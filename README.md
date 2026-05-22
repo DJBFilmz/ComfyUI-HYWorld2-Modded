@@ -1,10 +1,10 @@
 # ComfyUI HY-World 2.0 — WorldMirror 3D
 
-**I made changes to the WorldStereo nodes to integrate them into the workflow. This should, in theory, fix the shadowed or black holes in the gaussian splat. However, the render times are ridiculous, and I haven't been able to fully test it. 
+I made changes to the WorldStereo nodes to integrate them into the workflow. This should, in theory, fix the shadowed or black holes in the gaussian splat. However, the render times are ridiculous, and I haven't been able to fully test it. 
 
 If you have the ability to make the project run faster—either by quantizing the models or cleaning up the code—please do so. I believe the community would be incredibly grateful.
 
-- David J. Buchanan** 
+- David J. Buchanan
 
 
 ComfyUI custom nodes for 3D scene reconstruction from a single image or panorama using [HY-World 2.0](https://huggingface.co/tencent/HY-World-2.0) (Tencent).
