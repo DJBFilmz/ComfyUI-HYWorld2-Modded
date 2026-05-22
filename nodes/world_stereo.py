@@ -14,6 +14,16 @@ import math
 import numpy as np
 import torch
 
+# Get the absolute path of ComfyUI-HYWorld2 and its worldstereo subdirectory
+node_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+worldstereo_dir = os.path.join(node_dir, "worldstereo")
+
+# Inject the paths to the front of Python's search path to allow importing camera_utils
+for path in [node_dir, worldstereo_dir, os.path.join(worldstereo_dir, "src")]:
+    if os.path.exists(path) and path not in sys.path:
+        sys.path.insert(0, path)
+# ─── PATH RESOLUTION PATCH END ───
+
 # ── nodes/ -> repo root ────────────────────────────────────────────────────────
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
@@ -25,6 +35,7 @@ if _WORLDSTEREO_PATH not in sys.path:
     sys.path.insert(0, _WORLDSTEREO_PATH)
 
 try:
+    # 1. Try importing via the default package path
     from src.camera_utils import (
         camera_backward_forward,
         camera_left_right,
@@ -34,13 +45,29 @@ try:
     )
     CAMERA_UTILS_AVAILABLE = True
 except ImportError:
-    CAMERA_UTILS_AVAILABLE = False
+    try:
+        # 2. Fallback: Import directly to bypass the contested "src" namespace
+        from camera_utils import (
+            camera_backward_forward,
+            camera_left_right,
+            camera_rotation,
+            native_camera_rotation,
+            interpolate_poses,
+        )
+        CAMERA_UTILS_AVAILABLE = True
+    except ImportError as e:
+        print("\n" + "="*80)
+        print(f"[WorldStereo DEBUG] Real camera_utils import error: {e}")
+        import traceback
+        traceback.print_exc()
+        print("="*80 + "\n")
+        CAMERA_UTILS_AVAILABLE = False
 
 try:
     import folder_paths
     FOLDER_PATHS_AVAILABLE = True
 except ImportError:
-    FOLDER_PATHS_AVAILABLE = False
+    FOLDER_AVAILABLE = False
 
 try:
     from PIL import Image as PILImage
@@ -228,7 +255,7 @@ def _download_worldstereo_components(model_type: str) -> tuple:
         print(f"[WorldStereo] Downloading transformer ({model_type}) ...")
         tmp_dir = os.path.join(base, "WorldStereo", "_tmp")
         snapshot_download(
-            repo_id="hanshanxude/WorldStereo",
+            repo_id="hanshanxue/WorldStereo",  
             allow_patterns=[f"{model_type}/**"],
             local_dir=tmp_dir,
         )
@@ -272,12 +299,12 @@ def _download_worldstereo_components(model_type: str) -> tuple:
     # 4. Patch transformer config.json to use local base_model path
     config_path = os.path.join(transformer_dir, "config.json")
     if os.path.exists(config_path):
-        with open(config_path) as fh:
+        with open(config_path, "r", encoding="utf-8") as fh:
             cfg = json.load(fh)
         if cfg.get("base_model") != base_model_dir:
             cfg["base_model"] = base_model_dir
-            with open(config_path, "w") as fh:
-                json.dump(cfg, fh, indent=2)
+            with open(config_path, "w", encoding="utf-8") as fh:
+                json.dump(cfg, fh, indent=4)
             print(f"[WorldStereo] config.json patched -> base_model={base_model_dir}")
 
     return transformer_dir, base_model_dir, moge_dir
@@ -451,14 +478,177 @@ class VNCCS_LoadWorldStereoModel:
         offload_mode="model_cpu_offload",
         device="cuda",
     ):
-        from models.worldstereo_wrapper import WorldStereo
-        from moge.model import MoGeModel
+        import sys
+        import os
 
-        transformer_dir, _base_model_dir, moge_dir = _download_worldstereo_components(model_type)
+        # Resolve the parent custom node folder (ComfyUI-HYWorld2)
+        current_dir = os.path.dirname(os.path.dirname(__file__))
+
+        # Locate the "worldstereo" folder case-insensitively
+        worldstereo_path = None
+        for name in os.listdir(current_dir):
+            if name.lower() == "worldstereo":
+                worldstereo_path = os.path.join(current_dir, name)
+                break
+
+        if worldstereo_path:
+            # 1. Add worldstereo root to sys.path
+            if worldstereo_path not in sys.path:
+                sys.path.insert(0, worldstereo_path)
+
+            # 2. Append worldstereo's models directory to ComfyUI's 'models' search paths.
+            world_models_path = os.path.join(worldstereo_path, "models")
+            if "models" in sys.modules:
+                models_module = sys.modules["models"]
+                if hasattr(models_module, "__path__"):
+                    if world_models_path not in models_module.__path__:
+                        models_module.__path__.append(world_models_path)
+
+            # 3. Append worldstereo's src directory to the active 'src' search paths to prevent collisions
+            world_src_path = os.path.join(worldstereo_path, "src")
+            if "src" in sys.modules:
+                src_module = sys.modules["src"]
+                if hasattr(src_module, "__path__"):
+                    if isinstance(src_module.__path__, list):
+                        if world_src_path not in src_module.__path__:
+                            src_module.__path__.append(world_src_path)
+            else:
+                # If 'src' is not yet imported, import it now (will resolve to worldstereo/src)
+                try:
+                    import src
+                    if hasattr(src, "__path__") and isinstance(src.__path__, list):
+                        if world_src_path not in src.__path__:
+                            src.__path__.append(world_src_path)
+                except ImportError:
+                    pass
+
+        # ── Call download helper to resolve and prepare directory paths ───────
+        transformer_dir, base_model_dir, moge_dir = _download_worldstereo_components(model_type)
+
+        # Normalize Windows backslashes to forward slashes to prevent split('/') failures inside WorldStereo
+        transformer_dir = transformer_dir.replace("\\", "/")
+        base_model_dir = base_model_dir.replace("\\", "/")
+        moge_dir = moge_dir.replace("\\", "/")
+
+        # ── Monkey-patch torch.distributed to bypass Windows Gloo network bugs ──
+        import torch.distributed as dist
+        
+        # Set environment variables as a secondary fallback defense
+        os.environ["RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = "29500"
+
+        # Dummy Process Group class to satisfy PyTorch's DeviceMesh
+        class DummyProcessGroup:
+            def __init__(self):
+                self.group_name = "dummy_group"
+                
+            def __getattr__(self, name):
+                def _fallback_func(*args, **kwargs):
+                    return args[0] if args else None
+                return _fallback_func
+
+        # Generic no-op function that returns the first argument (the tensor) if present
+        def _dummy_dist_func(*args, **kwargs):
+            return args[0] if args else None
+
+        _dummy_pg = DummyProcessGroup()
+
+        dist.is_initialized = lambda: True
+        dist.get_rank = lambda *args, **kwargs: 0
+        dist.get_world_size = lambda *args, **kwargs: 1
+        dist.barrier = lambda *args, **kwargs: None
+        dist.new_group = lambda *args, **kwargs: _dummy_pg
+        dist.all_reduce = _dummy_dist_func
+        dist.broadcast = _dummy_dist_func
+        dist.all_gather = lambda tensor_list, tensor, *args, **kwargs: tensor_list
+        dist.reduce_scatter = lambda output, input_list, *args, **kwargs: output
+        dist.get_backend = lambda *args, **kwargs: "gloo"
+        dist.init_process_group = lambda *args, **kwargs: None
+
+        # Deep-patch all loaded torch.distributed submodules to prevent binding leaks
+        import sys
+        for mod_name, mod in list(sys.modules.items()):
+            if mod_name.startswith("torch.distributed") and mod:
+                for attr in ["init_process_group", "barrier", "broadcast", "all_reduce", "all_gather", "reduce_scatter", "new_group", "get_backend"]:
+                    if hasattr(mod, attr):
+                        try:
+                            if attr == "new_group":
+                                setattr(mod, attr, lambda *args, **kwargs: _dummy_pg)
+                            elif attr == "get_backend":
+                                setattr(mod, attr, lambda *args, **kwargs: "gloo")
+                            elif attr in ["all_reduce", "broadcast"]:
+                                setattr(mod, attr, _dummy_dist_func)
+                            else:
+                                setattr(mod, attr, lambda *args, **kwargs: None)
+                        except Exception:
+                            pass
+                if hasattr(mod, "is_initialized"):
+                    try:
+                        mod.is_initialized = lambda: True
+                    except Exception:
+                        pass
+                if hasattr(mod, "get_rank"):
+                    try:
+                        mod.get_rank = lambda *args, **kwargs: 0
+                    except Exception:
+                        pass
+                if hasattr(mod, "get_world_size"):
+                    try:
+                        mod.get_world_size = lambda *args, **kwargs: 1
+                    except Exception:
+                        pass
+                if hasattr(mod, "get_backend"):
+                    try:
+                        mod.get_backend = lambda *args, **kwargs: "gloo"
+                    except Exception:
+                        pass
+
+        # ── Monkey-patch Diffusers to bypass WorldStereo's required 'device' parameter bug ──
+        import diffusers.pipelines.pipeline_utils
+        _orig_get_signature_keys = diffusers.pipelines.pipeline_utils.DiffusionPipeline._get_signature_keys
+
+        @staticmethod
+        def patched_get_signature_keys(obj):
+            expected_modules, optional_parameters = _orig_get_signature_keys(obj)
+            
+            # Safely handle expected_modules whether it is a list or a set
+            if isinstance(expected_modules, list):
+                expected_modules = [x for x in expected_modules if x != "device"]
+            elif isinstance(expected_modules, set):
+                expected_modules = expected_modules - {"device"}
+                
+            # Safely handle optional_parameters whether it is a list or a set
+            if isinstance(optional_parameters, list):
+                if "device" not in optional_parameters:
+                    optional_parameters.append("device")
+            elif isinstance(optional_parameters, set):
+                optional_parameters = optional_parameters | {"device"}
+                
+            return expected_modules, optional_parameters
+
+        diffusers.pipelines.pipeline_utils.DiffusionPipeline._get_signature_keys = patched_get_signature_keys
+
+        from models.worldstereo_wrapper import WorldStereo
+
+        # Resolve MoGeModel class import based on your installed MoGe library version
+        try:
+            from moge.model.v2 import MoGeModel
+        except ImportError:
+            try:
+                from moge.model.v1 import MoGeModel
+            except ImportError:
+                from moge.model import MoGeModel  
 
         # ── Load WorldStereo pipeline ─────────────────────────────────────────
         print(f"[WorldStereo] Loading pipeline (model_type={model_type}, precision={precision}) ...")
-        worldstereo = WorldStereo.from_pretrained(transformer_dir, device=device)
+        parent_dir = os.path.dirname(transformer_dir)
+        worldstereo = WorldStereo.from_pretrained(
+            parent_dir,
+            subfolder=model_type,
+            device=device
+        )
         pipeline = worldstereo.pipeline
 
         # ── Apply precision to transformer ────────────────────────────────────
@@ -498,7 +688,13 @@ class VNCCS_LoadWorldStereoModel:
 
         # ── Load MoGe on CPU ─────────────────────────────────────────────────
         print("[WorldStereo] Loading MoGe depth estimator ...")
-        moge_model = MoGeModel.from_pretrained(moge_dir).eval()
+        
+        # Point directly to the model.pt file inside the cached directory
+        actual_moge_path = os.path.join(moge_dir, "model.pt")
+        if not os.path.exists(actual_moge_path):
+            actual_moge_path = moge_dir  # Fallback if structure varies
+            
+        moge_model = MoGeModel.from_pretrained(actual_moge_path).eval()
         print("[WorldStereo] MoGe loaded (CPU)")
 
         print("[WorldStereo] Pipeline ready")
@@ -509,7 +705,6 @@ class VNCCS_LoadWorldStereoModel:
             "device":      device,
             "model_type":  model_type,
         },)
-
 
 def _prepare_pipeline_inputs(
     image_pil,
@@ -532,7 +727,9 @@ def _prepare_pipeline_inputs(
 
     # 1. Image tensor in [-1, 1] for pipeline
     img_tensor = T.ToTensor()(image_pil) * 2.0 - 1.0   # [3, H, W], range [-1, 1]
-    img_np_01 = (img_tensor.permute(1, 2, 0).numpy() + 1.0) / 2.0  # [H, W, 3] in [0, 1]
+    
+    # Create [1, 3, H, W] PyTorch tensor in [0, 1] for pointcloud functions
+    img_tensor_01 = T.ToTensor()(image_pil).unsqueeze(0).float() # [1, 3, H, W]
 
     # 2. Depth via MoGe
     torch_device = torch.device(device)
@@ -541,34 +738,40 @@ def _prepare_pipeline_inputs(
         depth_output = moge_model.infer(
             img_tensor.unsqueeze(0).to(torch_device)
         )
-    # MoGe returns dict; extract depth as numpy [H, W]
+    # MoGe returns dict; extract depth as [1, 1, H, W] PyTorch tensor
     depth_raw = depth_output["depth"]
     if isinstance(depth_raw, torch.Tensor):
-        depth_np = depth_raw.squeeze().cpu().numpy()
+        depth_tensor = depth_raw.float()
+        if depth_tensor.dim() == 2:
+            depth_tensor = depth_tensor.unsqueeze(0).unsqueeze(0)
+        elif depth_tensor.dim() == 3:
+            depth_tensor = depth_tensor.unsqueeze(0)
     else:
-        depth_np = np.squeeze(depth_raw)
+        depth_tensor = torch.from_numpy(depth_raw).float().unsqueeze(0).unsqueeze(0)
+    
     moge_model.to("cpu")
     torch.cuda.empty_cache()
 
-    # 3. W2C matrices (numpy for pointcloud functions)
-    w2cs_np = _c2w_to_w2c(c2ws).numpy()  # [N, 4, 4]
-    intrs_np = intrs.numpy()              # [N, 3, 3]
-    ref_w2c = w2cs_np[0:1]               # [1, 4, 4] reference view (identity scene)
-    ref_K   = intrs_np[0]                # [3, 3]
+    # 3. W2C matrices as PyTorch Tensors
+    w2cs_t = _c2w_to_w2c(c2ws).float()   # [N, 4, 4]
+    intrs_t = intrs.float()              # [N, 3, 3]
+    ref_w2c = w2cs_t[0:1]                # [1, 4, 4] reference view
+    ref_K   = intrs_t[0:1]               # [1, 3, 3] reference view (preserves batch dim)
 
     # 4. 3D point cloud from reference view
+    # Keep on CPU initially — get_points3d_and_colors will move it to target device
     points3d, colors = get_points3d_and_colors(
         K=ref_K,
         w2cs=ref_w2c,
-        depth=depth_np,
-        image=img_np_01,
+        depth=depth_tensor.cpu(),
+        image=img_tensor_01,
         device=device,
     )
 
     # 5. Render point cloud from all N target views
     render_result = point_rendering(
-        K=intrs_np,
-        w2cs=w2cs_np,
+        K=intrs_t,
+        w2cs=w2cs_t,
         points=points3d,
         colors=colors,
         device=device,
@@ -623,7 +826,7 @@ def _prepare_pipeline_inputs(
         "render_video":     render_video,
         "render_mask":      render_mask,
         "camera_embedding": camera_emb,
-        "extrinsics":       torch.from_numpy(w2cs_np).float().to(torch_device),  # [N, 4, 4] W2C
+        "extrinsics":       _c2w_to_w2c(c2ws).float().to(torch_device),  # [N, 4, 4] W2C
         "intrinsics":       intrs.to(torch_device),   # [N, 3, 3]
         "height":           height,
         "width":            width,
@@ -633,7 +836,7 @@ def _prepare_pipeline_inputs(
 
 class VNCCS_WorldStereoGenerate:
     """
-    WorldStereo camera-guided video generation from a single image.
+    WorldStereo camera-guided video generation from a single image or batch of sliced views.
     Outputs video_frames + camera_poses + camera_intrinsics for VNCCS_WorldMirrorV2_3D.
     """
 
@@ -646,6 +849,10 @@ class VNCCS_WorldStereoGenerate:
                 "trajectory": ("CAMERA_TRAJECTORY",),
             },
             "optional": {
+                "prompt": ("STRING", {
+                    "default": "", "multiline": True,
+                    "tooltip": "Text prompt to guide the inpainting/generation of occluded parts.",
+                }),
                 "num_inference_steps": ("INT", {
                     "default": 0, "min": 0, "max": 100,
                     "tooltip": "0 = auto (4 for memory-dmd, 20 for others).",
@@ -658,23 +865,28 @@ class VNCCS_WorldStereoGenerate:
                     "tooltip": "-1 = random.",
                 }),
                 "negative_prompt": ("STRING", {"default": ""}),
+                "base_camera_poses": ("TENSOR",),
+                "base_camera_intrinsics": ("TENSOR",),
             },
         }
 
     RETURN_TYPES  = ("IMAGE",         "TENSOR",         "TENSOR")
     RETURN_NAMES  = ("video_frames",  "camera_poses",   "camera_intrinsics")
     FUNCTION      = "generate"
-    CATEGORY      = "VNCCS/Video"
+    CATEGORY = "VNCCS/Video"
 
     def generate(
         self,
         model,
         image,
         trajectory,
+        prompt="",
         num_inference_steps=0,
         guidance_scale=5.0,
         seed=-1,
         negative_prompt="",
+        base_camera_poses=None,
+        base_camera_intrinsics=None,
     ):
         pipeline   = model["pipeline"]
         moge_model = model["moge"]
@@ -690,50 +902,135 @@ class VNCCS_WorldStereoGenerate:
         if num_inference_steps == 0:
             num_inference_steps = 4 if "dmd" in model_type else 20
 
-        # ── Preprocess: ComfyUI IMAGE [1, H, W, 3] → PIL ─────────────────────
-        img_np  = (image[0].cpu().numpy()[..., :3] * 255).astype(np.uint8)
-        img_pil = PILImage.fromarray(img_np).resize((W, H), PILImage.Resampling.BICUBIC)
+        # Extract the total slice count from the input image batch
+        B = image.shape[0] if isinstance(image, torch.Tensor) else len(image)
+        print(f"[WorldStereo Batch Loop] Slices found: {B}. Initializing sequence generation loop...")
 
-        # ── Build pipeline inputs ─────────────────────────────────────────────
-        print(f"[WorldStereo] Preprocessing: depth estimation + point rendering ...")
-        pipeline_inputs = _prepare_pipeline_inputs(
-            image_pil=img_pil,
-            c2ws=c2ws,
-            intrs=intrs,
-            moge_model=moge_model,
-            device=device,
-            width=W,
-            height=H,
-        )
+        # ── Safety and Format Checks for Poses and Intrinsics ──
+        # Check if the user swapped camera_poses and intrinsics connections
+        if base_camera_poses is not None and base_camera_intrinsics is not None:
+            # Poses are typically [B, 4, 4] or [B, 3, 4], intrinsics are [B, 3, 3]
+            # If poses has last dim 3, but intrinsics has last dim 4, they are swapped
+            if base_camera_poses.shape[-1] == 3 and base_camera_intrinsics.shape[-1] == 4:
+                print("[WorldStereo Warning] Swapped inputs detected! base_camera_poses and base_camera_intrinsics appear to be reversed. Swapping them back automatically.")
+                base_camera_poses, base_camera_intrinsics = base_camera_intrinsics, base_camera_poses
 
-        # ── Generator ────────────────────────────────────────────────────────
-        generator = None
-        if seed >= 0:
-            generator = torch.Generator(device=device).manual_seed(seed)
+        # If base_camera_poses was provided but looks like intrinsics [B, 3, 3]
+        if base_camera_poses is not None and base_camera_poses.shape[-2] == 3 and base_camera_poses.shape[-1] == 3:
+            print("[WorldStereo Warning] base_camera_poses has shape [3, 3], which looks like intrinsics. Treating it as base_camera_intrinsics instead.")
+            if base_camera_intrinsics is None:
+                base_camera_intrinsics = base_camera_poses
+            base_camera_poses = None
 
-        # ── Inference ────────────────────────────────────────────────────────
-        print(f"[WorldStereo] Generating {N} frames ({num_inference_steps} steps, guidance={guidance_scale}) ...")
-        with torch.autocast(device, dtype=torch.bfloat16):
-            output = pipeline(
-                **pipeline_inputs,
-                negative_prompt=negative_prompt if negative_prompt else None,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-                generator=generator,
-                output_type="pt",
+        # Helper function to pad [3, 4] poses to [4, 4]
+        def pad_pose_to_4x4(pose: torch.Tensor) -> torch.Tensor:
+            if pose.shape[-2] == 3 and pose.shape[-1] == 4:
+                if len(pose.shape) == 2:  # [3, 4]
+                    bottom = torch.tensor([[0.0, 0.0, 0.0, 1.0]], dtype=pose.dtype, device=pose.device)
+                    return torch.cat([pose, bottom], dim=0)  # [4, 4]
+                elif len(pose.shape) == 3:  # [B, 3, 4]
+                    B_dim = pose.shape[0]
+                    bottom = torch.tensor([[0.0, 0.0, 0.0, 1.0]], dtype=pose.dtype, device=pose.device)
+                    bottom = bottom.unsqueeze(0).repeat(B_dim, 1, 1)  # [B, 1, 4]
+                    return torch.cat([pose, bottom], dim=1)  # [B, 4, 4]
+            return pose
+
+        # Pad base camera poses if they exist
+        if base_camera_poses is not None:
+            base_camera_poses = pad_pose_to_4x4(base_camera_poses)
+
+        all_video_frames = []
+        all_camera_poses = []
+        all_camera_intrinsics = []
+
+        # Iterate through each panoramic view slice
+        for b in range(B):
+            print(f"[WorldStereo Batch Loop] Processing view slice {b + 1}/{B}...")
+            
+            # Extract slice image and convert to PIL
+            img_slice = image[b] if isinstance(image, torch.Tensor) else image[b]
+            img_np  = (img_slice.cpu().numpy()[..., :3] * 255).astype(np.uint8)
+            img_pil = PILImage.fromarray(img_np).resize((W, H), PILImage.Resampling.BICUBIC)
+
+            # Determine the base camera pose for this specific slice
+            if base_camera_poses is not None:
+                if len(base_camera_poses.shape) == 3:  # Shape [B, 4, 4]
+                    idx_pose = b if b < base_camera_poses.shape[0] else 0
+                    base_pose = base_camera_poses[idx_pose]
+                else:  # Fallback to single [4, 4] matrix
+                    base_pose = base_camera_poses
+            else:
+                # Identity matrix fallback if unconnected
+                base_pose = torch.eye(4, dtype=torch.float32)
+
+            # Determine the base intrinsics for this specific slice
+            if base_camera_intrinsics is not None:
+                if len(base_camera_intrinsics.shape) == 3:  # Shape [B, 3, 3]
+                    idx_intr = b if b < base_camera_intrinsics.shape[0] else 0
+                    base_K = base_camera_intrinsics[idx_intr]
+                else:  # Fallback to single [3, 3] matrix
+                    base_K = base_camera_intrinsics
+            else:
+                # Fallback to standard intrinsics from the trajectory
+                base_K = intrs[0]
+
+            # Compose absolute trajectory camera-to-world (c2w) matrices: T_abs = T_base * T_trajectory
+            base_pose_dev = base_pose.to(c2ws.device, dtype=c2ws.dtype)
+            # Use explicit batch expansion and bmm to avoid batch broadcasting issues in PyTorch
+            base_pose_expanded = base_pose_dev.unsqueeze(0).expand(N, -1, -1)  # [N, 4, 4]
+            c2ws_abs = torch.bmm(base_pose_expanded, c2ws)                     # [N, 4, 4]
+
+            # Expand base intrinsics across all frames: [N, 3, 3]
+            base_K_dev = base_K.to(intrs.device, dtype=intrs.dtype)
+            intrs_abs = base_K_dev.unsqueeze(0).expand(N, -1, -1).clone()
+
+            # ── Preprocess Pipeline Inputs for the Slice ──
+            print(f"[WorldStereo] Slice {b + 1} processing: depth estimation + point rendering...")
+            pipeline_inputs = _prepare_pipeline_inputs(
+                image_pil=img_pil,
+                c2ws=c2ws_abs,
+                intrs=intrs_abs,
+                moge_model=moge_model,
+                device=device,
+                width=W,
+                height=H,
             )
 
-        torch.cuda.empty_cache()
+            # ── Generator Setup ──
+            generator = None
+            if seed >= 0:
+                generator = torch.Generator(device=device).manual_seed(seed + b)
 
-        # ── Decode: [N, C, H, W] float → ComfyUI IMAGE [N, H, W, 3] ─────────
-        frames = output.frames[0].float().cpu().clamp(0.0, 1.0)  # [N, 3, H, W]
-        video_frames = frames.permute(0, 2, 3, 1)                # [N, H, W, 3]
+            # ── Diffusion Generation ──
+            print(f"[WorldStereo] Slice {b + 1} executing inference for {N} camera frames...")
+            with torch.autocast(device, dtype=torch.bfloat16):
+                output = pipeline(
+                    **pipeline_inputs,
+                    prompt=prompt if prompt else "",
+                    negative_prompt=negative_prompt if negative_prompt else None,
+                    num_inference_steps=num_inference_steps,
+                    guidance_scale=guidance_scale,
+                    generator=generator,
+                    output_type="pt",
+                )
 
-        print(f"[WorldStereo] Done: {video_frames.shape[0]} frames @ {W}x{H}")
+            # Clean cache immediately to keep low VRAM overhead on sequential slices
+            torch.cuda.empty_cache()
 
-        # ── Camera outputs (for WorldMirror V2) ──────────────────────────────
-        camera_poses_out = c2ws.cpu().float()   # [N, 4, 4]
-        camera_intrs_out = intrs.cpu().float()  # [N, 3, 3]
+            # ── Extract Generated Frames ──
+            frames = output.frames[0].float().cpu().clamp(0.0, 1.0)  # [N, 3, H, W]
+            slice_video_frames = frames.permute(0, 2, 3, 1)          # [N, H, W, 3]
+
+            all_video_frames.append(slice_video_frames)
+            all_camera_poses.append(c2ws_abs.cpu().float())
+            all_camera_intrinsics.append(intrs_abs.cpu().float())
+
+        # Concatenate sequences of all processed slices into unified tensors
+        video_frames     = torch.cat(all_video_frames, dim=0)       # [B * N, H, W, 3]
+        camera_poses_out = torch.cat(all_camera_poses, dim=0)       # [B * N, 4, 4]
+        camera_intrs_out = torch.cat(all_camera_intrinsics, dim=0)  # [B * N, 3, 3]
+
+        print(f"[WorldStereo Batch Loop] Complete. Total of {video_frames.shape[0]} frames prepared for 3D fusion.")
 
         return video_frames, camera_poses_out, camera_intrs_out
 

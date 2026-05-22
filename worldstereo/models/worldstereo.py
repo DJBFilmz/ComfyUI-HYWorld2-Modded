@@ -503,7 +503,31 @@ class WorldStereoRefSModel(WanTransformer3DModel):
 
         if hasattr(self, "controlnet"):
             ### process controlnet inputs ###
+            
+            # ── Patched to dynamically duplicate inputs to match batch_size of hidden_states (for DMD/CFG) ──
+            B = hidden_states.shape[0]
+            if render_latent is not None and render_latent.shape[0] != B:
+                render_latent = render_latent.repeat(B // render_latent.shape[0], *([1] * (render_latent.dim() - 1)))
+            if render_mask is not None and render_mask.shape[0] != B:
+                render_mask = render_mask.repeat(B // render_mask.shape[0], *([1] * (render_mask.dim() - 1)))
+            if camera_embedding is not None and camera_embedding.shape[0] != B:
+                camera_embedding = camera_embedding.repeat(B // camera_embedding.shape[0], *([1] * (camera_embedding.dim() - 1)))
+            if reference_latent is not None and reference_latent.shape[0] != B:
+                reference_latent = reference_latent.repeat(B // reference_latent.shape[0], *([1] * (reference_latent.dim() - 1)))
+
+            # ── Dynamic Fallback: if reference_latent is None, construct a 36-channel latent on-the-fly ──
+            if reference_latent is None and render_latent is not None:
+                # 1. Grab first frame of render_latent (16 channels)
+                ref_16 = render_latent[:, :, 0:1]
+                # 2. Create the 4-channel mask of ones
+                ref_mask = torch.ones_like(ref_16[:, :4]).to(ref_16.dtype).to(ref_16.device)
+                # 3. Concatenate [16, 4, 16] to form a 36-channel reference latent
+                reference_latent = torch.cat([ref_16, ref_mask, ref_16], dim=1)
+
+            # Perform the concatenation after adjusting the batch size
+            print(f"[WorldStereo DEBUG] hidden_states shape: {hidden_states.shape}, render_latent shape: {render_latent.shape if render_latent is not None else None}")
             render_latent = torch.cat([hidden_states[:, :20], render_latent], dim=1)
+            
             controlnet_rotary_emb = self.controlnet_rope(render_latent)
             controlnet_inputs = self.controlnet.controlnet_patch_embedding(render_latent)
             controlnet_inputs = controlnet_inputs.flatten(2).transpose(1, 2)
@@ -513,6 +537,14 @@ class WorldStereoRefSModel(WanTransformer3DModel):
                 add_inputs = torch.cat([render_mask, camera_embedding], dim=1)
             else:
                 add_inputs = render_mask
+
+            # ── Patched to keyframe-slice mask & camera embeds if mask_downsample is 1 ──
+            if self.controlnet_cfg.get("mask_downsample", 4) == 1:
+                F_latent = render_latent.shape[2]
+                F_pixel = add_inputs.shape[2]
+                if F_pixel != F_latent:
+                    add_inputs = add_inputs[:, :, ::4]
+
             add_inputs = self.controlnet.controlnet_mask_embedding(add_inputs)
             controlnet_inputs = controlnet_inputs + add_inputs
             ### process controlnet inputs over ###
@@ -531,12 +563,14 @@ class WorldStereoRefSModel(WanTransformer3DModel):
             einops.rearrange(tmp_rotary_emb_1[:, :, :, :post_patch_width], "b f h w n c -> b (f h w) n c")
         ]
 
+        ref_index = ref_index if ref_index is not None else 0
         # Use ref_index to select specific frames from ref_rotary_emb
         ref_rotary_emb_0 = tmp_rotary_emb_0[:, :, :, post_patch_width:]  # b f h w n c
         ref_rotary_emb_1 = tmp_rotary_emb_1[:, :, :, post_patch_width:]  # b f h w n c
+        # Use ref_index to select specific frames from ref_rotary_emb
         ref_rotary_emb = [
-            einops.rearrange(ref_rotary_emb_0[:, ref_index + 1], "b f h w n c -> b (f h w) n c"),  # ref_index + 1, 0~19-->1~20
-            einops.rearrange(ref_rotary_emb_1[:, ref_index + 1], "b f h w n c -> b (f h w) n c")
+            einops.rearrange(ref_rotary_emb_0[:, ref_index + 1 : ref_index + 2], "b f h w n c -> b (f h w) n c"),  # ref_index + 1, 0~19-->1~20
+            einops.rearrange(ref_rotary_emb_1[:, ref_index + 1 : ref_index + 2], "b f h w n c -> b (f h w) n c")
         ]
 
         hidden_states = self.patch_embedding(hidden_states)

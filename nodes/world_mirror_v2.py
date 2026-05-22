@@ -277,6 +277,7 @@ class VNCCS_WorldMirrorV2_3D:
         camera_intrinsics   = None,
         camera_poses        = None,
     ):
+
         target_size    = (target_size // _PATCH_SIZE) * _PATCH_SIZE
         worldmirror    = model["model"]
         exec_dev       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -336,13 +337,110 @@ class VNCCS_WorldMirrorV2_3D:
             if original_dev != exec_dev:
                 worldmirror.to(exec_dev)
 
-        # ── 4. Inference ──────────────────────────────────────────────────────
+# ── 4. Inference ──────────────────────────────────────────────────────
         original_gs = worldmirror.enable_gs
         worldmirror.enable_gs = use_gsplat and GSPLAT_AVAILABLE
 
         try:
             print(f"🚀 [V2] Inference: {B} images @ {target_size}px, gs={worldmirror.enable_gs}")
             with torch.no_grad():
+                # Determine the target sequence length
+                num_images = images.shape[0] if isinstance(images, torch.Tensor) else len(images)
+
+                # Find the mismatching sequence length (num_poses) inside views
+                num_poses = None
+                
+                # Case A: views is a dictionary
+                if isinstance(views, dict):
+                    for k, v in views.items():
+                        if isinstance(v, torch.Tensor):
+                            if v.dim() >= 2 and v.shape[1] > 0 and v.shape[1] != num_images:
+                                num_poses = v.shape[1]
+                                break
+                            elif v.dim() == 1 and v.shape[0] > 0 and v.shape[0] != num_images:
+                                num_poses = v.shape[0]
+                                break
+                        elif isinstance(v, list) and len(v) > 0 and len(v) != num_images:
+                            num_poses = len(v)
+                            break
+                            
+                # Case B: views is a list or tuple
+                elif isinstance(views, (list, tuple)):
+                    for v in views:
+                        if isinstance(v, torch.Tensor):
+                            if v.dim() >= 2 and v.shape[1] > 0 and v.shape[1] != num_images:
+                                num_poses = v.shape[1]
+                                break
+                            elif v.dim() == 1 and v.shape[0] > 0 and v.shape[0] != num_images:
+                                num_poses = v.shape[0]
+                                break
+                        elif isinstance(v, list) and len(v) > 0 and len(v) != num_images:
+                            num_poses = len(v)
+                            break
+
+                # Case C: views is a custom object
+                elif hasattr(views, '__dict__'):
+                    for k, v in views.__dict__.items():
+                        if isinstance(v, torch.Tensor):
+                            if v.dim() >= 2 and v.shape[1] > 0 and v.shape[1] != num_images:
+                                num_poses = v.shape[1]
+                                break
+                            elif v.dim() == 1 and v.shape[0] > 0 and v.shape[0] != num_images:
+                                num_poses = v.shape[0]
+                                break
+                        elif isinstance(v, list) and len(v) > 0 and len(v) != num_images:
+                            num_poses = len(v)
+                            break
+
+                # Perform the sequence-length alignment if a mismatch is confirmed
+                if num_poses is not None and num_poses != num_images and num_images > 0:
+                    print(f"[WorldMirror V2 PATCH] Aligning views (type={type(views).__name__}): {num_poses} poses -> {num_images} images.")
+                    indices = torch.linspace(0, num_poses - 1, num_images, dtype=torch.long)
+
+                    # 1. Align Dictionary
+                    if isinstance(views, dict):
+                        for k, v in list(views.items()):
+                            if k == 'images':
+                                continue
+                            if isinstance(v, torch.Tensor):
+                                if v.dim() >= 2 and v.shape[1] == num_poses:
+                                    views[k] = v[:, indices.to(v.device)]
+                                elif v.dim() >= 1 and v.shape[0] == num_poses:
+                                    views[k] = v[indices.to(v.device)]
+                            elif isinstance(v, list) and len(v) == num_poses:
+                                views[k] = [v[i] for i in indices.tolist()]
+
+                    # 2. Align List or Tuple
+                    elif isinstance(views, (list, tuple)):
+                        new_views = []
+                        for v in views:
+                            if isinstance(v, torch.Tensor):
+                                if v.dim() >= 2 and v.shape[1] == num_poses:
+                                    new_views.append(v[:, indices.to(v.device)])
+                                elif v.dim() >= 1 and v.shape[0] == num_poses:
+                                    new_views.append(v[indices.to(v.device)])
+                                else:
+                                    new_views.append(v)
+                            elif isinstance(v, list) and len(v) == num_poses:
+                                new_views.append([v[i] for i in indices.tolist()])
+                            else:
+                                new_views.append(v)
+                        views = type(views)(new_views)
+
+                    # 3. Align Object attributes
+                    elif hasattr(views, '__dict__'):
+                        for k, v in list(views.__dict__.items()):
+                            if k == 'images':
+                                continue
+                            if isinstance(v, torch.Tensor):
+                                if v.dim() >= 2 and v.shape[1] == num_poses:
+                                    setattr(views, k, v[:, indices.to(v.device)])
+                                elif v.dim() >= 1 and v.shape[0] == num_poses:
+                                    setattr(views, k, v[indices.to(v.device)])
+                            elif isinstance(v, list) and len(v) == num_poses:
+                                setattr(views, k, [v[i] for i in indices.tolist()])
+
+                # Run the model
                 predictions = worldmirror(
                     views      = views,
                     cond_flags = cond_flags,
