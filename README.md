@@ -1,21 +1,5 @@
 # ComfyUI HY-World 2.0 — WorldMirror 3D
 
-I made changes to the WorldStereo nodes to integrate them into the workflow. This should, in theory, fix the shadowed or black holes in the gaussian splat. However, the render times are ridiculous, and I haven't been able to fully test it. 
-
-If you have the ability to make the project run faster—either by quantizing the models or cleaning up the code—please do so. I believe the community would be incredibly grateful.
-
-- David J. Buchanan
-
-Upon further testing (2026/05/22): My conclusion to the WorldStereo:
-
-1.	Yes, it does generate and could potentially fill the black areas/shadowed areas of the gaussian splat but because it has no context (not reading the full panorama, only slices of it), it guesses at what those black spot would look like and does a pretty bad job.
-2.	It takes hours to render. The lowest I got it down to was two and half hours. So, it’s not very practically unless you render once and keep reload the same splat—that’s assuming it guess the black holes correctly with the relevant information.
-3.	If there was a way to look at the entire splat from WorldMirror into WorlStereo to create the black/shadows areas that may solve the problem, but I’m am unsure how to do that. It seems like a more complex problem because it would be looking at the .ply data versus an image and therefore would take more calculation. Essentially, having ONE image to generate a splat is not very practically in the first place. 
-
-<br><br/>
-
-From AHEKOT original repo: 
-
 ComfyUI custom nodes for 3D scene reconstruction from a single image or panorama using [HY-World 2.0](https://huggingface.co/tencent/HY-World-2.0) (Tencent).
 
 ---
@@ -42,7 +26,20 @@ ComfyUI custom nodes for 3D scene reconstruction from a single image or panorama
 | `VNCCS_BackgroundPreview` | Preview 3D background renders |
 | `VNCCS_Equirect360ToViews` | Extract perspective views from equirectangular panorama |
 | `VNCCS_PanoramaMapper` | Map panorama to wall / floor / ceiling projections |
+WorldStereo
+I made changes to the WorldStereo nodes to integrate them into the workflow. This should, in theory, fix the shadowed or black holes in the gaussian splat. However, the render times are ridiculous, and I haven't been able to fully test it. 
 
+If you have the ability to make the project run faster—either by quantizing the models or cleaning up the code—please do so. I believe the community would be incredibly grateful.
+
+- David J. Buchanan
+
+Upon further testing (2026/05/22): My conclusion to the WorldStereo:
+
+1.	Yes, it does generate and could potentially fill the black areas/shadowed areas of the gaussian splat but because it has no context (not reading the full panorama, only slices of it), it guesses at what those black spot would look like and does a pretty bad job.
+2.	It takes hours to render. The lowest I got it down to was two and half hours. So, it’s not very practically unless you render once and keep reload the same splat—that’s assuming it guess the black holes correctly with the relevant information.
+3.	If there was a way to look at the entire splat from WorldMirror into WorlStereo to create the black/shadows areas that may solve the problem, but I’m am unsure how to do that. It seems like a more complex problem because it would be looking at the .ply data versus an image and therefore would take more calculation. Essentially, having ONE image to generate a splat is not very practically in the first place. 
+
+<br><br/>
 ---
 
 ## Installation
