@@ -1081,8 +1081,10 @@ def extract_splat_params(data):
                 if v is None: continue
                 # Handle potential list wrapper from some versions
                 if isinstance(v, list): v = v[0]
-                # Handle batch dimension [B, N, ...] -> [N, ...]
-                if v.dim() >= 3: v = v[0]
+                # Handle batch dimension [B, N, ...] -> [N, ...], but do not
+                # collapse SH tensors that are already [N, SH, 3].
+                if v.dim() >= 3 and v.shape[0] == 1:
+                    v = v[0]
                 params[k] = v.detach().cpu().float()
             
             if "means" not in params:
@@ -1340,7 +1342,17 @@ class VNCCS_SavePLY:
             flat = flat[::step][:max_values]
         return torch.quantile(flat, q)
 
-    def _save_gs_ply_safe(self, path, means, scales, rotations, rgbs, opacities, quantile_threshold=0.95):
+    def _save_gs_ply_safe(
+        self,
+        path,
+        means,
+        scales,
+        rotations,
+        rgbs,
+        opacities,
+        quantile_threshold=0.95,
+        apply_scale_filter=True,
+    ):
         from plyfile import PlyData, PlyElement
 
         means = means.detach().cpu().float().reshape(-1, 3)
@@ -1356,21 +1368,22 @@ class VNCCS_SavePLY:
             means[:n], scales[:n], rotations[:n], rgbs[:n], opacities[:n]
         )
 
-        max_scale = scales.max(dim=-1)[0]
-        scale_threshold = self._safe_quantile(max_scale, quantile_threshold)
-        keep = max_scale <= scale_threshold
-        kept = int(keep.sum().item())
-        if kept <= 0:
-            keep = torch.ones_like(max_scale, dtype=torch.bool)
+        if apply_scale_filter and quantile_threshold is not None:
+            max_scale = scales.max(dim=-1)[0]
+            scale_threshold = self._safe_quantile(max_scale, quantile_threshold)
+            keep = max_scale <= scale_threshold
             kept = int(keep.sum().item())
-        if kept != n:
-            print(f"📉 [SavePLY] Scale filter: {n} -> {kept} gaussians")
+            if kept <= 0:
+                keep = torch.ones_like(max_scale, dtype=torch.bool)
+                kept = int(keep.sum().item())
+            if kept != n:
+                print(f"📉 [SavePLY] Scale filter: {n} -> {kept} gaussians")
 
-        means = means[keep]
-        scales = scales[keep]
-        rotations = rotations[keep]
-        rgbs = rgbs[keep]
-        opacities = opacities[keep]
+            means = means[keep]
+            scales = scales[keep]
+            rotations = rotations[keep]
+            rgbs = rgbs[keep]
+            opacities = opacities[keep]
 
         attributes = ["x", "y", "z", "nx", "ny", "nz"]
         attributes += [f"f_dc_{i}" for i in range(3)]
@@ -1378,21 +1391,34 @@ class VNCCS_SavePLY:
         attributes += [f"scale_{i}" for i in range(3)]
         attributes += [f"rot_{i}" for i in range(4)]
 
-        means_np = means.numpy()
-        attributes_data = np.concatenate(
-            (
-                means_np,
-                np.zeros_like(means_np),
-                rgbs.numpy(),
-                opacities[..., None].numpy(),
-                scales.log().numpy(),
-                rotations.numpy(),
-            ),
-            axis=1,
-        )
         elements = np.empty(means.shape[0], dtype=[(attribute, "f4") for attribute in attributes])
-        elements[:] = list(map(tuple, attributes_data))
-        PlyData([PlyElement.describe(elements, "vertex")]).write(str(path))
+        means_np = means.numpy()
+        rgbs_np = rgbs.numpy()
+        opacities_np = opacities.numpy()
+        scales_np = scales.log().numpy()
+        rotations_np = rotations.numpy()
+
+        elements["x"] = means_np[:, 0]
+        elements["y"] = means_np[:, 1]
+        elements["z"] = means_np[:, 2]
+        elements["nx"] = 0.0
+        elements["ny"] = 0.0
+        elements["nz"] = 0.0
+        for i in range(3):
+            elements[f"f_dc_{i}"] = rgbs_np[:, i]
+            elements[f"scale_{i}"] = scales_np[:, i]
+        elements["opacity"] = opacities_np
+        for i in range(4):
+            elements[f"rot_{i}"] = rotations_np[:, i]
+
+        tmp_path = f"{path}.tmp"
+        try:
+            PlyData([PlyElement.describe(elements, "vertex")]).write(tmp_path)
+            os.replace(tmp_path, str(path))
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
 
 
     def save_ply(self, ply_data, filename="output", save_pointcloud=False, save_gaussians=True,
@@ -1412,6 +1438,7 @@ class VNCCS_SavePLY:
             # 1. Try Native Extraction (Primary)
             splats = ply_data.get("splats")
             native_success = False
+            apply_scale_filter = not bool(ply_data.get("skip_scale_filter"))
             
             if splats is not None and isinstance(splats, dict):
                 try:
@@ -1457,11 +1484,25 @@ class VNCCS_SavePLY:
                              quats = self._rotate_quaternions(quats, R)
                          
                          gs_path = self._get_unique_path(output_dir, filename, "gaussians", "ply")
-                         self._save_gs_ply_safe(gs_path, means, scales, quats, colors, opacities)
+                         self._save_gs_ply_safe(
+                             gs_path,
+                             means,
+                             scales,
+                             quats,
+                             colors,
+                             opacities,
+                             apply_scale_filter=apply_scale_filter,
+                         )
                          saved_files.append(gs_path)
                          print(f"💾 [SavePLY] SUCCESS: Saved gaussians (Native): {os.path.basename(gs_path)} ({len(means)} pts)")
                          native_success = True
                 except Exception as e:
+                    if isinstance(e, OSError) and getattr(e, "errno", None) == 28:
+                        raise RuntimeError(
+                            "SavePLY failed: no space left on device while writing Gaussian PLY. "
+                            "Free disk space or lower splat_upsample_max_points; fallback is disabled "
+                            "for storage errors to avoid leaving a broken 0 KB PLY."
+                        ) from e
                     print(f"⚠️ [SavePLY] Native extraction failed, falling back: {e}")
             
             # 2. Fallback to Helper (if splats missing or native failed)
@@ -1481,7 +1522,15 @@ class VNCCS_SavePLY:
                     colors = (colors - 0.5) / SH_C0
 
                     gs_path = self._get_unique_path(output_dir, filename, "gaussians", "ply")
-                    self._save_gs_ply_safe(gs_path, means, scales, quats, colors, opacities)
+                    self._save_gs_ply_safe(
+                        gs_path,
+                        means,
+                        scales,
+                        quats,
+                        colors,
+                        opacities,
+                        apply_scale_filter=apply_scale_filter,
+                    )
                     saved_files.append(gs_path)
                     print(f"💾 [SavePLY] SUCCESS: Saved gaussians (Fallback): {os.path.basename(gs_path)} ({len(means)} pts)")
                 else:

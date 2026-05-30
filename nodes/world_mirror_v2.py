@@ -238,8 +238,8 @@ def _voxel_prune_splats_dict(splats, voxel_size):
             pruned[color_key].append(colors_new)
     out.update(pruned)
     # Weights are only used as a merge/prune helper. After voxel merging they no
-    # longer map 1:1 to the pruned gaussians, so keeping them causes later
-    # cross-chunk pruning to mix tensors with incompatible lengths.
+    # longer map 1:1 to the pruned gaussians, so keeping them causes later prune
+    # passes to mix tensors with incompatible lengths.
     out.pop("weights", None)
     return out
 
@@ -1140,38 +1140,6 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
     def INPUT_TYPES(cls):
         inputs = copy.deepcopy(super().INPUT_TYPES())
         optional = inputs.setdefault("optional", {})
-        optional["chunked_inference"] = ("BOOLEAN", {
-            "default": False,
-            "tooltip": "Run WorldMirror V2 in sequential view chunks and merge Gaussian splats. Experimental high-res mode."
-        })
-        optional["chunk_size"] = ("INT", {
-            "default": 4, "min": 1, "max": 64, "step": 1,
-            "tooltip": "Number of views processed per model forward when chunked_inference is enabled."
-        })
-        optional["chunk_overlap"] = ("INT", {
-            "default": 0, "min": 0, "max": 16, "step": 1,
-            "tooltip": "Extra views shared between neighboring chunks. Duplicates are only reduced by voxel pruning."
-        })
-        optional["chunk_merge_voxel_prune"] = ("BOOLEAN", {
-            "default": True,
-            "tooltip": "Voxel-merge the final concatenated splats across chunks."
-        })
-        optional["chunk_merge_voxel_size"] = ("FLOAT", {
-            "default": 0.002, "min": 0.0001, "max": 0.1, "step": 0.0001,
-            "tooltip": "Voxel size for final cross-chunk merge."
-        })
-        optional["chunk_keep_diagnostics"] = ("BOOLEAN", {
-            "default": False,
-            "tooltip": "Keep full concatenated depth/normal/debug image outputs. Off saves RAM and keeps only first chunk diagnostics."
-        })
-        optional["chunk_anchor_depth_prior"] = ("BOOLEAN", {
-            "default": True,
-            "tooltip": "Run one low-res all-view pass and feed its depth as a shared prior to high-res chunks."
-        })
-        optional["chunk_anchor_target_size"] = ("INT", {
-            "default": 518, "min": 252, "max": 1400, "step": 14,
-            "tooltip": "Resolution for the low-res all-view anchor pass."
-        })
         optional["splat_upsample_mode"] = (["none", "depth_backproject"], {
             "default": "none",
             "tooltip": "Experimental: replace model splats with dense high-res splats from upsampled depth and high-res RGB."
@@ -1188,6 +1156,18 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
             "default": 0.003, "min": 0.0001, "max": 0.05, "step": 0.0001,
             "tooltip": "Constant Gaussian scale for high-res backprojected splats."
         })
+        optional["splat_upsample_scale_mode"] = (["constant", "depth_adaptive"], {
+            "default": "constant",
+            "tooltip": "Keep constant unless intentionally testing larger far-depth splats; adaptive scales can trigger saver scale filtering."
+        })
+        optional["splat_upsample_depth_scale_strength"] = ("FLOAT", {
+            "default": 0.0, "min": 0.0, "max": 8.0, "step": 0.05,
+            "tooltip": "How strongly splat size grows with depth in depth_adaptive mode."
+        })
+        optional["splat_upsample_depth_scale_max"] = ("FLOAT", {
+            "default": 3.0, "min": 1.0, "max": 12.0, "step": 0.1,
+            "tooltip": "Maximum depth-adaptive multiplier for splat_upsample_scale."
+        })
         optional["splat_upsample_opacity"] = ("FLOAT", {
             "default": 0.9, "min": 0.01, "max": 1.0, "step": 0.01,
             "tooltip": "Constant Gaussian opacity for high-res backprojected splats."
@@ -1201,31 +1181,14 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
             "tooltip": "Voxel size for high-res backprojected splat merge."
         })
         optional["splat_upsample_max_points"] = ("INT", {
-            "default": 5000000, "min": 0, "max": 50000000, "step": 100000,
-            "tooltip": "Deterministically downsample high-res splats to this many points. 0 disables the cap."
+            "default": 14000000, "min": 0, "max": 50000000, "step": 100000,
+            "tooltip": "Depth-aware downsample high-res splats to this many points. 0 disables the cap."
+        })
+        optional["splat_upsample_cap_far_bias"] = ("FLOAT", {
+            "default": 1.75, "min": 0.0, "max": 8.0, "step": 0.05,
+            "tooltip": "Preserve proportionally more far-depth splats when applying splat_upsample_max_points."
         })
         return inputs
-
-    def _chunk_ranges(self, total, chunk_size, chunk_overlap):
-        chunk_size = max(1, int(chunk_size))
-        chunk_overlap = max(0, min(int(chunk_overlap), chunk_size - 1))
-        step = max(1, chunk_size - chunk_overlap)
-        ranges = []
-        start = 0
-        while start < total:
-            end = min(total, start + chunk_size)
-            ranges.append((start, end))
-            if end >= total:
-                break
-            start += step
-        return ranges
-
-    def _slice_like_views(self, value, indices, total):
-        if value is None:
-            return None
-        if isinstance(value, torch.Tensor) and value.shape[0] == total:
-            return value[indices.to(value.device)]
-        return value
 
     def _splat_value_to_points(self, value):
         if isinstance(value, list):
@@ -1236,53 +1199,110 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
             return value[0] if value.dim() >= 3 and value.shape[0] == 1 else value
         return None
 
-    def _merge_splats(self, splat_dicts):
-        keys = ("means", "scales", "quats", "sh", "colors", "opacities", "weights")
-        merged = {}
-        expected_count = None
-        for key in keys:
-            parts = []
-            for splats in splat_dicts:
-                if not isinstance(splats, dict) or key not in splats:
-                    continue
-                value = self._splat_value_to_points(splats[key])
-                if isinstance(value, torch.Tensor):
-                    parts.append(value.detach().cpu())
-            if parts:
-                value = torch.cat(parts, dim=0)
-                if key == "means":
-                    expected_count = value.shape[0]
-                elif expected_count is not None and value.shape[0] != expected_count:
-                    print(
-                        f"⚠️ [V2 EXP] Dropping merged splat key '{key}' due to length mismatch: "
-                        f"{value.shape[0]} != {expected_count}"
-                    )
-                    continue
-                merged[key] = [value]
-        return merged if "means" in merged else None
+    def _depth_aware_indices(self, depth_values, max_points, far_bias=1.75, bins=8):
+        depth = depth_values.detach().cpu().float().flatten()
+        total = int(depth.numel())
+        max_points = int(max_points)
+        if max_points <= 0 or total <= max_points:
+            return None
 
-    def _cat_optional_tensors(self, values, dim):
-        tensors = [v.detach().cpu() for v in values if isinstance(v, torch.Tensor)]
-        if not tensors:
-            return None
-        return torch.cat(tensors, dim=dim)
+        finite = torch.isfinite(depth)
+        if not bool(finite.any()):
+            return torch.linspace(0, total - 1, max_points, dtype=torch.long)
 
-    def _depth_prior_from_anchor(self, anchor_output, source="depth"):
-        raw = anchor_output[5]
-        if not isinstance(raw, dict):
-            return None
-        depth = raw.get(source)
-        if depth is None and source != "depth":
-            depth = raw.get("depth")
-        if not isinstance(depth, torch.Tensor):
-            return None
-        if depth.dim() == 5:
-            depth = depth[0]
-        if depth.dim() == 3:
-            depth = depth[..., None]
-        if depth.dim() != 4:
-            return None
-        return depth.detach().cpu().float()
+        depth_valid = depth[finite]
+        d_min = depth_valid.min()
+        d_max = depth_valid.max()
+        if (d_max - d_min).abs().item() < 1e-8:
+            return torch.linspace(0, total - 1, max_points, dtype=torch.long)
+
+        normalized = ((depth - d_min) / (d_max - d_min)).clamp(0.0, 1.0)
+        normalized = torch.where(torch.isfinite(normalized), normalized, torch.zeros_like(normalized))
+        bin_ids = torch.clamp((normalized * bins).long(), max=bins - 1)
+        quotas = []
+        remaining = max_points
+        for bin_id in range(bins):
+            count = int((bin_ids == bin_id).sum().item())
+            weight = 1.0 + float(far_bias) * (bin_id / max(1, bins - 1))
+            quotas.append([bin_id, count, weight, 0])
+
+        weighted_total = sum(count * weight for _, count, weight, _ in quotas)
+        if weighted_total <= 0:
+            return torch.linspace(0, total - 1, max_points, dtype=torch.long)
+
+        for item in quotas:
+            _, count, weight, _ = item
+            quota = min(count, int(round(max_points * (count * weight) / weighted_total)))
+            item[3] = quota
+            remaining -= quota
+
+        if remaining != 0:
+            order = sorted(
+                range(len(quotas)),
+                key=lambda i: quotas[i][2],
+                reverse=remaining > 0,
+            )
+            while remaining != 0:
+                changed = False
+                for i in order:
+                    if remaining == 0:
+                        break
+                    count = quotas[i][1]
+                    quota = quotas[i][3]
+                    if remaining > 0 and quota < count:
+                        quotas[i][3] += 1
+                        remaining -= 1
+                        changed = True
+                    elif remaining < 0 and quota > 0:
+                        quotas[i][3] -= 1
+                        remaining += 1
+                        changed = True
+                if not changed:
+                    break
+
+        selected = []
+        for bin_id, count, _, quota in quotas:
+            if count <= 0 or quota <= 0:
+                continue
+            ids = torch.where(bin_ids == bin_id)[0]
+            if ids.numel() <= quota:
+                selected.append(ids)
+            else:
+                take = torch.linspace(0, ids.numel() - 1, quota, dtype=torch.long)
+                selected.append(ids[take])
+
+        if not selected:
+            return torch.linspace(0, total - 1, max_points, dtype=torch.long)
+        idx = torch.cat(selected).sort().values
+        if idx.numel() > max_points:
+            take = torch.linspace(0, idx.numel() - 1, max_points, dtype=torch.long)
+            idx = idx[take]
+        return idx
+
+    def _cap_splats(self, splats, max_points, depth_values=None, far_bias=1.75):
+        if not max_points or max_points <= 0 or not isinstance(splats, dict):
+            return splats
+        current_means = self._splat_value_to_points(splats.get("means"))
+        if not isinstance(current_means, torch.Tensor) or current_means.shape[0] <= max_points:
+            return splats
+
+        n = current_means.shape[0]
+        if isinstance(depth_values, torch.Tensor) and depth_values.numel() == n:
+            idx = self._depth_aware_indices(depth_values, max_points, far_bias=far_bias)
+            cap_kind = "depth-aware"
+        else:
+            distance = torch.linalg.norm(current_means.detach().cpu().float(), dim=-1)
+            idx = self._depth_aware_indices(distance, max_points, far_bias=far_bias)
+            cap_kind = "distance-aware"
+        if idx is None:
+            return splats
+
+        for key, value in list(splats.items()):
+            points = self._splat_value_to_points(value)
+            if isinstance(points, torch.Tensor) and points.shape[0] == n:
+                splats[key] = [points[idx.to(points.device)]]
+        print(f"🧪 [V2 EXP] Upsample {cap_kind} point cap: {n} -> {int(max_points)} gaussians")
+        return splats
 
     def _prepare_highres_views(self, images, camera_intrinsics, upsample_size):
         image_tensors = []
@@ -1324,10 +1344,14 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
         upsample_size,
         depth_source,
         splat_scale,
+        scale_mode,
+        depth_scale_strength,
+        depth_scale_max,
         splat_opacity,
         voxel_prune,
         voxel_size,
         max_points,
+        cap_far_bias,
     ):
         if not V2_UTILS_AVAILABLE:
             print("⚠️ [V2 EXP] splat upsample skipped: V2 utilities unavailable.")
@@ -1370,7 +1394,25 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
         pts, _, _ = depth_to_world_coords_points(depth_hi, poses, intrs)
         means = pts.reshape(1, S * H * W, 3)
         sh = ((highres_imgs.permute(0, 1, 3, 4, 2).reshape(1, S * H * W, 3) - 0.5) / 0.28209479177387814).float()
-        scales = torch.full_like(means, float(splat_scale))
+        depth_flat = depth_hi.reshape(1, S * H * W)
+        if scale_mode == "depth_adaptive":
+            d_min = depth_flat.min()
+            d_max = depth_flat.max()
+            if (d_max - d_min).abs().item() > 1e-8:
+                depth_norm = ((depth_flat - d_min) / (d_max - d_min)).clamp(0.0, 1.0)
+                multiplier = (1.0 + float(depth_scale_strength) * depth_norm).clamp(
+                    1.0,
+                    float(depth_scale_max),
+                )
+            else:
+                multiplier = torch.ones_like(depth_flat)
+            scales = torch.full_like(means, float(splat_scale)) * multiplier[..., None]
+            print(
+                "🧪 [V2 EXP] Upsample depth-adaptive scale: "
+                f"base={float(splat_scale):.5f}, max_multiplier={float(multiplier.max().item()):.2f}"
+            )
+        else:
+            scales = torch.full_like(means, float(splat_scale))
         opacities = torch.full((1, means.shape[1]), float(splat_opacity), dtype=torch.float32)
         quats = torch.zeros((1, means.shape[1], 4), dtype=torch.float32)
         quats[..., 0] = 1.0
@@ -1389,20 +1431,13 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
             if isinstance(pruned_means, torch.Tensor):
                 print(f"🧪 [V2 EXP] Upsample voxel prune: {n_before} -> {pruned_means.shape[0]} gaussians")
 
-        if max_points and max_points > 0 and isinstance(splats, dict):
-            current_means = self._splat_value_to_points(splats.get("means"))
-            if isinstance(current_means, torch.Tensor) and current_means.shape[0] > max_points:
-                n = current_means.shape[0]
-                idx = torch.linspace(0, n - 1, int(max_points), dtype=torch.long)
-                for key, value in list(splats.items()):
-                    points = self._splat_value_to_points(value)
-                    if isinstance(points, torch.Tensor) and points.shape[0] == n:
-                        splats[key] = [points[idx]]
-                print(f"🧪 [V2 EXP] Upsample point cap: {n} -> {int(max_points)} gaussians")
+        cap_depth = depth_flat.flatten() if not voxel_prune else None
+        splats = self._cap_splats(splats, max_points, depth_values=cap_depth, far_bias=cap_far_bias)
 
         ply_data = dict(output[0])
         ply_data.update({
             "splats": splats,
+            "skip_scale_filter": True,
             "images": highres_imgs,
             "camera_poses": poses.unsqueeze(0),
             "camera_intrs": intrs.unsqueeze(0),
@@ -1437,164 +1472,45 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
             output[12],
         )
 
-    def _merge_chunk_outputs(self, outputs, chunk_merge_voxel_prune, chunk_merge_voxel_size, chunk_keep_diagnostics):
-        first = outputs[0]
-        ply_datas = [out[0] for out in outputs]
-        merged_splats = self._merge_splats([ply.get("splats") for ply in ply_datas if isinstance(ply, dict)])
-        if chunk_merge_voxel_prune and merged_splats is not None:
-            merged_splats = _voxel_prune_splats_dict(merged_splats, chunk_merge_voxel_size)
-
-        merged_ply = dict(ply_datas[0])
-        merged_ply.update({
-            "splats": merged_splats,
-            "pts3d": None,
-            "pts3d_filtered": None,
-            "filter_mask": None,
-            "gs_filter_mask": None,
-            "images": first[5].get("images") if isinstance(first[5], dict) else None,
-        })
-
-        cam_poses = self._cat_optional_tensors([out[3] for out in outputs], dim=1)
-        cam_intrs = self._cat_optional_tensors([out[4] for out in outputs], dim=1)
-        if cam_poses is not None:
-            merged_ply["camera_poses"] = cam_poses
-        if cam_intrs is not None:
-            merged_ply["camera_intrs"] = cam_intrs
-
-        merged_raw = dict(first[5]) if isinstance(first[5], dict) else {}
-        merged_raw["splats"] = merged_splats
-        if cam_poses is not None:
-            merged_raw["camera_poses"] = cam_poses
-        if cam_intrs is not None:
-            merged_raw["camera_intrs"] = cam_intrs
-
-        if chunk_keep_diagnostics:
-            image_outputs = [
-                self._cat_optional_tensors([out[i] for out in outputs], dim=0)
-                for i in (1, 2, 6, 7, 8, 9, 10, 11, 12)
-            ]
-        else:
-            image_outputs = [first[i] for i in (1, 2, 6, 7, 8, 9, 10, 11, 12)]
-
-        return (
-            merged_ply,
-            image_outputs[0],
-            image_outputs[1],
-            cam_poses if cam_poses is not None else first[3],
-            cam_intrs if cam_intrs is not None else first[4],
-            merged_raw,
-            image_outputs[2],
-            image_outputs[3],
-            image_outputs[4],
-            image_outputs[5],
-            image_outputs[6],
-            image_outputs[7],
-            image_outputs[8],
-        )
-
     def run_inference(
         self,
         model,
         images,
         use_gsplat=True,
-        chunked_inference=False,
-        chunk_size=4,
-        chunk_overlap=0,
-        chunk_merge_voxel_prune=True,
-        chunk_merge_voxel_size=0.002,
-        chunk_keep_diagnostics=False,
-        chunk_anchor_depth_prior=True,
-        chunk_anchor_target_size=518,
         splat_upsample_mode="none",
         splat_upsample_size=1022,
         splat_upsample_depth_source="gs_depth",
         splat_upsample_scale=0.003,
+        splat_upsample_scale_mode="constant",
+        splat_upsample_depth_scale_strength=0.0,
+        splat_upsample_depth_scale_max=3.0,
         splat_upsample_opacity=0.9,
         splat_upsample_voxel_prune=True,
         splat_upsample_voxel_size=0.0015,
-        splat_upsample_max_points=5_000_000,
+        splat_upsample_max_points=14_000_000,
+        splat_upsample_cap_far_bias=1.75,
         **kwargs,
     ):
-        if not chunked_inference:
-            output = super().run_inference(model, images, use_gsplat=use_gsplat, **kwargs)
-            if splat_upsample_mode == "depth_backproject":
-                output = self._build_upsampled_splats(
-                    output,
-                    images,
-                    kwargs.get("camera_poses"),
-                    kwargs.get("camera_intrinsics"),
-                    splat_upsample_size,
-                    splat_upsample_depth_source,
-                    splat_upsample_scale,
-                    splat_upsample_opacity,
-                    splat_upsample_voxel_prune,
-                    splat_upsample_voxel_size,
-                    splat_upsample_max_points,
-                )
-            return output
-
-        total = int(images.shape[0])
-        ranges = self._chunk_ranges(total, chunk_size, chunk_overlap)
-        print(
-            f"🧪 [V2 EXP] Chunked inference: {total} views, {len(ranges)} chunks, "
-            f"chunk_size={chunk_size}, overlap={chunk_overlap}, target_size={kwargs.get('target_size', 952)}"
-        )
-
-        anchor_depth_prior = None
-        if chunk_anchor_depth_prior and kwargs.get("depth_prior") is None:
-            anchor_kwargs = dict(kwargs)
-            anchor_kwargs["target_size"] = chunk_anchor_target_size
-            anchor_kwargs["depth_prior"] = None
-            anchor_kwargs["debug_log"] = False
-            anchor_kwargs["voxel_prune_splats"] = False
-            print(
-                f"🧪 [V2 EXP] Anchor pass: {total} views @ {chunk_anchor_target_size}px "
-                "for shared depth prior"
-            )
-            anchor_out = super().run_inference(
-                model,
+        output = super().run_inference(model, images, use_gsplat=use_gsplat, **kwargs)
+        if splat_upsample_mode == "depth_backproject":
+            output = self._build_upsampled_splats(
+                output,
                 images,
-                use_gsplat=False,
-                **anchor_kwargs,
+                kwargs.get("camera_poses"),
+                kwargs.get("camera_intrinsics"),
+                splat_upsample_size,
+                splat_upsample_depth_source,
+                splat_upsample_scale,
+                splat_upsample_scale_mode,
+                splat_upsample_depth_scale_strength,
+                splat_upsample_depth_scale_max,
+                splat_upsample_opacity,
+                splat_upsample_voxel_prune,
+                splat_upsample_voxel_size,
+                splat_upsample_max_points,
+                splat_upsample_cap_far_bias,
             )
-            anchor_depth_prior = self._depth_prior_from_anchor(anchor_out)
-            if anchor_depth_prior is not None:
-                print(f"🧪 [V2 EXP] Anchor depth prior: {tuple(anchor_depth_prior.shape)}")
-            elif torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        outputs = []
-        for chunk_idx, (start, end) in enumerate(ranges, 1):
-            indices = torch.arange(start, end, dtype=torch.long)
-            chunk_kwargs = dict(kwargs)
-            for key in ("camera_intrinsics", "camera_poses", "depth_prior"):
-                chunk_kwargs[key] = self._slice_like_views(kwargs.get(key), indices, total)
-            if anchor_depth_prior is not None:
-                chunk_kwargs["depth_prior"] = self._slice_like_views(anchor_depth_prior, indices, total)
-            print(f"🧪 [V2 EXP] Chunk {chunk_idx}/{len(ranges)}: views[{start}:{end}]")
-            out = super().run_inference(
-                model,
-                images[indices.to(images.device)] if isinstance(images, torch.Tensor) else images[start:end],
-                use_gsplat=use_gsplat,
-                **chunk_kwargs,
-            )
-            outputs.append(out)
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        merged = self._merge_chunk_outputs(
-            outputs,
-            chunk_merge_voxel_prune=chunk_merge_voxel_prune,
-            chunk_merge_voxel_size=chunk_merge_voxel_size,
-            chunk_keep_diagnostics=chunk_keep_diagnostics,
-        )
-        splats = merged[0].get("splats")
-        means = None
-        if isinstance(splats, dict):
-            means = self._splat_value_to_points(splats.get("means"))
-        if isinstance(means, torch.Tensor):
-            print(f"🧪 [V2 EXP] Merged splats: {means.shape[0]} gaussians")
-        return merged
+        return output
 
 
 # ─────────────────────────────────────────────────────────────────────────────
