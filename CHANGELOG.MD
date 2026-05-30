@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.3.0
+
+### Added
+
+- Added WorldMirror V2 low-VRAM controls for head frame chunking, Gaussian parameter chunking, transformer MLP token chunking, and selectable head compute modes.
+- Added a single `low_vram_mode` profile for the clean WorldMirror V2 node, applying the proven low-memory defaults while keeping individual tuning controls in the advanced node.
+- Added WorldMirror V2 `depth_only` and `depth+gs` execution modes to skip unnecessary heads when pushing high reconstruction resolutions.
+- Added `torchao` as a main dependency for WorldMirror V2 FP8 weight-only quantization.
+
+### Changed
+
+- Updated the package version to `1.3.0`.
+- Reworked WorldMirror V2 loading so models are prepared on CPU before CUDA residency, avoiding the old temporary fp32 VRAM spike during load.
+- Updated FP8 loading to cast the model to bf16 first, move it to CUDA, and then apply torchao FP8 quantization on the target GPU for compatibility with torchao tensor subclasses.
+- Raised WorldMirror V2 `target_size` limits to `4096` for experimental high-resolution runs.
+- Updated the clean WorldMirror V2 node to infer dense splat upsample size from the incoming view resolution and hide fixed camera/source/upsample-mode controls.
+- Kept dense splat scale, adaptive scale, voxel pruning, and point-cap controls available in the clean node because they directly affect density and file size.
+- Kept the advanced WorldMirror V2 node fully manual by exposing all individual low-VRAM and high-resolution tuning controls instead of the grouped `low_vram_mode` profile.
+- Reduced WorldMirror V2 head and Gaussian renderer peak memory by chunking DPT head frames and Gaussian parameter-head frames.
+- Reduced transformer peak memory by chunking MLP evaluation and using functional linear operations with in-place bias application.
+- Updated DPT dense head output handling so Gaussian features are not forced back to float32 before splat generation.
+- Updated the bundled WorldMirror panorama workflow for the new high-resolution and low-VRAM defaults.
+
+### Fixed
+
+- Fixed FP8 WorldMirror V2 failures caused by applying torchao quantization before moving the model to CUDA.
+- Fixed `model_cpu_offload` incompatibility with torchao FP8 weights by detecting FP8/tensor-subclass models and keeping them GPU-resident.
+- Fixed high-resolution WorldMirror V2 OOM pressure from CUDA double-precision positional embedding generation.
+- Fixed edge-filter handling when `head_compute_mode` skips normal prediction by reporting the skipped filter instead of assuming normals exist.
+- Fixed an inconsistent clean-node UI where grouped low-VRAM mode and its individual internal controls were shown at the same time.
+
 ## 1.2.0
 
 ### Added

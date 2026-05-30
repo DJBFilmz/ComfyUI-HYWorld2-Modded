@@ -5,6 +5,7 @@
 
 from typing import Callable, Optional
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 
@@ -25,14 +26,28 @@ class Mlp(nn.Module):
         self.act = act_layer()
         self.fc2 = nn.Linear(hidden_features, out_features, bias=bias)
         self.drop = nn.Dropout(drop)
+        self.inference_chunk_size = 0
 
-    def forward(self, x: Tensor) -> Tensor:
-        x = self.fc1(x)
+    def _forward_impl(self, x: Tensor) -> Tensor:
+        x = F.linear(x, self.fc1.weight, None)
+        if self.fc1.bias is not None:
+            x.add_(self.fc1.bias)
         x = self.act(x)
         x = self.drop(x)
-        x = self.fc2(x)
+        x = F.linear(x, self.fc2.weight, None)
+        if self.fc2.bias is not None:
+            x.add_(self.fc2.bias)
         x = self.drop(x)
         return x
+
+    def forward(self, x: Tensor) -> Tensor:
+        chunk_size = int(getattr(self, "inference_chunk_size", 0) or 0)
+        if self.training or chunk_size <= 0 or x.dim() < 3 or x.shape[-2] <= chunk_size:
+            return self._forward_impl(x)
+        return torch.cat(
+            [self._forward_impl(chunk) for chunk in torch.split(x, chunk_size, dim=-2)],
+            dim=-2,
+        )
 
 
 class MlpFP32(Mlp):
