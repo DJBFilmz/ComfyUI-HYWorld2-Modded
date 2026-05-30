@@ -52,6 +52,7 @@ try:
     from hyworld2.worldrecon.hyworldmirror.utils.inference_utils import (
         compute_filter_mask,           # high-level: pts_mask + gs_mask
         _compute_sky_mask_from_model,  # model-native sky mask (no ONNX needed)
+        _voxel_prune_gaussians,
     )
     from hyworld2.worldrecon.hyworldmirror.utils.visual_util import (
         segment_sky,
@@ -77,6 +78,311 @@ def _resize_to_tensor(pil_img, target_size):
         new_w = round(orig_w * (new_h / orig_h) / _PATCH_SIZE) * _PATCH_SIZE
     pil_img = pil_img.resize((new_w, new_h), Image.Resampling.BICUBIC)
     return transforms.ToTensor()(pil_img), orig_w, orig_h, new_w, new_h
+
+
+def _adaptive_target_size_from_images(images, max_target_size):
+    """Match the official adaptive-size idea for in-memory ComfyUI images."""
+    if images is None or images.shape[0] == 0:
+        return max_target_size
+    heights = images.shape[1]
+    widths = images.shape[2]
+    longest = max(int(widths), int(heights))
+    target = min(max_target_size, longest)
+    target = max(_PATCH_SIZE, (target // _PATCH_SIZE) * _PATCH_SIZE)
+    return target
+
+
+def _map_to_comfy_image(value, fallback_shape, normalize=True):
+    """Convert [1,S,H,W], [1,S,H,W,1], [S,H,W], or [S,H,W,1] maps to [S,H,W,3]."""
+    S, H, W = fallback_shape
+    if value is None:
+        return torch.zeros(S, H, W, 3, dtype=torch.float32)
+    if isinstance(value, np.ndarray):
+        t = torch.from_numpy(value)
+    else:
+        t = value.detach().cpu()
+    t = t.float()
+    if t.dim() == 5:
+        t = t[0]
+    if t.dim() == 4 and t.shape[-1] == 1:
+        t = t[..., 0]
+    elif t.dim() == 4 and t.shape[1] == 1:
+        t = t[:, 0]
+    if t.dim() == 2:
+        t = t.unsqueeze(0)
+    if t.dim() != 3:
+        return torch.zeros(S, H, W, 3, dtype=torch.float32)
+    if normalize:
+        t_min = t.amin(dim=(1, 2), keepdim=True)
+        t_max = t.amax(dim=(1, 2), keepdim=True)
+        t = (t - t_min) / (t_max - t_min + 1e-8)
+    else:
+        t = t.clamp(0, 1)
+    return t.unsqueeze(-1).repeat(1, 1, 1, 3).float()
+
+
+def _resize_depth_prior(depth_prior, target_size, expected_count):
+    """Resize optional ComfyUI depth IMAGE to [1,S,H,W] for WorldMirror depth conditioning."""
+    if depth_prior is None:
+        return None
+    if depth_prior.shape[0] not in (1, expected_count):
+        raise ValueError(
+            f"depth_prior must have 1 frame or match images ({expected_count}); got {depth_prior.shape[0]}"
+        )
+    if depth_prior.shape[0] == 1 and expected_count > 1:
+        depth_prior = depth_prior.repeat(expected_count, 1, 1, 1)
+
+    depth_list = []
+    for i in range(expected_count):
+        depth_np = depth_prior[i].detach().cpu().numpy()
+        if depth_np.ndim == 3:
+            depth_np = depth_np[..., 0]
+        depth_np = np.nan_to_num(depth_np.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        if depth_np.max() <= 0:
+            depth_np = np.ones_like(depth_np, dtype=np.float32)
+        depth_min = depth_np[depth_np > 0].min() if np.any(depth_np > 0) else depth_np.min()
+        depth_np = depth_np - depth_min
+        if depth_np.max() > 0:
+            depth_np = depth_np / depth_np.max()
+        orig_h, orig_w = depth_np.shape[:2]
+        if orig_w >= orig_h:
+            new_w = target_size
+            new_h = round(orig_h * (new_w / orig_w) / _PATCH_SIZE) * _PATCH_SIZE
+        else:
+            new_h = target_size
+            new_w = round(orig_w * (new_h / orig_h) / _PATCH_SIZE) * _PATCH_SIZE
+        d = torch.from_numpy(depth_np).float().view(1, 1, orig_h, orig_w)
+        d = torch.nn.functional.interpolate(d, size=(new_h, new_w), mode="bilinear", align_corners=False)[0, 0]
+        if new_h > target_size:
+            crop = (new_h - target_size) // 2
+            d = d[crop:crop + target_size, :]
+        depth_list.append(d)
+    return torch.stack(depth_list).unsqueeze(0)
+
+
+def _apply_mask_to_splats(splats, mask_np):
+    if splats is None or mask_np is None:
+        return splats
+    flat_mask = torch.from_numpy(mask_np.reshape(-1)).bool()
+
+    def _filter_splat_tensor(t):
+        mask = flat_mask.to(t.device)
+        if t.dim() >= 2 and t.shape[1] == mask.shape[0]:
+            return t[:, mask, ...]
+        if t.dim() >= 1 and t.shape[0] == mask.shape[0]:
+            return t[mask, ...]
+        return t
+
+    filtered = {}
+    for k, v in splats.items():
+        if isinstance(v, list):
+            filtered[k] = [
+                _filter_splat_tensor(t) if isinstance(t, torch.Tensor) else t
+                for t in v
+            ]
+        elif isinstance(v, torch.Tensor):
+            filtered[k] = _filter_splat_tensor(v)
+        else:
+            filtered[k] = v
+    return filtered
+
+
+def _voxel_prune_splats_dict(splats, voxel_size):
+    if splats is None or voxel_size <= 0 or not V2_UTILS_AVAILABLE:
+        return splats
+    required = ("means", "scales", "quats", "opacities")
+    if not isinstance(splats, dict) or any(k not in splats for k in required):
+        return splats
+    out = dict(splats)
+    batches = len(splats["means"]) if isinstance(splats["means"], list) else splats["means"].shape[0]
+    pruned = {k: [] for k in ("means", "scales", "quats", "opacities")}
+    color_key = "sh" if "sh" in splats else "colors" if "colors" in splats else None
+    if color_key is None:
+        return splats
+    pruned[color_key] = []
+
+    for i in range(batches):
+        def get_item(key):
+            v = splats[key]
+            return v[i] if isinstance(v, list) else v[i]
+
+        means = get_item("means").detach().cpu()
+        scales = get_item("scales").detach().cpu()
+        quats = get_item("quats").detach().cpu()
+        opacities = get_item("opacities").detach().cpu().reshape(-1)
+        colors = get_item(color_key).detach().cpu()
+        if colors.dim() == 3 and colors.shape[1] == 1:
+            colors_for_prune = colors[:, 0, :]
+        else:
+            colors_for_prune = colors.reshape(colors.shape[0], -1)[:, :3]
+        weights = get_item("weights").detach().cpu().reshape(-1) if "weights" in splats else torch.ones_like(opacities)
+        means, scales, quats, colors_new, opacities = _voxel_prune_gaussians(
+            means, scales, quats, colors_for_prune, opacities, weights, voxel_size=voxel_size
+        )
+        pruned["means"].append(means)
+        pruned["scales"].append(scales)
+        pruned["quats"].append(quats)
+        pruned["opacities"].append(opacities)
+        if color_key == "sh":
+            pruned[color_key].append(colors_new[:, None, :])
+        else:
+            pruned[color_key].append(colors_new)
+    out.update(pruned)
+    return out
+
+
+def _module_has_meta_tensors(module):
+    return any(p.device.type == "meta" for p in module.parameters())
+
+
+def _first_real_device(module, fallback=torch.device("cpu")):
+    for param in module.parameters():
+        if param.device.type != "meta":
+            return param.device
+    return fallback
+
+
+def _move_worldmirror(module, device):
+    if _module_has_meta_tensors(module):
+        raise RuntimeError(
+            "WorldMirror V2 model contains meta tensors, most likely from a previous "
+            "model_cpu_offload run. Reload the Load WorldMirror V2 Model node, or keep "
+            "offload_scheme=model_cpu_offload for this model instance."
+        )
+    module.to(device)
+
+
+def _camera_debug_angles(c2w):
+    """Return approximate yaw/pitch/roll in degrees from a c2w matrix."""
+    R = c2w[:3, :3].float()
+    forward = R @ torch.tensor([0.0, 0.0, 1.0], device=R.device)
+    up = R @ torch.tensor([0.0, -1.0, 0.0], device=R.device)
+    yaw = torch.atan2(forward[0], forward[2]) * 180.0 / torch.pi
+    pitch = torch.asin(torch.clamp(-forward[1] / forward.norm().clamp_min(1e-8), -1.0, 1.0)) * 180.0 / torch.pi
+    roll = torch.atan2(up[0], -up[1]) * 180.0 / torch.pi
+    return yaw.item(), pitch.item(), roll.item()
+
+
+def _angle_delta_deg(a, b):
+    return ((a - b + 180.0) % 360.0) - 180.0
+
+
+def _tensor_stats_line(name, value):
+    if value is None:
+        return f"{name}=none"
+    t = value.detach().cpu().float()
+    if t.numel() == 0:
+        return f"{name}=empty"
+    return (
+        f"{name}: min={t.min().item():.4f}, p10={torch.quantile(t.flatten(), 0.10).item():.4f}, "
+        f"median={t.median().item():.4f}, p90={torch.quantile(t.flatten(), 0.90).item():.4f}, "
+        f"max={t.max().item():.4f}"
+    )
+
+
+def _log_camera_table(title, poses, intrs, H, W):
+    if poses is None and intrs is None:
+        print(f"[V2 DEBUG] {title}: none")
+        return
+    poses_cpu = poses.detach().cpu().float() if poses is not None else None
+    intrs_cpu = intrs.detach().cpu().float() if intrs is not None else None
+    if poses_cpu is not None and poses_cpu.dim() == 4:
+        poses_cpu = poses_cpu[0]
+    if intrs_cpu is not None and intrs_cpu.dim() == 4:
+        intrs_cpu = intrs_cpu[0]
+    count = poses_cpu.shape[0] if poses_cpu is not None else intrs_cpu.shape[0]
+    print(f"[V2 DEBUG] {title}: {count} cameras")
+    for i in range(count):
+        if poses_cpu is not None:
+            yaw, pitch, roll = _camera_debug_angles(poses_cpu[i])
+            t = poses_cpu[i, :3, 3]
+            pose_part = (
+                f"yaw={yaw:8.3f} pitch={pitch:8.3f} roll={roll:8.3f} "
+                f"t=({t[0].item(): .4f},{t[1].item(): .4f},{t[2].item(): .4f})"
+            )
+        else:
+            pose_part = "pose=none"
+        if intrs_cpu is not None:
+            fx = intrs_cpu[i, 0, 0].item()
+            fy = intrs_cpu[i, 1, 1].item()
+            cx = intrs_cpu[i, 0, 2].item()
+            cy = intrs_cpu[i, 1, 2].item()
+            fov_x = 2.0 * np.degrees(np.arctan(W * 0.5 / max(fx, 1e-8)))
+            fov_y = 2.0 * np.degrees(np.arctan(H * 0.5 / max(fy, 1e-8)))
+            intr_part = (
+                f"fx={fx:8.3f} fy={fy:8.3f} cx={cx:7.2f} cy={cy:7.2f} "
+                f"fov=({fov_x:6.2f},{fov_y:6.2f})"
+            )
+        else:
+            intr_part = "intr=none"
+        print(f"[V2 DEBUG]   {i:02d}: {pose_part} | {intr_part}")
+
+
+def _log_per_view_points(name, points, S, H, W):
+    if points is None:
+        print(f"[V2 DEBUG] {name}: none")
+        return
+    pts = points.detach().cpu().float()
+    if pts.dim() == 5:
+        pts = pts[0].reshape(S, H * W, 3)
+    elif pts.dim() == 3 and pts.shape[1] == S * H * W:
+        pts = pts[0].reshape(S, H * W, 3)
+    elif pts.dim() == 2 and pts.shape[0] == S * H * W:
+        pts = pts.reshape(S, H * W, 3)
+    else:
+        print(f"[V2 DEBUG] {name}: unsupported shape={tuple(pts.shape)}")
+        return
+    print(f"[V2 DEBUG] {name}: per-view world bounds")
+    for i in range(S):
+        p = pts[i]
+        center = p.mean(dim=0)
+        pmin = p.amin(dim=0)
+        pmax = p.amax(dim=0)
+        print(
+            f"[V2 DEBUG]   {i:02d}: center=({center[0]: .4f},{center[1]: .4f},{center[2]: .4f}) "
+            f"min=({pmin[0]: .4f},{pmin[1]: .4f},{pmin[2]: .4f}) "
+            f"max=({pmax[0]: .4f},{pmax[1]: .4f},{pmax[2]: .4f})"
+        )
+
+
+def _log_worldmirror_debug(predictions, views, camera_poses, camera_intrinsics, imgs_tensor):
+    S, _, H, W = imgs_tensor.shape[1:]
+    print("[V2 DEBUG] ================= WorldMirror V2 Debug =================")
+    print(f"[V2 DEBUG] images: S={S}, H={H}, W={W}")
+    _log_camera_table("input camera priors", camera_poses, camera_intrinsics, H, W)
+    _log_camera_table("model predicted cameras", predictions.get("camera_poses"), predictions.get("camera_intrs"), H, W)
+    if camera_poses is not None and predictions.get("camera_poses") is not None:
+        pred = predictions["camera_poses"].detach().cpu().float()[0]
+        inp = camera_poses.detach().cpu().float()
+        print("[V2 DEBUG] predicted - input angular deltas")
+        yaw_deltas = []
+        roll_deltas = []
+        for i in range(min(inp.shape[0], pred.shape[0])):
+            iy, ip, ir = _camera_debug_angles(inp[i])
+            py, pp, pr = _camera_debug_angles(pred[i])
+            dyaw = _angle_delta_deg(py, iy)
+            droll = _angle_delta_deg(pr, ir)
+            yaw_deltas.append(dyaw)
+            roll_deltas.append(droll)
+            print(f"[V2 DEBUG]   {i:02d}: dyaw={dyaw: .3f}, dpitch={pp - ip: .3f}, droll={droll: .3f}")
+        if roll_deltas:
+            mean_abs_roll = sum(abs(v) for v in roll_deltas) / len(roll_deltas)
+            mean_abs_yaw = sum(abs(v) for v in yaw_deltas) / len(yaw_deltas)
+            if mean_abs_roll > 120.0 and mean_abs_yaw > 120.0:
+                print(
+                    "[V2 DEBUG] warning: input camera priors look axis-flipped relative to model predictions; "
+                    "try pose_convention=opencv_c2w before tuning offsets."
+                )
+    print("[V2 DEBUG] " + _tensor_stats_line("depth", predictions.get("depth")))
+    print("[V2 DEBUG] " + _tensor_stats_line("gs_depth", predictions.get("gs_depth")))
+    print("[V2 DEBUG] " + _tensor_stats_line("depth_conf", predictions.get("depth_conf")))
+    print("[V2 DEBUG] " + _tensor_stats_line("pts3d_conf", predictions.get("pts3d_conf")))
+    print("[V2 DEBUG] " + _tensor_stats_line("gs_depth_conf", predictions.get("gs_depth_conf")))
+    _log_per_view_points("pts3d", predictions.get("pts3d"), S, H, W)
+    splats = predictions.get("splats")
+    if isinstance(splats, dict):
+        _log_per_view_points("splats.means", splats.get("means"), S, H, W)
+    print("[V2 DEBUG] =========================================================")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -137,7 +443,7 @@ class VNCCS_LoadWorldMirrorV2Model:
         # .to() is the standard nn.Module version. We apply precision below.
         print(f"🔄 [V2] Loading model (device={device}, precision={precision})")
         model = WorldMirror.from_pretrained(model_dir)
-        model = model.to(device)
+        _move_worldmirror(model, device)
 
         # ── bf16 ──────────────────────────────────────────────────────────────
         if precision == "bf16":
@@ -248,17 +554,62 @@ class VNCCS_WorldMirrorV2_3D:
                 }),
                 "edge_normal_threshold": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 90.0, "step": 0.5}),
                 "edge_depth_threshold":  ("FLOAT", {"default": 0.03, "min": 0.001, "max": 0.5, "step": 0.001}),
+                "apply_confidence_mask": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Discard the lowest-confidence points using confidence_percentile. Official V2 defaults this off."
+                }),
+                "camera_conditioning": (["pose+intrinsics", "intrinsics_only", "pose_only", "none"], {
+                    "default": "pose+intrinsics",
+                    "tooltip": "Which input camera priors to pass into WorldMirror V2. Panorama poses are rotation-only, so testing intrinsics_only/none can reduce seam conflicts."
+                }),
+                "splat_camera_source": (["input_when_available", "predicted"], {
+                    "default": "input_when_available",
+                    "tooltip": "input_when_available keeps panorama GS positions locked to supplied cameras. predicted matches official inference."
+                }),
+                "adaptive_target_size": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Clamp target_size to the input resolution, matching the official Gradio flow more closely."
+                }),
+                "apply_model_masks": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Filter outputs using V2 native depth_mask / gs_depth_mask predictions."
+                }),
+                "model_mask_threshold": ("FLOAT", {
+                    "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Keep pixels whose native model mask is at least this value."
+                }),
+                "voxel_prune_splats": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Voxel-merge filtered Gaussian splats after inference."
+                }),
+                "voxel_size": ("FLOAT", {
+                    "default": 0.002, "min": 0.0001, "max": 0.1, "step": 0.0001,
+                    "tooltip": "Voxel size used when voxel_prune_splats is enabled."
+                }),
+                "debug_log": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Print camera/depth/splat alignment diagnostics to the ComfyUI console."
+                }),
                 "camera_intrinsics": ("TENSOR", {
                     "tooltip": "Optional: intrinsics from Equirect360ToViews node."
                 }),
                 "camera_poses": ("TENSOR", {
                     "tooltip": "Optional: extrinsics from Equirect360ToViews node."
                 }),
+                "depth_prior": ("IMAGE", {
+                    "tooltip": "Optional depth prior matching the input views. Enables WorldMirror cond_flags[1]."
+                }),
             }
         }
 
-    RETURN_TYPES  = ("PLY_DATA", "IMAGE",       "IMAGE",       "TENSOR",         "TENSOR",             "VNCCS_SPLAT")
-    RETURN_NAMES  = ("ply_data", "depth_maps",  "normal_maps", "camera_poses",   "camera_intrinsics",  "raw_splats")
+    RETURN_TYPES  = (
+        "PLY_DATA", "IMAGE", "IMAGE", "TENSOR", "TENSOR", "VNCCS_SPLAT",
+        "IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE",
+    )
+    RETURN_NAMES  = (
+        "ply_data", "depth_maps", "normal_maps", "camera_poses", "camera_intrinsics", "raw_splats",
+        "depth_conf", "pts3d_conf", "depth_mask", "gs_depth_conf", "gs_depth_mask", "filter_mask", "gs_filter_mask",
+    )
     FUNCTION      = "run_inference"
     CATEGORY      = "VNCCS/3D"
 
@@ -274,14 +625,27 @@ class VNCCS_WorldMirrorV2_3D:
         filter_edges        = True,
         edge_normal_threshold = 1.0,
         edge_depth_threshold  = 0.03,
+        apply_confidence_mask = False,
+        camera_conditioning = "pose+intrinsics",
+        splat_camera_source = "input_when_available",
+        adaptive_target_size = False,
+        apply_model_masks = False,
+        model_mask_threshold = 0.5,
+        voxel_prune_splats = False,
+        voxel_size = 0.002,
+        debug_log = False,
         camera_intrinsics   = None,
         camera_poses        = None,
+        depth_prior         = None,
     ):
 
         target_size    = (target_size // _PATCH_SIZE) * _PATCH_SIZE
+        if adaptive_target_size:
+            target_size = _adaptive_target_size_from_images(images, target_size)
         worldmirror    = model["model"]
         exec_dev       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        original_dev   = next(worldmirror.parameters()).device
+        original_dev   = _first_real_device(worldmirror)
+        has_meta_params = _module_has_meta_tensors(worldmirror)
 
         # ── 1. Preprocess: ComfyUI IMAGE [B,H,W,C] → tensor [1,S,3,H,W] ─────
         B = images.shape[0]
@@ -318,31 +682,66 @@ class VNCCS_WorldMirrorV2_3D:
         views      = {"img": imgs_tensor}
         cond_flags = [0, 0, 0]  # [pose, depth, intrinsics]
 
-        if camera_poses is not None:
+        use_pose_prior = camera_conditioning in ("pose+intrinsics", "pose_only")
+        use_intrinsics_prior = camera_conditioning in ("pose+intrinsics", "intrinsics_only")
+        has_input_cameras = camera_poses is not None and camera_intrinsics is not None
+        use_input_splat_cameras = splat_camera_source == "input_when_available" and has_input_cameras
+
+        if (use_pose_prior or use_input_splat_cameras) and camera_poses is not None:
             views["camera_poses"] = camera_poses.unsqueeze(0).to(exec_dev)
+        if use_pose_prior and camera_poses is not None:
             cond_flags[0] = 1
-        if camera_intrinsics is not None:
+        if (use_intrinsics_prior or use_input_splat_cameras) and camera_intrinsics is not None:
             views["camera_intrs"] = camera_intrinsics.unsqueeze(0).to(exec_dev)
+        if use_intrinsics_prior and camera_intrinsics is not None:
             cond_flags[2] = 1
+        if depth_prior is not None:
+            depth_tensor = _resize_depth_prior(depth_prior, target_size, B).to(exec_dev)
+            views["depthmap"] = depth_tensor
+            cond_flags[1] = 1
 
         # ── 3. Offload ────────────────────────────────────────────────────────
+        if has_meta_params and offload_scheme != "model_cpu_offload":
+            raise RuntimeError(
+                "WorldMirror V2 model is currently offloaded/meta. Set offload_scheme "
+                "to model_cpu_offload, or reload the Load WorldMirror V2 Model node "
+                "before running with offload_scheme=none."
+            )
         if offload_scheme == "model_cpu_offload" and exec_dev.type == "cuda":
-            try:
-                from accelerate import cpu_offload
-                cpu_offload(worldmirror, execution_device=exec_dev)
-            except Exception as e:
-                print(f"⚠️ [V2] model_cpu_offload failed ({e}), moving to GPU.")
-                worldmirror.to(exec_dev)
+            if has_meta_params:
+                print("ℹ️ [V2] Model is already accelerate-offloaded; keeping existing offload hooks.")
+            else:
+                try:
+                    from accelerate import cpu_offload
+                    cpu_offload(worldmirror, execution_device=exec_dev)
+                except Exception as e:
+                    print(f"⚠️ [V2] model_cpu_offload failed ({e}), moving to GPU.")
+                    _move_worldmirror(worldmirror, exec_dev)
         else:
             if original_dev != exec_dev:
-                worldmirror.to(exec_dev)
+                _move_worldmirror(worldmirror, exec_dev)
 
 # ── 4. Inference ──────────────────────────────────────────────────────
         original_gs = worldmirror.enable_gs
+        gs_renderer = getattr(worldmirror, "gs_renderer", None)
+        original_inference_position_from = (
+            getattr(gs_renderer, "inference_position_from", "gsdepth+predcamera")
+            if gs_renderer is not None else None
+        )
         worldmirror.enable_gs = use_gsplat and GSPLAT_AVAILABLE
+        effective_splat_camera_source = "predicted"
+        if worldmirror.enable_gs and gs_renderer is not None:
+            gs_renderer.inference_position_from = (
+                "gsdepth+gtcamera" if use_input_splat_cameras else "gsdepth+predcamera"
+            )
+            effective_splat_camera_source = "input" if use_input_splat_cameras else "predicted"
 
         try:
-            print(f"🚀 [V2] Inference: {B} images @ {target_size}px, gs={worldmirror.enable_gs}")
+            print(
+                f"🚀 [V2] Inference: {B} images @ {target_size}px, gs={worldmirror.enable_gs}, "
+                f"camera_conditioning={camera_conditioning}, splat_camera_source={splat_camera_source} "
+                f"(effective={effective_splat_camera_source})"
+            )
             with torch.no_grad():
                 # Determine the target sequence length
                 num_images = images.shape[0] if isinstance(images, torch.Tensor) else len(images)
@@ -449,9 +848,14 @@ class VNCCS_WorldMirrorV2_3D:
             print("✅ [V2] Inference complete")
         finally:
             worldmirror.enable_gs = original_gs
-            if offload_scheme == "none" and original_dev.type == "cpu":
-                worldmirror.to("cpu")
+            if gs_renderer is not None and original_inference_position_from is not None:
+                gs_renderer.inference_position_from = original_inference_position_from
+            if offload_scheme == "none" and original_dev.type == "cpu" and not _module_has_meta_tensors(worldmirror):
+                _move_worldmirror(worldmirror, "cpu")
                 torch.cuda.empty_cache()
+
+        if debug_log:
+            _log_worldmirror_debug(predictions, views, camera_poses, camera_intrinsics, imgs_tensor)
 
         # ── 5. Sky mask (model-native first, ONNX fallback) ──────────────────
         S, H, W = predictions["depth"].shape[1:4]
@@ -486,7 +890,7 @@ class VNCCS_WorldMirrorV2_3D:
                 imgs                 = imgs_tensor,
                 img_paths            = [],            # not needed: sky_mask provided directly
                 H                    = H, W = W, S = S,
-                apply_confidence_mask= True,
+                apply_confidence_mask= apply_confidence_mask,
                 apply_edge_mask      = filter_edges,
                 apply_sky_mask       = apply_sky_mask,
                 confidence_percentile= confidence_percentile,
@@ -495,6 +899,25 @@ class VNCCS_WorldMirrorV2_3D:
                 sky_mask             = sky_mask_np,
                 use_gs_depth         = "gs_depth" in predictions,
             )
+
+        if apply_model_masks:
+            def _native_mask(key):
+                value = predictions.get(key)
+                if value is None:
+                    return None
+                t = value[0].detach().cpu().float()
+                if t.dim() == 4 and t.shape[-1] == 1:
+                    t = t[..., 0]
+                return (t.numpy() >= model_mask_threshold)
+
+            depth_model_mask = _native_mask("depth_mask")
+            gs_depth_model_mask = _native_mask("gs_depth_mask")
+            if depth_model_mask is not None:
+                pts_mask = depth_model_mask if pts_mask is None else (pts_mask & depth_model_mask)
+            if gs_depth_model_mask is not None:
+                gs_mask = gs_depth_model_mask if gs_mask is None else (gs_mask & gs_depth_model_mask)
+            elif depth_model_mask is not None and gs_mask is not None:
+                gs_mask = gs_mask & depth_model_mask
 
         # ── 7. Filter pts3d ───────────────────────────────────────────────────
         filtered_pts = None
@@ -508,31 +931,29 @@ class VNCCS_WorldMirrorV2_3D:
 
         # ── 8. Filter splats with GS-specific mask ────────────────────────────
         splats = predictions.get("splats")
-        if splats is not None and gs_mask is not None:
-            flat_gs = torch.from_numpy(gs_mask.reshape(-1))
-            filtered = {}
-            for k, v in splats.items():
-                if isinstance(v, list):
-                    filtered[k] = [
-                        t[flat_gs.to(t.device)]
-                        if (isinstance(t, torch.Tensor) and t.shape[0] == flat_gs.shape[0])
-                        else t
-                        for t in v
-                    ]
-                else:
-                    filtered[k] = v
-            splats = filtered
+        splat_mask = gs_mask if gs_mask is not None else pts_mask
+        splats = _apply_mask_to_splats(splats, splat_mask)
+        if voxel_prune_splats:
+            splats = _voxel_prune_splats_dict(splats, voxel_size)
 
         # ── 9. Assemble PLY_DATA ──────────────────────────────────────────────
         ply_data = {
             "pts3d":          predictions.get("pts3d"),
             "pts3d_filtered": filtered_pts,
             "pts3d_conf":     predictions.get("pts3d_conf"),
+            "depth_conf":     predictions.get("depth_conf"),
+            "depth_mask":     predictions.get("depth_mask"),
+            "gs_depth_conf":  predictions.get("gs_depth_conf"),
+            "gs_depth_mask":  predictions.get("gs_depth_mask"),
             "splats":         splats,
             "images":         imgs_tensor,
             "filter_mask": (
                 torch.from_numpy(pts_mask.reshape(-1)).to(exec_dev)
                 if pts_mask is not None else None
+            ),
+            "gs_filter_mask": (
+                torch.from_numpy(gs_mask.reshape(-1)).to(exec_dev)
+                if gs_mask is not None else None
             ),
             "camera_poses":   predictions.get("camera_poses"),
             "camera_intrs":   predictions.get("camera_intrs"),
@@ -562,7 +983,20 @@ class VNCCS_WorldMirrorV2_3D:
 
         predictions["images"] = imgs_tensor   # needed by SplatRefiner
 
-        return ply_data, depth_out, normals_out, cam_poses, cam_intrs, predictions
+        fallback_shape = (S, H, W)
+        depth_conf_out = _map_to_comfy_image(predictions.get("depth_conf"), fallback_shape)
+        pts3d_conf_out = _map_to_comfy_image(predictions.get("pts3d_conf"), fallback_shape)
+        depth_mask_out = _map_to_comfy_image(predictions.get("depth_mask"), fallback_shape, normalize=False)
+        gs_depth_conf_out = _map_to_comfy_image(predictions.get("gs_depth_conf"), fallback_shape)
+        gs_depth_mask_out = _map_to_comfy_image(predictions.get("gs_depth_mask"), fallback_shape, normalize=False)
+        filter_mask_out = _map_to_comfy_image(pts_mask, fallback_shape, normalize=False)
+        gs_filter_mask_out = _map_to_comfy_image(gs_mask, fallback_shape, normalize=False)
+
+        return (
+            ply_data, depth_out, normals_out, cam_poses, cam_intrs, predictions,
+            depth_conf_out, pts3d_conf_out, depth_mask_out, gs_depth_conf_out,
+            gs_depth_mask_out, filter_mask_out, gs_filter_mask_out,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

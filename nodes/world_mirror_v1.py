@@ -110,6 +110,30 @@ def build_rotation_matrix(pitch_deg, yaw_deg, roll_deg=0.0):
         
     return R
 
+
+def build_camera_pose_matrix(pitch_deg, yaw_deg, roll_deg=0.0, pose_convention="opencv_c2w"):
+    """Build a 4x4 camera pose matrix for exported camera priors."""
+    if pose_convention == "flip_pitch":
+        R = build_rotation_matrix(-pitch_deg, yaw_deg, roll_deg)
+    elif pose_convention == "flip_yaw":
+        R = build_rotation_matrix(pitch_deg, -yaw_deg, roll_deg)
+    elif pose_convention == "flip_pitch_yaw":
+        R = build_rotation_matrix(-pitch_deg, -yaw_deg, roll_deg)
+    else:
+        R = build_rotation_matrix(pitch_deg, yaw_deg, roll_deg)
+
+    axis_flip = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
+    if pose_convention == "opencv_w2c":
+        R = R.T
+    elif pose_convention == "opengl_c2w":
+        R = R @ axis_flip
+    elif pose_convention == "opengl_w2c":
+        R = (R @ axis_flip).T
+
+    pose = np.eye(4, dtype=np.float32)
+    pose[:3, :3] = R
+    return pose
+
 def equirect_to_perspective(
     equirect_img, 
     fov_deg, 
@@ -117,14 +141,11 @@ def equirect_to_perspective(
     pitch_deg, 
     roll_deg=0.0,
     output_size=(512, 512), 
-    dynamic_fov=False, 
-    correct_distortion=False, 
-    return_mask=False,
-    mask_falloff=2.2
+    dynamic_fov=False,
 ):
     """
     Extract a perspective view from an equirectangular panorama using PyTorch grid_sample.
-    Supports Dynamic FOV reduction and Distortion Correction (Cylindrical-ish projection).
+    Supports Dynamic FOV reduction for off-horizon views.
     """
     # 1. Dynamic FOV Reduction (Strategies 1)
     if dynamic_fov and abs(pitch_deg) > 15:
@@ -228,50 +249,7 @@ def equirect_to_perspective(
     
     out_img = Image.fromarray((out_tensor.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
     
-    mask_img = None
-    if return_mask:
-        # Strategy 2: Distortion Mask
-        # Calculate stretch factor. Simple heuristic: distance from center + ray angle magnitude
-        # High stretch = High value (white), Low stretch = Low value (black)
-        # Or opposite: Weights (1 = good, 0 = bad)
-        
-        # Stretch in rectilinear ~ 1/cos(angle)^3
-        # Angle from center optical axis (fwd)
-        # Dot product with forward vector (0,0,-1)
-        # ray_fwd = (0,0,-1)
-        # cos_angle = z coordinate of normalized unrotated ray? 
-        # Wait, grid_x, grid_y are unrotated. 
-        # rays_z_orig = -f / norm. 
-        # Let's use the normalized unrotated z component.
-        
-        # Recompute unrotated normalized z
-        # raw_norm = torch.sqrt(grid_x**2 + (-grid_y)**2 + (-f)**2)
-        # cos_angle = abs(-f) / raw_norm
-        
-        # --- NEW RADIAL MASKING (FOV-AWARE) ---
-        # Instead of absolute angle, we use distance from image center.
-        # This guarantees we fade out the edges regardless of what FOV is chosen.
-        # r^2 = x^2 + y^2
-        r_sq = grid_x**2 + (-grid_y)**2
-        # Max radius at edge (grid coordinates are [-1, 1])
-        # Corner is at (1, 1) or (-1, -1), so max distance squared is 1^2 + 1^2 = 2.0
-        max_dist_sq = 2.0
-        
-        # Normalized distance squared (0 at center, 1 at corner)
-        dist_sq_norm = r_sq / max_dist_sq
-        
-        # Soft Falloff: (1 - d^2 * multiplier)^power
-        # Default multiplier 2.2 hits zero at radius ~0.95 (just before the corner)
-        weight = torch.clamp(1.0 - dist_sq_norm * mask_falloff, min=0.0, max=1.0) 
-        # Square or cube the weight for steeper falloff
-        weight = torch.pow(weight, 2.0) 
-
-        
-        mask_tensor = weight.unsqueeze(0).unsqueeze(0) # [1, 1, H, W]
-        mask_np = (mask_tensor.squeeze().cpu().numpy() * 255).astype(np.uint8)
-        mask_img = Image.fromarray(mask_np, mode="L")
-
-    return out_img, mask_img, f
+    return out_img, f
 
 
 def create_filter_mask(
@@ -929,10 +907,35 @@ class VNCCS_Equirect360ToViews:
                 "pitches": ("STRING", {"default": "0,-30,30"}),
                 "output_size": ("INT", {"default": 518, "min": 252, "max": 1022, "step": 14}),
                 "dynamic_fov": ("BOOLEAN", {"default": True, "tooltip": "Automatically reduce FOV looking up/down to minimize stretching"}),
-                "correct_distortion": ("BOOLEAN", {"default": False, "tooltip": "Apply cylindrical-like warping to straighten vertical lines"}),
-                "output_distortion_mask": ("BOOLEAN", {"default": False, "tooltip": "Output a mask indicating highly stretched areas (edges)"}),
-                "mask_falloff": ("FLOAT", {"default": 2.2, "min": 0.5, "max": 5.0, "step": 0.1, "tooltip": "Controls how fast the distortion mask fades. Higher = smaller visible area per view (removes more edges)."}),
                 "yaw_offset": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 1.0, "tooltip": "Global rotation offset to align walls with cardinal directions (0, 90, 180, 270)"}),
+                "pose_convention": ([
+                    "opencv_c2w",
+                    "opencv_w2c",
+                    "opengl_c2w",
+                    "opengl_w2c",
+                    "flip_pitch",
+                    "flip_yaw",
+                    "flip_pitch_yaw",
+                ], {
+                    "default": "opencv_c2w",
+                    "tooltip": "Camera pose convention exported to WorldMirror. Views are unchanged; only camera_poses changes."
+                }),
+                "pose_yaw_offset": ("FLOAT", {
+                    "default": 0.0, "min": -45.0, "max": 45.0, "step": 0.5,
+                    "tooltip": "Pose-only yaw calibration. Does not change extracted images."
+                }),
+                "pose_pitch_offset": ("FLOAT", {
+                    "default": 0.0, "min": -30.0, "max": 30.0, "step": 0.5,
+                    "tooltip": "Pose-only pitch calibration. Does not change extracted images."
+                }),
+                "pose_roll_offset": ("FLOAT", {
+                    "default": 0.0, "min": -30.0, "max": 30.0, "step": 0.5,
+                    "tooltip": "Pose-only roll calibration. Does not change extracted images."
+                }),
+                "intrinsics_focal_scale": ("FLOAT", {
+                    "default": 1.0, "min": 0.5, "max": 1.5, "step": 0.01,
+                    "tooltip": "Scales exported fx/fy only. Use to calibrate angular/radial drift without changing views."
+                }),
             }
         }
     
@@ -941,8 +944,10 @@ class VNCCS_Equirect360ToViews:
     FUNCTION = "extract_views"
     CATEGORY = "VNCCS/3D"
     
-    def extract_views(self, panorama, quality="Standard (518)", fov=90, yaw_step=45, pitches="0,-30,30", output_size=518, 
-                      dynamic_fov=True, correct_distortion=False, output_distortion_mask=False, mask_falloff=2.2, yaw_offset=0.0):
+    def extract_views(self, panorama, quality="Standard (518)", fov=90, yaw_step=45, pitches="0,-30,30", output_size=518,
+                      dynamic_fov=True, yaw_offset=0.0, pose_convention="opencv_c2w",
+                      pose_yaw_offset=0.0, pose_pitch_offset=0.0, pose_roll_offset=0.0,
+                      intrinsics_focal_scale=1.0):
         
         # Override output_size if Marble quality is selected
         if "Standard" in quality:
@@ -960,36 +965,28 @@ class VNCCS_Equirect360ToViews:
         yaw_angles = list(range(0, 360, yaw_step))
         
         views = []
-        masks = []
         total = len(yaw_angles) * len(pitch_list)
         
         print(f"🔄 Extracting {total} views from 360° panorama...")
         print(f"   - Settings: FOV={fov}, Step={yaw_step}, Output={output_size}")
-        print(f"   - Features: DynamicFOV={dynamic_fov}, DistortionCorrection={correct_distortion}, Mask={output_distortion_mask}")
+        print(
+            f"   - Features: DynamicFOV={dynamic_fov}, PoseConvention={pose_convention}, "
+            f"PoseOffset=({pose_yaw_offset}, {pose_pitch_offset}, {pose_roll_offset}), "
+            f"FocalScale={intrinsics_focal_scale}"
+        )
 
         intrinsics_list = []
         poses_list = []
 
         for yaw in yaw_angles:
             for pitch in pitch_list:
-                
-                # Smart Projection Logic:
-                # Cylindrical correction is great for the horizon (Pitch ~0) but distorts poles.
-                # Standard Rectilinear is better for looking up/down (Ceiling/Floor).
-                # If correct_distortion is requested, we apply it ONLY to the horizon views.
-                use_correction = correct_distortion and (abs(pitch) < 20)
-                proj_name = "Cylindrical-ish" if use_correction else "Rectilinear"
-                
-                view, mask, focal = equirect_to_perspective(
+                view, focal = equirect_to_perspective(
                     pil_img,
                     fov_deg=fov,
                     yaw_deg=(yaw + yaw_offset) % 360, # Apply Offset and Wrap
                     pitch_deg=pitch,
                     output_size=(output_size, output_size),
                     dynamic_fov=dynamic_fov,
-                    correct_distortion=use_correction, # Pass calculated flag
-                    return_mask=output_distortion_mask,
-                    mask_falloff=mask_falloff
                 )
 
                 # Construct Intrinsics Matrix [3, 3]
@@ -1002,7 +999,7 @@ class VNCCS_Equirect360ToViews:
                 cx, cy = output_size / 2.0, output_size / 2.0
                 fx = focal * (output_size / 2.0) / math.tan(math.radians(fov)/2) # Wait, f is 1/tan(fov_rad/2)
                 # Correct calculation: f_pixels = (output_size / 2.0) * focal
-                f_pixels = (output_size / 2.0) * focal
+                f_pixels = (output_size / 2.0) * focal * intrinsics_focal_scale
                 intra = np.array([
                     [f_pixels, 0, cx],
                     [0, f_pixels, cy],
@@ -1013,38 +1010,19 @@ class VNCCS_Equirect360ToViews:
                 # Construct Pose Matrix [4, 4] (C2W)
                 # Based on Yaw/Pitch/Roll logic in equirect_to_perspective
                 # We use (yaw + yaw_offset) to match the view rotation
-                R = build_rotation_matrix(pitch, yaw + yaw_offset, 0.0)
-                pose = np.eye(4, dtype=np.float32)
-                pose[:3, :3] = R
+                pose = build_camera_pose_matrix(
+                    pitch + pose_pitch_offset,
+                    yaw + yaw_offset + pose_yaw_offset,
+                    pose_roll_offset,
+                    pose_convention,
+                )
                 poses_list.append(pose)
                 
                 view_np = np.array(view).astype(np.float32) / 255.0
                 
-                mask_stat = ""
-                if output_distortion_mask and mask is not None:
-                    # Append Mask as Alpha Channel
-                    mask_np = np.array(mask).astype(np.float32) / 255.0  # [H, W]
-                    
-                    # Log stat
-                    valid_pixels = np.count_nonzero(mask_np > 0.1)
-                    total_pixels = mask_np.size
-                    coverage = (valid_pixels / total_pixels) * 100
-                    mask_stat = f"| Mask Valid: {coverage:.1f}%"
-                    
-                    mask_np = mask_np[:, :, None] # [H, W, 1]
-                    # Ensure view is [H, W, 3]
-                    if view_np.shape[2] == 3:
-                        view_np = np.concatenate([view_np, mask_np], axis=2) # [H, W, 4]
-                elif view_np.shape[2] == 3:
-                     pass
-                
-                print(f"   - View: Pitch={pitch:3d}, Yaw={yaw:3d} | Proj: {proj_name:12s} {mask_stat}")
+                print(f"   - View: Pitch={pitch:3d}, Yaw={yaw:3d} | Proj: Rectilinear")
                      
                 views.append(view_np)
-
-        # Handle mixed channel counts if some failed? No, consistent.
-        # But if output_distortion_mask is False, we return RGB.
-        # If True, we return RGBA.
         
         views_tensor = torch.from_numpy(np.stack(views, axis=0))
         intrinsics_tensor = torch.from_numpy(np.stack(intrinsics_list, axis=0))
