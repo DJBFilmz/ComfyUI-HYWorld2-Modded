@@ -170,6 +170,7 @@
         let currentSplat = null;
         let fullscreenFlight = false;
         let fovReference = null;
+        let viewportScaleCompensation = 1.0;
 
         // Default focal length
         // Default focal length (pixel-space, sane default for 512px view)
@@ -304,12 +305,50 @@
             camera.data.fy = fovReference.fy * scale;
         }
 
+        function markCurrentSplatDirty() {
+            if (!currentSplat || !currentSplat.data) return;
+            currentSplat.data.changed = true;
+            currentSplat.data.detached = false;
+
+            const renderData = renderer?._renderData || renderer?.renderData;
+            if (renderData) {
+                if (renderData.markDirty) {
+                    renderData.markDirty(currentSplat);
+                }
+                renderData.dataChanged = true;
+            }
+        }
+
+        function applyViewportScaleCompensation(height) {
+            if (!currentSplat || !currentSplat.data || !currentSplat.data.scales || !fovReference || !height) {
+                return;
+            }
+
+            // Keeping FOV stable means fx/fy grow with viewport height. Without
+            // this inverse scale, distant low-opacity/dark gaussians become
+            // visibly larger in fullscreen than in the node preview.
+            const desired = Math.min(1.0, fovReference.height / Math.max(1, height));
+            const ratio = desired / viewportScaleCompensation;
+            if (Math.abs(ratio - 1.0) < 0.0001) {
+                return;
+            }
+
+            const scales = currentSplat.data.scales;
+            for (let i = 0; i < scales.length; i++) {
+                scales[i] *= ratio;
+            }
+            viewportScaleCompensation = desired;
+            markCurrentSplatDirty();
+            console.log('[GaussianViewer] Viewport scale compensation:', desired.toFixed(4));
+        }
+
         function resizeRendererToCanvas() {
             if (!renderer || isResolutionLocked) return;
             const width = Math.max(1, canvas.clientWidth);
             const height = Math.max(1, canvas.clientHeight);
             renderer.setSize(width, height);
             applyFovReference(width, height);
+            applyViewportScaleCompensation(height);
         }
 
         function setFullscreenFlight(enabled) {
@@ -591,6 +630,7 @@
                 camera.data.fx = DEFAULT_FOCAL_LENGTH;
                 camera.data.fy = DEFAULT_FOCAL_LENGTH;
                 fovReference = null;
+                viewportScaleCompensation = 1.0;
                 resizeRendererToCanvas();
 
                 // Clear ALL existing objects from scene
@@ -681,7 +721,7 @@
                         }
 
                         // Mark data as changed so gsplat.js re-uploads to GPU
-                        currentSplat.data.changed = true;
+                        markCurrentSplatDirty();
 
                         for (let i = 0; i < scales.length; i++) {
                             const s = scales[i];
@@ -718,6 +758,8 @@
                     scaleInput.value = 1.0;
                     currentScale = 1.0;
                     lastScaleValue = 1.0;
+                    viewportScaleCompensation = 1.0;
+                    applyViewportScaleCompensation(canvas.clientHeight || 1);
                 }
 
                 // Set camera from extrinsics and intrinsics if provided
@@ -962,9 +1004,8 @@
 
                 // Mark data as changed to trigger GPU re-upload
                 // gsplat.js checks data.changed and data.detached
-                currentSplat.data.changed = true;
-                currentSplat.data.detached = false;
-                console.log('[GaussianViewer] Set data.changed=true, data.detached=false');
+                markCurrentSplatDirty();
+                console.log('[GaussianViewer] Marked splat dirty after scale update');
 
                 // Get the render data (could be _renderData or renderData)
                 const renderData = renderer._renderData || renderer.renderData;

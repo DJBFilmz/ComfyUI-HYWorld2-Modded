@@ -75,7 +75,11 @@ app.registerExtension({
                 // less of the 3D viewport without changing scene framing.
                 const node = this;
                 widget.computeSize = function () {
+                    const isNodeResizeClamp = app.canvas?.resizing_node === node;
                     const width = Math.max(240, node.size[0] - 20);
+                    if (isNodeResizeClamp) {
+                        return [width, 80];
+                    }
                     const top = this.last_y ?? 120;
                     const height = Math.max(80, node.size[1] - top - 8);
                     return [width, height];

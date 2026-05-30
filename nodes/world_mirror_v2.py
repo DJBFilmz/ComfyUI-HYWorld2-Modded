@@ -1156,13 +1156,13 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
             "default": 0.003, "min": 0.0001, "max": 0.05, "step": 0.0001,
             "tooltip": "Constant Gaussian scale for high-res backprojected splats."
         })
-        optional["splat_upsample_scale_mode"] = (["constant", "depth_adaptive"], {
+        optional["splat_upsample_scale_mode"] = (["constant", "depth_adaptive", "footprint_adaptive", "hybrid_adaptive"], {
             "default": "constant",
-            "tooltip": "Keep constant unless intentionally testing larger far-depth splats; adaptive scales can trigger saver scale filtering."
+            "tooltip": "constant uses one world-space size; depth_adaptive grows with depth; footprint_adaptive follows local 3D spacing; hybrid uses both."
         })
         optional["splat_upsample_depth_scale_strength"] = ("FLOAT", {
             "default": 0.0, "min": 0.0, "max": 8.0, "step": 0.05,
-            "tooltip": "How strongly splat size grows with depth in depth_adaptive mode."
+            "tooltip": "Depth growth strength, or local footprint multiplier in footprint/hybrid modes."
         })
         optional["splat_upsample_depth_scale_max"] = ("FLOAT", {
             "default": 3.0, "min": 1.0, "max": 12.0, "step": 0.1,
@@ -1395,7 +1395,8 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
         means = pts.reshape(1, S * H * W, 3)
         sh = ((highres_imgs.permute(0, 1, 3, 4, 2).reshape(1, S * H * W, 3) - 0.5) / 0.28209479177387814).float()
         depth_flat = depth_hi.reshape(1, S * H * W)
-        if scale_mode == "depth_adaptive":
+
+        def depth_adaptive_scales():
             d_min = depth_flat.min()
             d_max = depth_flat.max()
             if (d_max - d_min).abs().item() > 1e-8:
@@ -1406,7 +1407,39 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
                 )
             else:
                 multiplier = torch.ones_like(depth_flat)
-            scales = torch.full_like(means, float(splat_scale)) * multiplier[..., None]
+            return torch.full_like(means, float(splat_scale)) * multiplier[..., None], multiplier
+
+        def footprint_adaptive_scales(multiplier=None):
+            dx = torch.linalg.norm(pts[:, :, 1:, :] - pts[:, :, :-1, :], dim=-1)
+            dy = torch.linalg.norm(pts[:, 1:, :, :] - pts[:, :-1, :, :], dim=-1)
+            dx = torch.cat([dx, dx[:, :, -1:]], dim=2)
+            dy = torch.cat([dy, dy[:, -1:, :]], dim=1)
+            footprint = torch.maximum(dx, dy).clamp_min(float(splat_scale))
+            multiplier = max(1.0, float(depth_scale_strength)) if multiplier is None else float(multiplier)
+            scales_hw = (footprint * multiplier).clamp(
+                float(splat_scale),
+                float(splat_scale) * float(depth_scale_max),
+            )
+            return scales_hw.reshape(1, S * H * W, 1).expand_as(means).float()
+
+        if scale_mode == "hybrid_adaptive":
+            scales_depth, multiplier = depth_adaptive_scales()
+            scales_footprint = footprint_adaptive_scales(multiplier=1.0)
+            scales = torch.maximum(scales_depth, scales_footprint)
+            print(
+                "🧪 [V2 EXP] Upsample hybrid-adaptive scale: "
+                f"base={float(splat_scale):.5f}, max_multiplier={float(multiplier.max().item()):.2f}, "
+                f"max_scale={float(scales.max().item()):.5f}, mean_scale={float(scales.mean().item()):.5f}"
+            )
+        elif scale_mode == "footprint_adaptive":
+            scales = footprint_adaptive_scales()
+            print(
+                "🧪 [V2 EXP] Upsample footprint-adaptive scale: "
+                f"base={float(splat_scale):.5f}, multiplier={max(1.0, float(depth_scale_strength)):.2f}, "
+                f"max_scale={float(scales.max().item()):.5f}, mean_scale={float(scales.mean().item()):.5f}"
+            )
+        elif scale_mode == "depth_adaptive":
+            scales, multiplier = depth_adaptive_scales()
             print(
                 "🧪 [V2 EXP] Upsample depth-adaptive scale: "
                 f"base={float(splat_scale):.5f}, max_multiplier={float(multiplier.max().item()):.2f}"
@@ -1560,6 +1593,18 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
                     "default": 0.003, "min": 0.0001, "max": 0.05, "step": 0.0001,
                     "tooltip": "Gaussian size for dense backprojected splats."
                 }),
+                "splat_upsample_scale_mode": (["constant", "depth_adaptive", "footprint_adaptive", "hybrid_adaptive"], {
+                    "default": "constant",
+                    "tooltip": "constant uses one Gaussian size; depth_adaptive grows with depth; footprint_adaptive follows local 3D spacing; hybrid uses both."
+                }),
+                "splat_upsample_depth_scale_strength": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 8.0, "step": 0.05,
+                    "tooltip": "Depth growth strength, or local footprint multiplier in footprint/hybrid modes."
+                }),
+                "splat_upsample_depth_scale_max": ("FLOAT", {
+                    "default": 3.0, "min": 1.0, "max": 12.0, "step": 0.1,
+                    "tooltip": "Maximum multiplier over splat_upsample_scale for adaptive modes."
+                }),
                 "splat_upsample_voxel_prune": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "Voxel-merge dense splats to reduce file size."
@@ -1603,6 +1648,9 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
         splat_upsample_mode="depth_backproject",
         splat_upsample_size=1022,
         splat_upsample_scale=0.003,
+        splat_upsample_scale_mode="constant",
+        splat_upsample_depth_scale_strength=0.0,
+        splat_upsample_depth_scale_max=3.0,
         splat_upsample_voxel_prune=True,
         splat_upsample_voxel_size=0.0015,
         splat_upsample_max_points=10_000_000,
@@ -1643,9 +1691,9 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
             splat_upsample_size=splat_upsample_size,
             splat_upsample_depth_source="gs_depth",
             splat_upsample_scale=splat_upsample_scale,
-            splat_upsample_scale_mode="constant",
-            splat_upsample_depth_scale_strength=0.0,
-            splat_upsample_depth_scale_max=3.0,
+            splat_upsample_scale_mode=splat_upsample_scale_mode,
+            splat_upsample_depth_scale_strength=splat_upsample_depth_scale_strength,
+            splat_upsample_depth_scale_max=splat_upsample_depth_scale_max,
             splat_upsample_opacity=0.9,
             splat_upsample_voxel_prune=splat_upsample_voxel_prune,
             splat_upsample_voxel_size=splat_upsample_voxel_size,

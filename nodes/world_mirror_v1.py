@@ -142,6 +142,7 @@ def equirect_to_perspective(
     roll_deg=0.0,
     output_size=(512, 512), 
     dynamic_fov=False,
+    sampling_mode="bilinear",
 ):
     """
     Extract a perspective view from an equirectangular panorama using PyTorch grid_sample.
@@ -238,11 +239,14 @@ def equirect_to_perspective(
     
     grid = torch.stack((u, v), dim=-1).unsqueeze(0) # [1, H, W, 2]
     
+    if sampling_mode not in ("bilinear", "bicubic"):
+        sampling_mode = "bilinear"
+
     # Sampling
     out_tensor = torch.nn.functional.grid_sample(
         img_tensor, 
         grid, 
-        mode='bicubic', 
+        mode=sampling_mode,
         padding_mode='border', 
         align_corners=True
     )
@@ -936,6 +940,10 @@ class VNCCS_Equirect360ToViews:
                     "default": 1.0, "min": 0.5, "max": 1.5, "step": 0.01,
                     "tooltip": "Scales exported fx/fy only. Use to calibrate angular/radial drift without changing views."
                 }),
+                "sampling_mode": (["bilinear", "bicubic"], {
+                    "default": "bilinear",
+                    "tooltip": "Perspective extraction resampling. bilinear is safer for 3D reconstruction; bicubic is sharper but can create colored edge ringing."
+                }),
             }
         }
     
@@ -947,7 +955,7 @@ class VNCCS_Equirect360ToViews:
     def extract_views(self, panorama, quality="Standard (518)", fov=90, yaw_step=45, pitches="0,-30,30", output_size=518,
                       dynamic_fov=True, yaw_offset=0.0, pose_convention="opencv_c2w",
                       pose_yaw_offset=0.0, pose_pitch_offset=0.0, pose_roll_offset=0.0,
-                      intrinsics_focal_scale=1.0):
+                      intrinsics_focal_scale=1.0, sampling_mode="bilinear"):
         
         # Override output_size if Marble quality is selected
         if "Standard" in quality:
@@ -972,7 +980,7 @@ class VNCCS_Equirect360ToViews:
         print(
             f"   - Features: DynamicFOV={dynamic_fov}, PoseConvention={pose_convention}, "
             f"PoseOffset=({pose_yaw_offset}, {pose_pitch_offset}, {pose_roll_offset}), "
-            f"FocalScale={intrinsics_focal_scale}"
+            f"FocalScale={intrinsics_focal_scale}, Sampling={sampling_mode}"
         )
 
         intrinsics_list = []
@@ -987,6 +995,7 @@ class VNCCS_Equirect360ToViews:
                     pitch_deg=pitch,
                     output_size=(output_size, output_size),
                     dynamic_fov=dynamic_fov,
+                    sampling_mode=sampling_mode,
                 )
 
                 # Construct Intrinsics Matrix [3, 3]
