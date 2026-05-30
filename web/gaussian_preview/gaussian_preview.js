@@ -41,6 +41,8 @@ app.registerExtension({
                 iframe.style.minHeight = "0";
                 iframe.style.border = "none";
                 iframe.style.backgroundColor = "#1a1a1a";
+                iframe.allowFullscreen = true;
+                iframe.setAttribute("allow", "fullscreen; clipboard-write");
 
                 // Point to gsplat.js HTML viewer (with cache buster)
                 iframe.src = `/extensions/${EXTENSION_FOLDER}/gaussian_preview/static/viewer_gaussian.html?v=` + Date.now();

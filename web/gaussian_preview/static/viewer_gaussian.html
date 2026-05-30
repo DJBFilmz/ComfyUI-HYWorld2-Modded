@@ -27,6 +27,18 @@
             min-height: 0;
         }
 
+        body.fullscreen-flight #viewerContainer {
+            cursor: crosshair;
+        }
+
+        body.fullscreen-flight #controlsBar {
+            background: rgba(20, 20, 20, 0.94);
+        }
+
+        body.fullscreen-flight #fullscreen {
+            background: #2f6f6a;
+        }
+
         canvas {
             width: 100%;
             height: 100%;
@@ -131,6 +143,7 @@
                 title="Gaussian scale multiplier">
         </div>
         <button id="resetCamera" title="Reset camera view">Reset View</button>
+        <button id="fullscreen" title="Open fullscreen flight view">Full Screen</button>
         <button id="screenshot" title="Take screenshot">Screenshot</button>
         <button id="copyImage" title="Copy image to clipboard">Copy Image</button>
     </div>
@@ -155,6 +168,8 @@
         let controls = null;
         let animationId = null;
         let currentSplat = null;
+        let fullscreenFlight = false;
+        let fovReference = null;
 
         // Default focal length
         // Default focal length (pixel-space, sane default for 512px view)
@@ -169,7 +184,7 @@
                 scene = new SPLAT.Scene();
                 camera = new SPLAT.Camera();
                 renderer = new SPLAT.WebGLRenderer(canvas);
-                controls = new SPLAT.OrbitControls(camera, canvas);
+                setOrbitControlsFromCamera();
 
                 // Set default focal length
                 camera.data.fx = DEFAULT_FOCAL_LENGTH;
@@ -177,9 +192,7 @@
 
                 // Handle resize
                 const resize = () => {
-                    if (!isResolutionLocked) {
-                        renderer.setSize(canvas.clientWidth, canvas.clientHeight);
-                    }
+                    resizeRendererToCanvas();
                 };
                 window.addEventListener('resize', resize);
                 resize();
@@ -209,6 +222,125 @@
         // Scale compensation: when focal length is scaled down for canvas size,
         // gaussian scales need to be multiplied by this factor to maintain correct screen-space size
         let gaussianScaleCompensation = 1.0;
+
+        function getSceneMaxDim() {
+            if (!currentSplat || !currentSplat.bounds) {
+                return 1.0;
+            }
+            const size = currentSplat.bounds.size();
+            return Math.max(size.x, size.y, size.z, 0.1);
+        }
+
+        function getCameraForward() {
+            const m = SPLAT.Matrix3.RotationFromQuaternion(camera.rotation).buffer;
+            return new SPLAT.Vector3(m[2], m[5], m[8]).normalize();
+        }
+
+        function setOrbitControlsFromCamera() {
+            if (!camera || !canvas) return;
+            if (controls && controls.dispose) {
+                controls.dispose();
+            }
+            controls = new SPLAT.OrbitControls(camera, canvas);
+            controls.minZoom = 0.001;
+            const pivotDistance = Math.min(0.05, Math.max(0.005, getSceneMaxDim() * 0.002));
+            const forward = getCameraForward();
+            const target = new SPLAT.Vector3(
+                camera.position.x + forward.x * pivotDistance,
+                camera.position.y + forward.y * pivotDistance,
+                camera.position.z + forward.z * pivotDistance
+            );
+            controls.setCameraTarget(target);
+        }
+
+        function setFPSControlsFromCamera() {
+            if (!camera || !canvas) return;
+            if (controls && controls.dispose) {
+                controls.dispose();
+            }
+            controls = new SPLAT.FPSControls(camera, canvas);
+            controls.moveSpeed = Math.max(0.25, Math.min(6.0, getSceneMaxDim() * 0.75));
+            controls.lookSpeed = 0.7;
+            controls.dampening = 0.35;
+            canvas.focus?.();
+        }
+
+        function updateFullscreenButton() {
+            const button = document.getElementById('fullscreen');
+            if (!button) return;
+            button.textContent = fullscreenFlight ? 'Exit Full Screen' : 'Full Screen';
+            button.title = fullscreenFlight
+                ? 'Exit fullscreen flight view'
+                : 'Open fullscreen flight view';
+        }
+
+        function rememberCurrentFov(width, height) {
+            if (!camera || !width || !height) return;
+            fovReference = {
+                width,
+                height,
+                fx: camera.data.fx || DEFAULT_FOCAL_LENGTH,
+                fy: camera.data.fy || DEFAULT_FOCAL_LENGTH,
+            };
+        }
+
+        function cloneFovReference() {
+            return fovReference ? { ...fovReference } : null;
+        }
+
+        function applyFovReference(width, height) {
+            if (!camera || !width || !height) return;
+            if (!fovReference) {
+                rememberCurrentFov(width, height);
+                return;
+            }
+
+            // gsplat stores focal length in pixels. If the render buffer grows
+            // but fx/fy stay fixed, FOV changes. Anchor to viewport height so
+            // fullscreen preserves vertical FOV; wider aspect simply reveals
+            // more horizontally without stretching the optics.
+            const scale = height / Math.max(1, fovReference.height);
+            camera.data.fx = fovReference.fx * scale;
+            camera.data.fy = fovReference.fy * scale;
+        }
+
+        function resizeRendererToCanvas() {
+            if (!renderer || isResolutionLocked) return;
+            const width = Math.max(1, canvas.clientWidth);
+            const height = Math.max(1, canvas.clientHeight);
+            renderer.setSize(width, height);
+            applyFovReference(width, height);
+        }
+
+        function setFullscreenFlight(enabled) {
+            if (fullscreenFlight === enabled) return;
+            fullscreenFlight = enabled;
+            document.body.classList.toggle('fullscreen-flight', enabled);
+            if (enabled) {
+                setFPSControlsFromCamera();
+            } else {
+                if (document.pointerLockElement === canvas) {
+                    document.exitPointerLock?.();
+                }
+                setOrbitControlsFromCamera();
+            }
+            updateFullscreenButton();
+            resizeRendererToCanvas();
+        }
+
+        async function toggleFullscreen() {
+            try {
+                if (!document.fullscreenElement) {
+                    await document.documentElement.requestFullscreen();
+                    setFullscreenFlight(true);
+                } else {
+                    await document.exitFullscreen();
+                }
+            } catch (err) {
+                console.error('[GaussianViewer] Fullscreen toggle failed:', err);
+                showError('Fullscreen failed: ' + err.message);
+            }
+        }
 
         // Resume the animation loop (used after pausing for screenshot/clipboard)
         function resumeAnimationLoop() {
@@ -286,6 +418,7 @@
                 // Use NATIVE focal length (no scaling down)
                 camera.data.fx = fx;
                 camera.data.fy = fy;
+                rememberCurrentFov(imageWidth, imageHeight);
 
                 // IMPORTANT: Calculate scale compensation
                 // gsplat.js renders points based on their world space size projected to screen space.
@@ -387,7 +520,8 @@
                 position: camPos,
                 target: targetPos,
                 fx: camera.data.fx,
-                fy: camera.data.fy
+                fy: camera.data.fy,
+                fovReference: cloneFovReference(),
             };
 
             // Set camera position - IMPORTANT: must set camera.position, not camera.data.position
@@ -398,7 +532,9 @@
             camera.position.z = camPosZ;
 
             // Update orbit controls to orbit around the target point
-            controls.setCameraTarget(targetPos);
+            if (controls.setCameraTarget) {
+                controls.setCameraTarget(targetPos);
+            }
 
             console.log('[GaussianViewer] ✅ Camera configured from Extrinsics:');
             console.log('[GaussianViewer] | Position:', camera.position.x.toFixed(3), camera.position.y.toFixed(3), camera.position.z.toFixed(3));
@@ -429,14 +565,17 @@
             camera.position.z = center.z - distance; // Position camera in front of scene (Z-)
 
             const targetPos = new SPLAT.Vector3(center.x, center.y, center.z);
-            controls.setCameraTarget(targetPos);
+            if (controls.setCameraTarget) {
+                controls.setCameraTarget(targetPos);
+            }
 
             // Store as initial for reset
             initialCameraData = {
                 position: camera.position.clone(),
                 target: targetPos.clone(),
                 fx: camera.data.fx,
-                fy: camera.data.fy
+                fy: camera.data.fy,
+                fovReference: cloneFovReference(),
             };
 
             console.log('[GaussianViewer] Auto-fit complete. Camera at:', camera.position.z, 'Looking at:', targetPos.z);
@@ -449,6 +588,10 @@
             try {
                 // Reset lock state
                 isResolutionLocked = false;
+                camera.data.fx = DEFAULT_FOCAL_LENGTH;
+                camera.data.fy = DEFAULT_FOCAL_LENGTH;
+                fovReference = null;
+                resizeRendererToCanvas();
 
                 // Clear ALL existing objects from scene
                 if (scene.objects && scene.objects.length > 0) {
@@ -585,6 +728,9 @@
                     // Otherwise, auto-fit to see the whole thing
                     autoFitCamera();
                 }
+                if (fullscreenFlight) {
+                    setFPSControlsFromCamera();
+                }
 
                 // Show info panel
                 infoPanel.classList.remove('hidden');
@@ -628,10 +774,14 @@
                     if (initialCameraData.fy) {
                         camera.data.fy = initialCameraData.fy;
                     }
+                    fovReference = initialCameraData.fovReference ? { ...initialCameraData.fovReference } : fovReference;
+                    resizeRendererToCanvas();
 
                     // Set the target - this recalculates orbit state from current camera.position
-                    if (initialCameraData.target) {
+                    if (initialCameraData.target && controls.setCameraTarget) {
                         controls.setCameraTarget(initialCameraData.target);
+                    } else if (fullscreenFlight) {
+                        setFPSControlsFromCamera();
                     }
 
                     console.log('[GaussianViewer] Reset camera to position:', pos.x, pos.y, pos.z);
@@ -885,8 +1035,13 @@
 
         // Event listeners
         document.getElementById('resetCamera').addEventListener('click', resetCamera);
+        document.getElementById('fullscreen').addEventListener('click', toggleFullscreen);
         document.getElementById('screenshot').addEventListener('click', takeScreenshot);
         document.getElementById('copyImage').addEventListener('click', copyImageToClipboard);
+
+        document.addEventListener('fullscreenchange', () => {
+            setFullscreenFlight(Boolean(document.fullscreenElement));
+        });
 
         // Listen for messages from parent
         window.addEventListener('message', (event) => {
