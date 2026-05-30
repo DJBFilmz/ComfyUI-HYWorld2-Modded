@@ -712,10 +712,14 @@ class VNCCS_WorldMirrorV2_3D:
             },
             "optional": {
                 "target_size": ("INT", {
-                    "default": 952, "min": 252, "max": 1400, "step": 14,
-                    "tooltip": "Longest side in pixels. V2 natively supports high resolutions."
+                    "default": 952, "min": 252, "max": 4096, "step": 14,
+                    "tooltip": "Longest side in pixels. Experimental high values are VRAM-heavy; use low-VRAM modes above 1400."
                 }),
                 "offload_scheme": (["none", "model_cpu_offload"], {"default": "none"}),
+                "low_vram_mode": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Apply the low-VRAM profile: depth_only, frame chunks=1, GS param chunks=1, transformer MLP chunks=8192."
+                }),
                 "head_frame_chunk_size": ("INT", {
                     "default": 2, "min": 1, "max": 8, "step": 1,
                     "tooltip": "Frames processed at once by depth/point/normal/GS heads. Lower values reduce VRAM, especially for FP8 multi-view runs."
@@ -828,6 +832,7 @@ class VNCCS_WorldMirrorV2_3D:
         use_gsplat          = True,
         target_size         = 952,
         offload_scheme      = "none",
+        low_vram_mode = False,
         head_frame_chunk_size = 2,
         head_compute_mode = "all",
         gs_param_chunk_size = 1,
@@ -855,6 +860,11 @@ class VNCCS_WorldMirrorV2_3D:
         depth_prior         = None,
     ):
 
+        if low_vram_mode:
+            head_frame_chunk_size = 1
+            head_compute_mode = "depth_only"
+            gs_param_chunk_size = 1
+            transformer_mlp_chunk_size = 8192
         target_size    = (target_size // _PATCH_SIZE) * _PATCH_SIZE
         if adaptive_target_size:
             target_size = _adaptive_target_size_from_images(images, target_size)
@@ -1656,6 +1666,12 @@ class VNCCS_WorldMirrorV2_3D_Advanced(VNCCS_WorldMirrorV2_3D_Experimental):
 
     CATEGORY = "VNCCS/3D/Advanced"
 
+    @classmethod
+    def INPUT_TYPES(cls):
+        inputs = copy.deepcopy(super().INPUT_TYPES())
+        inputs.get("optional", {}).pop("low_vram_mode", None)
+        return inputs
+
 
 class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
     """Clean WorldMirror V2 node for the panorama-to-dense-splat workflow."""
@@ -1671,48 +1687,24 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
             },
             "optional": {
                 "target_size": ("INT", {
-                    "default": 518, "min": 252, "max": 1400, "step": 14,
-                    "tooltip": "Model inference resolution. Keep this low for multi-view panorama passes; dense splats can be upsampled separately."
+                    "default": 518, "min": 252, "max": 4096, "step": 14,
+                    "tooltip": "Model inference resolution. Experimental high values are VRAM-heavy; dense splats can be upsampled separately."
                 }),
                 "offload_scheme": (["none", "model_cpu_offload"], {
                     "default": "none",
                     "tooltip": "Move model weights to CPU between GPU use to reduce VRAM at the cost of speed."
                 }),
-                "head_frame_chunk_size": ("INT", {
-                    "default": 2, "min": 1, "max": 8, "step": 1,
-                    "tooltip": "Frames processed at once by depth/point/normal/GS heads. Lower values reduce VRAM."
-                }),
-                "head_compute_mode": (["depth+gs", "all", "depth_only"], {
-                    "default": "depth+gs",
-                    "tooltip": "depth+gs skips points/normals for the highest target_size ceiling. all computes every model head."
-                }),
-                "gs_param_chunk_size": ("INT", {
-                    "default": 1, "min": 1, "max": 24, "step": 1,
-                    "tooltip": "Frames processed at once by the Gaussian parameter Conv2d head. 1 uses the least VRAM."
-                }),
-                "transformer_mlp_chunk_size": ("INT", {
-                    "default": 32768, "min": 0, "max": 262144, "step": 4096,
-                    "tooltip": "Token chunk size for transformer MLPs. 32768 is a low-VRAM default; 0 disables."
+                "low_vram_mode": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Apply the low-VRAM profile: depth_only, frame chunks=1, GS param chunks=1, transformer MLP chunks=8192."
                 }),
                 "apply_sky_mask": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Remove sky-like regions before saving. Useful for outdoor panoramas where sky can create far/infinite splats."
                 }),
-                "camera_conditioning": (["pose+intrinsics", "intrinsics_only", "pose_only", "none"], {
-                    "default": "pose+intrinsics",
-                    "tooltip": "Which input camera priors to pass into WorldMirror V2."
-                }),
-                "splat_camera_source": (["input_when_available", "predicted"], {
-                    "default": "input_when_available",
-                    "tooltip": "Use supplied panorama cameras for Gaussian positions when available."
-                }),
-                "splat_upsample_mode": (["depth_backproject", "none"], {
-                    "default": "depth_backproject",
-                    "tooltip": "Build dense high-resolution splats from model depth and high-resolution view RGB."
-                }),
-                "splat_upsample_size": ("INT", {
-                    "default": 1022, "min": 252, "max": 4096, "step": 14,
-                    "tooltip": "Dense splat grid size. This can be higher than target_size without rerunning the transformer at that resolution."
+                "debug_log": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Print camera/depth/splat alignment diagnostics to the ComfyUI console."
                 }),
                 "splat_upsample_scale": ("FLOAT", {
                     "default": 0.003, "min": 0.0001, "max": 0.05, "step": 0.0001,
@@ -1746,10 +1738,6 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
                     "default": 1.75, "min": 0.0, "max": 8.0, "step": 0.05,
                     "tooltip": "Preserve proportionally more far splats when applying the point cap."
                 }),
-                "debug_log": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Print camera/depth/splat alignment diagnostics to the ComfyUI console."
-                }),
                 "camera_intrinsics": ("TENSOR", {
                     "tooltip": "Optional: intrinsics from Equirect360ToViews or WorldStereo."
                 }),
@@ -1768,6 +1756,7 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
         images,
         target_size=518,
         offload_scheme="none",
+        low_vram_mode=True,
         head_frame_chunk_size=2,
         head_compute_mode="depth+gs",
         gs_param_chunk_size=1,
@@ -1790,12 +1779,14 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
         camera_poses=None,
         depth_prior=None,
     ):
+        splat_upsample_size = self._infer_splat_upsample_size(images)
         return super().run_inference(
             model,
             images,
             use_gsplat=True,
             target_size=target_size,
             offload_scheme=offload_scheme,
+            low_vram_mode=low_vram_mode,
             head_frame_chunk_size=head_frame_chunk_size,
             head_compute_mode=head_compute_mode,
             gs_param_chunk_size=gs_param_chunk_size,
@@ -1807,8 +1798,8 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
             edge_normal_threshold=1.0,
             edge_depth_threshold=0.03,
             apply_confidence_mask=False,
-            camera_conditioning=camera_conditioning,
-            splat_camera_source=splat_camera_source,
+            camera_conditioning="pose+intrinsics",
+            splat_camera_source="input_when_available",
             splat_color_source="input_image",
             adaptive_target_size=False,
             apply_model_masks=False,
@@ -1821,7 +1812,7 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
             camera_intrinsics=camera_intrinsics,
             camera_poses=camera_poses,
             depth_prior=depth_prior,
-            splat_upsample_mode=splat_upsample_mode,
+            splat_upsample_mode="depth_backproject",
             splat_upsample_size=splat_upsample_size,
             splat_upsample_depth_source="gs_depth",
             splat_upsample_scale=splat_upsample_scale,
@@ -1834,6 +1825,12 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
             splat_upsample_max_points=splat_upsample_max_points,
             splat_upsample_cap_far_bias=splat_upsample_cap_far_bias,
         )
+
+    @staticmethod
+    def _infer_splat_upsample_size(images):
+        if isinstance(images, torch.Tensor) and images.dim() >= 3:
+            return max(int(images.shape[1]), int(images.shape[2]))
+        return 1022
 
 
 # ─────────────────────────────────────────────────────────────────────────────

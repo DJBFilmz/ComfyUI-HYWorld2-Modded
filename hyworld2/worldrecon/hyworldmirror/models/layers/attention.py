@@ -61,7 +61,10 @@ class Attention(nn.Module):
 
     def _compute_qkv(self, x: Tensor):
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        qkv = F.linear(x, self.qkv.weight, None)
+        if self.qkv.bias is not None:
+            qkv.add_(self.qkv.bias)
+        qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q).to(v.dtype), self.k_norm(k).to(v.dtype)
         return q, k, v, B, N, C
@@ -95,7 +98,9 @@ class Attention(nn.Module):
 
     def _project_output(self, x: Tensor, B: int, N: int, C: int) -> Tensor:
         x = x.transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
+        x = F.linear(x, self.proj.weight, None)
+        if self.proj.bias is not None:
+            x.add_(self.proj.bias)
         x = self.proj_drop(x)
         return x
 

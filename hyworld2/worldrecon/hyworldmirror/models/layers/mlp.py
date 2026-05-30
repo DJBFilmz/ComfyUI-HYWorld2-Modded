@@ -5,6 +5,7 @@
 
 from typing import Callable, Optional
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 
@@ -28,10 +29,14 @@ class Mlp(nn.Module):
         self.inference_chunk_size = 0
 
     def _forward_impl(self, x: Tensor) -> Tensor:
-        x = self.fc1(x)
+        x = F.linear(x, self.fc1.weight, None)
+        if self.fc1.bias is not None:
+            x.add_(self.fc1.bias)
         x = self.act(x)
         x = self.drop(x)
-        x = self.fc2(x)
+        x = F.linear(x, self.fc2.weight, None)
+        if self.fc2.bias is not None:
+            x.add_(self.fc2.bias)
         x = self.drop(x)
         return x
 
