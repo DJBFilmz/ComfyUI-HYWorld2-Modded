@@ -20,8 +20,11 @@ def position_grid_to_embed(pos_grid: torch.Tensor, embed_dim: int, omega_0: floa
     device = pos_grid.device
     pos_flat = pos_grid.reshape(-1, grid_dim)  # Flatten to (H*W, 2)
     
-    # Generate frequency bands
-    omega = torch.arange(embed_dim // 4, dtype=torch.float32 if device.type == "mps" else torch.double, device=device)
+    # Generate frequency bands in the same low-precision dtype as the feature
+    # map when possible. The previous CUDA path used float64, which creates a
+    # large transient allocation in high-resolution DPT heads.
+    compute_dtype = pos_grid.dtype if pos_grid.dtype in (torch.float16, torch.bfloat16, torch.float32) else torch.float32
+    omega = torch.arange(embed_dim // 4, dtype=compute_dtype, device=device)
     omega /= embed_dim / 4.0
     omega = 1.0 / omega_0**omega  # (D/4,)
     
@@ -40,7 +43,7 @@ def position_grid_to_embed(pos_grid: torch.Tensor, embed_dim: int, omega_0: floa
     # Combine x and y embeddings
     emb = torch.cat([emb_x, emb_y], dim=-1)  # (H*W, D)
     
-    return emb.float().view(H, W, embed_dim)  # [H, W, D]
+    return emb.to(pos_grid.dtype).view(H, W, embed_dim)  # [H, W, D]
 
 
 # Inspired by https://github.com/microsoft/moge

@@ -45,14 +45,14 @@ diffusers>=0.36.0
 transformers>=4.40.0
 bitsandbytes>=0.43.0
 optimum-quanto>=0.2.4
+torchao
 imageio[ffmpeg]
 kornia
 
 # Sky segmentation ONNX fallback (optional)
 # onnxruntime
 
-# FP8 quantization (optional, requires compatible GPU)
-# torchao
+# FP8 quantization requires a compatible GPU
 
 # Video input (optional)
 # moviepy==1.0.3

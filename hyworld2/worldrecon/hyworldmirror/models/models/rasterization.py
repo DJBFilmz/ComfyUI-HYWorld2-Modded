@@ -112,6 +112,7 @@ class GaussianSplatRenderer(nn.Module):
         self.enable_conf_filter = enable_conf_filter
         self.conf_threshold_percent = conf_threshold_percent
         self.max_gaussians = max_gaussians
+        self.gs_param_chunk_size = 1
 
         # Predict Gaussian parameters from GS features (quaternions/scales/opacities/SH/weights)
         splits_and_inits = [
@@ -166,7 +167,17 @@ class GaussianSplatRenderer(nn.Module):
         head_dtype = next(self.gs_head.parameters()).dtype
         if gs_feats_reshape.dtype != head_dtype:
             gs_feats_reshape = gs_feats_reshape.to(head_dtype)
-        gs_params = self.gs_head(gs_feats_reshape)
+        gs_param_chunk_size = int(getattr(self, "gs_param_chunk_size", 1) or gs_feats_reshape.shape[0])
+        if gs_param_chunk_size > 0 and gs_param_chunk_size < gs_feats_reshape.shape[0]:
+            gs_params = torch.cat(
+                [
+                    self.gs_head(gs_feats_reshape[i:i + gs_param_chunk_size])
+                    for i in range(0, gs_feats_reshape.shape[0], gs_param_chunk_size)
+                ],
+                dim=0,
+            )
+        else:
+            gs_params = self.gs_head(gs_feats_reshape)
         gt_colors = images.permute(0, 1, 3, 4, 2)
 
         # 2) Select rendering cameras
@@ -524,7 +535,6 @@ class GaussianSplatRenderer(nn.Module):
         viewmats = views['camera_poses'][:, :nums]
         Ks = views['camera_intrs'][:, :nums]
         return viewmats, Ks
-
 
 
 

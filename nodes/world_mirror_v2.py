@@ -396,6 +396,24 @@ def _set_worldmirror_head_frame_chunk_size(model, chunk_size):
             setattr(head, "frames_chunk_size", chunk_size)
 
 
+def _set_worldmirror_gs_param_chunk_size(model, chunk_size):
+    chunk_size = max(1, int(chunk_size))
+    gs_renderer = getattr(model, "gs_renderer", None)
+    if gs_renderer is not None:
+        setattr(gs_renderer, "gs_param_chunk_size", chunk_size)
+
+
+def _set_worldmirror_transformer_mlp_chunk_size(model, chunk_size):
+    chunk_size = max(0, int(chunk_size))
+    updated = 0
+    for module in model.modules():
+        if hasattr(module, "inference_chunk_size") and hasattr(module, "fc1") and hasattr(module, "fc2"):
+            setattr(module, "inference_chunk_size", chunk_size)
+            updated += 1
+    if chunk_size > 0:
+        print(f"ℹ️ [V2] Transformer MLP chunking enabled: {updated} MLPs, chunk_size={chunk_size}")
+
+
 def _has_torchao_tensor_subclasses(model):
     for tensor in list(model.parameters()) + list(model.buffers()):
         tensor_type = type(tensor)
@@ -403,6 +421,31 @@ def _has_torchao_tensor_subclasses(model):
         if tensor_type.__module__.startswith("torchao.") or data_type.__module__.startswith("torchao."):
             return True
     return False
+
+
+def _apply_worldmirror_head_compute_mode(model, mode, use_gsplat):
+    original = {
+        "enable_pts": getattr(model, "enable_pts", None),
+        "enable_norm": getattr(model, "enable_norm", None),
+        "enable_gs": getattr(model, "enable_gs", None),
+    }
+    if mode == "depth+gs":
+        model.enable_pts = False
+        model.enable_norm = False
+        model.enable_gs = bool(use_gsplat and original["enable_gs"])
+    elif mode == "depth_only":
+        model.enable_pts = False
+        model.enable_norm = False
+        model.enable_gs = False
+    else:
+        model.enable_gs = bool(use_gsplat and original["enable_gs"])
+    return original
+
+
+def _restore_worldmirror_head_compute_mode(model, original):
+    for key, value in original.items():
+        if value is not None:
+            setattr(model, key, value)
 
 
 def _camera_debug_angles(c2w):
@@ -677,6 +720,18 @@ class VNCCS_WorldMirrorV2_3D:
                     "default": 2, "min": 1, "max": 8, "step": 1,
                     "tooltip": "Frames processed at once by depth/point/normal/GS heads. Lower values reduce VRAM, especially for FP8 multi-view runs."
                 }),
+                "head_compute_mode": (["all", "depth+gs", "depth_only"], {
+                    "default": "all",
+                    "tooltip": "all computes every output head. depth+gs skips points/normals to raise the VRAM ceiling. depth_only also skips native GS."
+                }),
+                "gs_param_chunk_size": ("INT", {
+                    "default": 1, "min": 1, "max": 24, "step": 1,
+                    "tooltip": "Frames processed at once by the Gaussian parameter Conv2d head. 1 uses the least VRAM."
+                }),
+                "transformer_mlp_chunk_size": ("INT", {
+                    "default": 0, "min": 0, "max": 262144, "step": 4096,
+                    "tooltip": "Token chunk size for transformer MLPs. 0 disables. Lower values reduce VRAM at high target_size but are slower."
+                }),
                 "confidence_percentile": ("FLOAT", {
                     "default": 10.0, "min": 0.0, "max": 100.0, "step": 1.0,
                     "tooltip": "Discard bottom N% lowest-confidence points."
@@ -774,6 +829,9 @@ class VNCCS_WorldMirrorV2_3D:
         target_size         = 952,
         offload_scheme      = "none",
         head_frame_chunk_size = 2,
+        head_compute_mode = "all",
+        gs_param_chunk_size = 1,
+        transformer_mlp_chunk_size = 0,
         confidence_percentile = 10.0,
         apply_sky_mask      = False,
         filter_edges        = True,
@@ -803,6 +861,8 @@ class VNCCS_WorldMirrorV2_3D:
         worldmirror    = model["model"]
         model_precision = model.get("precision", "unknown") if isinstance(model, dict) else "unknown"
         _set_worldmirror_head_frame_chunk_size(worldmirror, head_frame_chunk_size)
+        _set_worldmirror_gs_param_chunk_size(worldmirror, gs_param_chunk_size)
+        _set_worldmirror_transformer_mlp_chunk_size(worldmirror, transformer_mlp_chunk_size)
         exec_dev       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         original_dev   = _first_real_device(worldmirror)
         has_meta_params = _module_has_meta_tensors(worldmirror)
@@ -887,14 +947,14 @@ class VNCCS_WorldMirrorV2_3D:
             if original_dev != exec_dev:
                 _move_worldmirror(worldmirror, exec_dev)
 
-# ── 4. Inference ──────────────────────────────────────────────────────
-        original_gs = worldmirror.enable_gs
+        # ── 4. Inference ──────────────────────────────────────────────────────
+        original_heads = _apply_worldmirror_head_compute_mode(worldmirror, head_compute_mode, use_gsplat and GSPLAT_AVAILABLE)
         gs_renderer = getattr(worldmirror, "gs_renderer", None)
         original_inference_position_from = (
             getattr(gs_renderer, "inference_position_from", "gsdepth+predcamera")
             if gs_renderer is not None else None
         )
-        worldmirror.enable_gs = use_gsplat and GSPLAT_AVAILABLE
+        worldmirror.enable_gs = bool(worldmirror.enable_gs and use_gsplat and GSPLAT_AVAILABLE)
         effective_splat_camera_source = "predicted"
         if worldmirror.enable_gs and gs_renderer is not None:
             gs_renderer.inference_position_from = (
@@ -906,7 +966,9 @@ class VNCCS_WorldMirrorV2_3D:
             print(
                 f"🚀 [V2] Inference: {B} images @ {target_size}px, gs={worldmirror.enable_gs}, "
                 f"camera_conditioning={camera_conditioning}, splat_camera_source={splat_camera_source} "
-                f"(effective={effective_splat_camera_source}), splat_color_source={splat_color_source}"
+                f"(effective={effective_splat_camera_source}), splat_color_source={splat_color_source}, "
+                f"head_compute_mode={head_compute_mode}, head_frame_chunk_size={head_frame_chunk_size}, "
+                f"gs_param_chunk_size={gs_param_chunk_size}, transformer_mlp_chunk_size={transformer_mlp_chunk_size}"
             )
             with torch.no_grad():
                 # Determine the target sequence length
@@ -1013,7 +1075,7 @@ class VNCCS_WorldMirrorV2_3D:
                 )
             print("✅ [V2] Inference complete")
         finally:
-            worldmirror.enable_gs = original_gs
+            _restore_worldmirror_head_compute_mode(worldmirror, original_heads)
             if gs_renderer is not None and original_inference_position_from is not None:
                 gs_renderer.inference_position_from = original_inference_position_from
             if offload_scheme == "none" and original_dev.type == "cpu" and not _module_has_meta_tensors(worldmirror):
@@ -1050,6 +1112,8 @@ class VNCCS_WorldMirrorV2_3D:
 
         # ── 6. Geometric filter mask (V2 native) ─────────────────────────────
         pts_mask = gs_mask = None
+        if filter_edges and "normals" not in predictions:
+            print("ℹ️ [V2] Edge filter skipped because head_compute_mode did not compute normals.")
         if V2_UTILS_AVAILABLE and "depth" in predictions and "normals" in predictions:
             pts_mask, gs_mask = compute_filter_mask(
                 predictions          = predictions,
@@ -1406,11 +1470,14 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
         raw = output[5]
         if not isinstance(raw, dict):
             return output
+        requested_depth_source = depth_source
+        actual_depth_source = depth_source
         depth = raw.get(depth_source)
         if depth is None and depth_source != "depth":
             depth = raw.get("depth")
+            actual_depth_source = "depth"
         if not isinstance(depth, torch.Tensor):
-            print(f"⚠️ [V2 EXP] splat upsample skipped: missing depth source '{depth_source}'.")
+            print(f"⚠️ [V2 EXP] splat upsample skipped: missing depth source '{requested_depth_source}'.")
             return output
 
         highres_imgs, highres_intrs = self._prepare_highres_views(original_images, camera_intrinsics, upsample_size)
@@ -1530,7 +1597,7 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
 
         print(
             f"🧪 [V2 EXP] Upsampled splats: {S} views @ {H}x{W}, "
-            f"{n_before} raw gaussians from {depth_source}"
+            f"{n_before} raw gaussians from {actual_depth_source}"
         )
         return (
             ply_data,
@@ -1615,6 +1682,18 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
                     "default": 2, "min": 1, "max": 8, "step": 1,
                     "tooltip": "Frames processed at once by depth/point/normal/GS heads. Lower values reduce VRAM."
                 }),
+                "head_compute_mode": (["depth+gs", "all", "depth_only"], {
+                    "default": "depth+gs",
+                    "tooltip": "depth+gs skips points/normals for the highest target_size ceiling. all computes every model head."
+                }),
+                "gs_param_chunk_size": ("INT", {
+                    "default": 1, "min": 1, "max": 24, "step": 1,
+                    "tooltip": "Frames processed at once by the Gaussian parameter Conv2d head. 1 uses the least VRAM."
+                }),
+                "transformer_mlp_chunk_size": ("INT", {
+                    "default": 32768, "min": 0, "max": 262144, "step": 4096,
+                    "tooltip": "Token chunk size for transformer MLPs. 32768 is a low-VRAM default; 0 disables."
+                }),
                 "apply_sky_mask": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Remove sky-like regions before saving. Useful for outdoor panoramas where sky can create far/infinite splats."
@@ -1690,6 +1769,9 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
         target_size=518,
         offload_scheme="none",
         head_frame_chunk_size=2,
+        head_compute_mode="depth+gs",
+        gs_param_chunk_size=1,
+        transformer_mlp_chunk_size=32768,
         apply_sky_mask=False,
         camera_conditioning="pose+intrinsics",
         splat_camera_source="input_when_available",
@@ -1715,6 +1797,9 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
             target_size=target_size,
             offload_scheme=offload_scheme,
             head_frame_chunk_size=head_frame_chunk_size,
+            head_compute_mode=head_compute_mode,
+            gs_param_chunk_size=gs_param_chunk_size,
+            transformer_mlp_chunk_size=transformer_mlp_chunk_size,
             confidence_percentile=10.0,
             apply_sky_mask=apply_sky_mask,
             filter_edges=True,
