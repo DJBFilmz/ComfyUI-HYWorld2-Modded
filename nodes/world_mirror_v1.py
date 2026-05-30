@@ -8,6 +8,7 @@ Includes equirectangular panorama to perspective views conversion.
 import os
 import sys
 import math
+import re
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -109,6 +110,30 @@ def build_rotation_matrix(pitch_deg, yaw_deg, roll_deg=0.0):
         
     return R
 
+
+def build_camera_pose_matrix(pitch_deg, yaw_deg, roll_deg=0.0, pose_convention="opencv_c2w"):
+    """Build a 4x4 camera pose matrix for exported camera priors."""
+    if pose_convention == "flip_pitch":
+        R = build_rotation_matrix(-pitch_deg, yaw_deg, roll_deg)
+    elif pose_convention == "flip_yaw":
+        R = build_rotation_matrix(pitch_deg, -yaw_deg, roll_deg)
+    elif pose_convention == "flip_pitch_yaw":
+        R = build_rotation_matrix(-pitch_deg, -yaw_deg, roll_deg)
+    else:
+        R = build_rotation_matrix(pitch_deg, yaw_deg, roll_deg)
+
+    axis_flip = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
+    if pose_convention == "opencv_w2c":
+        R = R.T
+    elif pose_convention == "opengl_c2w":
+        R = R @ axis_flip
+    elif pose_convention == "opengl_w2c":
+        R = (R @ axis_flip).T
+
+    pose = np.eye(4, dtype=np.float32)
+    pose[:3, :3] = R
+    return pose
+
 def equirect_to_perspective(
     equirect_img, 
     fov_deg, 
@@ -116,14 +141,12 @@ def equirect_to_perspective(
     pitch_deg, 
     roll_deg=0.0,
     output_size=(512, 512), 
-    dynamic_fov=False, 
-    correct_distortion=False, 
-    return_mask=False,
-    mask_falloff=2.2
+    dynamic_fov=False,
+    sampling_mode="bilinear",
 ):
     """
     Extract a perspective view from an equirectangular panorama using PyTorch grid_sample.
-    Supports Dynamic FOV reduction and Distortion Correction (Cylindrical-ish projection).
+    Supports Dynamic FOV reduction for off-horizon views.
     """
     # 1. Dynamic FOV Reduction (Strategies 1)
     if dynamic_fov and abs(pitch_deg) > 15:
@@ -216,61 +239,21 @@ def equirect_to_perspective(
     
     grid = torch.stack((u, v), dim=-1).unsqueeze(0) # [1, H, W, 2]
     
+    if sampling_mode not in ("bilinear", "bicubic"):
+        sampling_mode = "bilinear"
+
     # Sampling
     out_tensor = torch.nn.functional.grid_sample(
         img_tensor, 
         grid, 
-        mode='bicubic', 
+        mode=sampling_mode,
         padding_mode='border', 
         align_corners=True
     )
     
     out_img = Image.fromarray((out_tensor.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
     
-    mask_img = None
-    if return_mask:
-        # Strategy 2: Distortion Mask
-        # Calculate stretch factor. Simple heuristic: distance from center + ray angle magnitude
-        # High stretch = High value (white), Low stretch = Low value (black)
-        # Or opposite: Weights (1 = good, 0 = bad)
-        
-        # Stretch in rectilinear ~ 1/cos(angle)^3
-        # Angle from center optical axis (fwd)
-        # Dot product with forward vector (0,0,-1)
-        # ray_fwd = (0,0,-1)
-        # cos_angle = z coordinate of normalized unrotated ray? 
-        # Wait, grid_x, grid_y are unrotated. 
-        # rays_z_orig = -f / norm. 
-        # Let's use the normalized unrotated z component.
-        
-        # Recompute unrotated normalized z
-        # raw_norm = torch.sqrt(grid_x**2 + (-grid_y)**2 + (-f)**2)
-        # cos_angle = abs(-f) / raw_norm
-        
-        # --- NEW RADIAL MASKING (FOV-AWARE) ---
-        # Instead of absolute angle, we use distance from image center.
-        # This guarantees we fade out the edges regardless of what FOV is chosen.
-        # r^2 = x^2 + y^2
-        r_sq = grid_x**2 + (-grid_y)**2
-        # Max radius at edge (grid coordinates are [-1, 1])
-        # Corner is at (1, 1) or (-1, -1), so max distance squared is 1^2 + 1^2 = 2.0
-        max_dist_sq = 2.0
-        
-        # Normalized distance squared (0 at center, 1 at corner)
-        dist_sq_norm = r_sq / max_dist_sq
-        
-        # Soft Falloff: (1 - d^2 * multiplier)^power
-        # Default multiplier 2.2 hits zero at radius ~0.95 (just before the corner)
-        weight = torch.clamp(1.0 - dist_sq_norm * mask_falloff, min=0.0, max=1.0) 
-        # Square or cube the weight for steeper falloff
-        weight = torch.pow(weight, 2.0) 
-
-        
-        mask_tensor = weight.unsqueeze(0).unsqueeze(0) # [1, 1, H, W]
-        mask_np = (mask_tensor.squeeze().cpu().numpy() * 255).astype(np.uint8)
-        mask_img = Image.fromarray(mask_np, mode="L")
-
-    return out_img, mask_img, f
+    return out_img, f
 
 
 def create_filter_mask(
@@ -921,17 +904,16 @@ class VNCCS_Equirect360ToViews:
                 "panorama": ("IMAGE",),
             },
             "optional": {
-                "quality": (["Standard (518)", "Marble HD (1022)", "Marble Ultra (1526)"], {"default": "Standard (518)"}),
                 # Unlocked limits for Brute Force/Consensus experiments
                 "fov": ("INT", {"default": 90, "min": 1, "max": 179}),
                 "yaw_step": ("INT", {"default": 45, "min": 1, "max": 180}),
-                "pitches": ("STRING", {"default": "0,-30,30"}),
-                "output_size": ("INT", {"default": 518, "min": 252, "max": 1022, "step": 14}),
+                "pitches": ("STRING", {"default": "0,-60,60"}),
+                "output_size": ("INT", {"default": 518, "min": 252, "max": 4096, "step": 14}),
                 "dynamic_fov": ("BOOLEAN", {"default": True, "tooltip": "Automatically reduce FOV looking up/down to minimize stretching"}),
-                "correct_distortion": ("BOOLEAN", {"default": False, "tooltip": "Apply cylindrical-like warping to straighten vertical lines"}),
-                "output_distortion_mask": ("BOOLEAN", {"default": False, "tooltip": "Output a mask indicating highly stretched areas (edges)"}),
-                "mask_falloff": ("FLOAT", {"default": 2.2, "min": 0.5, "max": 5.0, "step": 0.1, "tooltip": "Controls how fast the distortion mask fades. Higher = smaller visible area per view (removes more edges)."}),
-                "yaw_offset": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 1.0, "tooltip": "Global rotation offset to align walls with cardinal directions (0, 90, 180, 270)"}),
+                "sampling_mode": (["bilinear", "bicubic"], {
+                    "default": "bilinear",
+                    "tooltip": "Perspective extraction resampling. bilinear is safer for 3D reconstruction; bicubic is sharper but can create colored edge ringing."
+                }),
             }
         }
     
@@ -940,17 +922,11 @@ class VNCCS_Equirect360ToViews:
     FUNCTION = "extract_views"
     CATEGORY = "VNCCS/3D"
     
-    def extract_views(self, panorama, quality="Standard (518)", fov=90, yaw_step=45, pitches="0,-30,30", output_size=518, 
-                      dynamic_fov=True, correct_distortion=False, output_distortion_mask=False, mask_falloff=2.2, yaw_offset=0.0):
-        
-        # Override output_size if Marble quality is selected
-        if "Standard" in quality:
-            output_size = 518
-        elif "HD" in quality:
-            output_size = 1022
-        elif "Ultra" in quality:
-            output_size = 1526
-            
+    def extract_views(self, panorama, quality="Standard (518)", fov=90, yaw_step=45, pitches="0,-60,60", output_size=518,
+                      dynamic_fov=True, yaw_offset=0.0, pose_convention="opencv_c2w",
+                      pose_yaw_offset=0.0, pose_pitch_offset=0.0, pose_roll_offset=0.0,
+                      intrinsics_focal_scale=1.0, sampling_mode="bilinear"):
+
         pitch_list = [int(p.strip()) for p in pitches.split(",")]
         
         img_np = (panorama[0].cpu().numpy() * 255).astype(np.uint8)
@@ -959,36 +935,29 @@ class VNCCS_Equirect360ToViews:
         yaw_angles = list(range(0, 360, yaw_step))
         
         views = []
-        masks = []
         total = len(yaw_angles) * len(pitch_list)
         
         print(f"🔄 Extracting {total} views from 360° panorama...")
         print(f"   - Settings: FOV={fov}, Step={yaw_step}, Output={output_size}")
-        print(f"   - Features: DynamicFOV={dynamic_fov}, DistortionCorrection={correct_distortion}, Mask={output_distortion_mask}")
+        print(
+            f"   - Features: DynamicFOV={dynamic_fov}, PoseConvention={pose_convention}, "
+            f"PoseOffset=({pose_yaw_offset}, {pose_pitch_offset}, {pose_roll_offset}), "
+            f"FocalScale={intrinsics_focal_scale}, Sampling={sampling_mode}"
+        )
 
         intrinsics_list = []
         poses_list = []
 
         for yaw in yaw_angles:
             for pitch in pitch_list:
-                
-                # Smart Projection Logic:
-                # Cylindrical correction is great for the horizon (Pitch ~0) but distorts poles.
-                # Standard Rectilinear is better for looking up/down (Ceiling/Floor).
-                # If correct_distortion is requested, we apply it ONLY to the horizon views.
-                use_correction = correct_distortion and (abs(pitch) < 20)
-                proj_name = "Cylindrical-ish" if use_correction else "Rectilinear"
-                
-                view, mask, focal = equirect_to_perspective(
+                view, focal = equirect_to_perspective(
                     pil_img,
                     fov_deg=fov,
                     yaw_deg=(yaw + yaw_offset) % 360, # Apply Offset and Wrap
                     pitch_deg=pitch,
                     output_size=(output_size, output_size),
                     dynamic_fov=dynamic_fov,
-                    correct_distortion=use_correction, # Pass calculated flag
-                    return_mask=output_distortion_mask,
-                    mask_falloff=mask_falloff
+                    sampling_mode=sampling_mode,
                 )
 
                 # Construct Intrinsics Matrix [3, 3]
@@ -1001,7 +970,7 @@ class VNCCS_Equirect360ToViews:
                 cx, cy = output_size / 2.0, output_size / 2.0
                 fx = focal * (output_size / 2.0) / math.tan(math.radians(fov)/2) # Wait, f is 1/tan(fov_rad/2)
                 # Correct calculation: f_pixels = (output_size / 2.0) * focal
-                f_pixels = (output_size / 2.0) * focal
+                f_pixels = (output_size / 2.0) * focal * intrinsics_focal_scale
                 intra = np.array([
                     [f_pixels, 0, cx],
                     [0, f_pixels, cy],
@@ -1012,38 +981,19 @@ class VNCCS_Equirect360ToViews:
                 # Construct Pose Matrix [4, 4] (C2W)
                 # Based on Yaw/Pitch/Roll logic in equirect_to_perspective
                 # We use (yaw + yaw_offset) to match the view rotation
-                R = build_rotation_matrix(pitch, yaw + yaw_offset, 0.0)
-                pose = np.eye(4, dtype=np.float32)
-                pose[:3, :3] = R
+                pose = build_camera_pose_matrix(
+                    pitch + pose_pitch_offset,
+                    yaw + yaw_offset + pose_yaw_offset,
+                    pose_roll_offset,
+                    pose_convention,
+                )
                 poses_list.append(pose)
                 
                 view_np = np.array(view).astype(np.float32) / 255.0
                 
-                mask_stat = ""
-                if output_distortion_mask and mask is not None:
-                    # Append Mask as Alpha Channel
-                    mask_np = np.array(mask).astype(np.float32) / 255.0  # [H, W]
-                    
-                    # Log stat
-                    valid_pixels = np.count_nonzero(mask_np > 0.1)
-                    total_pixels = mask_np.size
-                    coverage = (valid_pixels / total_pixels) * 100
-                    mask_stat = f"| Mask Valid: {coverage:.1f}%"
-                    
-                    mask_np = mask_np[:, :, None] # [H, W, 1]
-                    # Ensure view is [H, W, 3]
-                    if view_np.shape[2] == 3:
-                        view_np = np.concatenate([view_np, mask_np], axis=2) # [H, W, 4]
-                elif view_np.shape[2] == 3:
-                     pass
-                
-                print(f"   - View: Pitch={pitch:3d}, Yaw={yaw:3d} | Proj: {proj_name:12s} {mask_stat}")
+                print(f"   - View: Pitch={pitch:3d}, Yaw={yaw:3d} | Proj: Rectilinear")
                      
                 views.append(view_np)
-
-        # Handle mixed channel counts if some failed? No, consistent.
-        # But if output_distortion_mask is False, we return RGB.
-        # If True, we return RGBA.
         
         views_tensor = torch.from_numpy(np.stack(views, axis=0))
         intrinsics_tensor = torch.from_numpy(np.stack(intrinsics_list, axis=0))
@@ -1102,8 +1052,10 @@ def extract_splat_params(data):
                 if v is None: continue
                 # Handle potential list wrapper from some versions
                 if isinstance(v, list): v = v[0]
-                # Handle batch dimension [B, N, ...] -> [N, ...]
-                if v.dim() >= 3: v = v[0]
+                # Handle batch dimension [B, N, ...] -> [N, ...], but do not
+                # collapse SH tensors that are already [N, SH, 3].
+                if v.dim() >= 3 and v.shape[0] == 1:
+                    v = v[0]
                 params[k] = v.detach().cpu().float()
             
             if "means" not in params:
@@ -1238,13 +1190,6 @@ class VNCCS_SavePLY:
                 "ply_data": ("PLY_DATA",),
                 "filename": ("STRING", {"default": "output"}),
             },
-            "optional": {
-                "save_pointcloud": ("BOOLEAN", {"default": False}),
-                "save_gaussians": ("BOOLEAN", {"default": True}),
-                "rotate_x": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 5.0}),
-                "rotate_y": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 5.0}),
-                "rotate_z": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 5.0}),
-            }
         }
     
     RETURN_TYPES = ("STRING",)
@@ -1338,6 +1283,7 @@ class VNCCS_SavePLY:
         return torch.stack([w, x, y, z], dim=1)
 
     def _get_unique_path(self, directory, filename, suffix, extension):
+        filename = self._sanitize_filename(filename)
         counter = 1
         while True:
             # Use 5 digits like ComfyUI SaveImage
@@ -1347,13 +1293,161 @@ class VNCCS_SavePLY:
                 return path
             counter += 1
 
+    def _sanitize_filename(self, filename):
+        base = os.path.basename(str(filename or "output").replace("\\", "/"))
+        base = os.path.splitext(base)[0]
+        base = re.sub(r"[^A-Za-z0-9._ -]+", "_", base).strip(" ._")
+        return base or "output"
+
+    def _safe_quantile(self, values, q, max_values=1_000_000):
+        flat = values.detach().cpu().float().reshape(-1)
+        if flat.numel() > max_values:
+            step = max(1, flat.numel() // max_values)
+            flat = flat[::step][:max_values]
+        return torch.quantile(flat, q)
+
+    def _save_splat_preview_cache(self, path, means, scales, rotations, rgbs, opacities, chunk_size=1_000_000):
+        """Write gsplat.js' compact 32-byte/gaussian binary preview cache."""
+        splat_path = os.path.splitext(str(path))[0] + ".splat"
+        tmp_path = f"{splat_path}.tmp"
+        n = int(means.shape[0])
+        sh_c0 = 0.28209479177387814
+
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+        try:
+            with open(tmp_path, "wb") as handle:
+                for start in range(0, n, chunk_size):
+                    end = min(start + chunk_size, n)
+                    count = end - start
+                    block = np.zeros((count, 32), dtype=np.uint8)
+                    floats = block.view("<f4").reshape(count, 8)
+
+                    floats[:, 0:3] = means[start:end].numpy()
+                    floats[:, 3:6] = scales[start:end].numpy()
+
+                    rgb = (rgbs[start:end] * sh_c0 + 0.5).clamp(0.0, 1.0)
+                    block[:, 24:27] = (rgb.numpy() * 255.0 + 0.5).astype(np.uint8)
+
+                    alpha = opacities[start:end]
+                    if alpha.numel() and (float(alpha.min()) < 0.0 or float(alpha.max()) > 1.0):
+                        alpha = torch.sigmoid(alpha)
+                    block[:, 27] = (alpha.clamp(0.0, 1.0).numpy() * 255.0 + 0.5).astype(np.uint8)
+
+                    quat = rotations[start:end]
+                    quat = quat / quat.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+                    block[:, 28:32] = (quat.clamp(-1.0, 1.0).numpy() * 128.0 + 128.0).clip(0, 255).astype(np.uint8)
+
+                    handle.write(block.tobytes())
+
+            os.replace(tmp_path, splat_path)
+            size_mb = os.path.getsize(splat_path) / (1024 * 1024)
+            print(f"⚡ [SavePLY] Wrote preview splat cache: {os.path.basename(splat_path)} ({size_mb:.2f} MB)")
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
+
+    def _save_gs_ply_safe(
+        self,
+        path,
+        means,
+        scales,
+        rotations,
+        rgbs,
+        opacities,
+        quantile_threshold=0.95,
+        apply_scale_filter=True,
+    ):
+        from plyfile import PlyData, PlyElement
+
+        means = means.detach().cpu().float().reshape(-1, 3)
+        scales = scales.detach().cpu().float().reshape(-1, 3).clamp_min(1e-8)
+        rotations = rotations.detach().cpu().float().reshape(-1, 4)
+        rgbs = rgbs.detach().cpu().float().reshape(-1, 3)
+        opacities = opacities.detach().cpu().float().reshape(-1)
+
+        n = min(means.shape[0], scales.shape[0], rotations.shape[0], opacities.shape[0])
+        if n == 0:
+            raise ValueError("No Gaussian splats to save")
+        if rgbs.shape[0] == 1 and n > 1:
+            rgbs = rgbs.expand(n, -1)
+        elif rgbs.shape[0] != n:
+            n = min(n, rgbs.shape[0])
+        if opacities.shape[0] == 1 and n > 1:
+            opacities = opacities.expand(n)
+        means, scales, rotations, rgbs, opacities = (
+            means[:n], scales[:n], rotations[:n], rgbs[:n], opacities[:n]
+        )
+
+        if apply_scale_filter and quantile_threshold is not None:
+            max_scale = scales.max(dim=-1)[0]
+            scale_threshold = self._safe_quantile(max_scale, quantile_threshold)
+            keep = max_scale <= scale_threshold
+            kept = int(keep.sum().item())
+            if kept <= 0:
+                keep = torch.ones_like(max_scale, dtype=torch.bool)
+                kept = int(keep.sum().item())
+            if kept != n:
+                print(f"📉 [SavePLY] Scale filter: {n} -> {kept} gaussians")
+
+            means = means[keep]
+            scales = scales[keep]
+            rotations = rotations[keep]
+            rgbs = rgbs[keep]
+            opacities = opacities[keep]
+
+        attributes = ["x", "y", "z", "nx", "ny", "nz"]
+        attributes += [f"f_dc_{i}" for i in range(3)]
+        attributes += ["opacity"]
+        attributes += [f"scale_{i}" for i in range(3)]
+        attributes += [f"rot_{i}" for i in range(4)]
+
+        elements = np.empty(means.shape[0], dtype=[(attribute, "f4") for attribute in attributes])
+        means_np = means.numpy()
+        rgbs_np = rgbs.numpy()
+        opacities_np = opacities.numpy()
+        scales_np = scales.log().numpy()
+        rotations_np = rotations.numpy()
+
+        elements["x"] = means_np[:, 0]
+        elements["y"] = means_np[:, 1]
+        elements["z"] = means_np[:, 2]
+        elements["nx"] = 0.0
+        elements["ny"] = 0.0
+        elements["nz"] = 0.0
+        for i in range(3):
+            elements[f"f_dc_{i}"] = rgbs_np[:, i]
+            elements[f"scale_{i}"] = scales_np[:, i]
+        elements["opacity"] = opacities_np
+        for i in range(4):
+            elements[f"rot_{i}"] = rotations_np[:, i]
+
+        tmp_path = f"{path}.tmp"
+        try:
+            PlyData([PlyElement.describe(elements, "vertex")]).write(tmp_path)
+            os.replace(tmp_path, str(path))
+            try:
+                self._save_splat_preview_cache(path, means, scales, rotations, rgbs, opacities)
+            except Exception as cache_error:
+                print(f"⚠️ [SavePLY] Preview splat cache failed: {cache_error}")
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
+
 
     def save_ply(self, ply_data, filename="output", save_pointcloud=False, save_gaussians=True,
                  rotate_x=0.0, rotate_y=0.0, rotate_z=0.0):
         from src.utils.save_utils import save_scene_ply, save_gs_ply
         
         output_dir = folder_paths.get_output_directory()
+        filename = self._sanitize_filename(filename)
         saved_files = []
+        save_pointcloud = False
+        save_gaussians = True
+        rotate_x = rotate_y = rotate_z = 0.0
         
         R = None
         if rotate_x != 0 or rotate_y != 0 or rotate_z != 0:
@@ -1364,6 +1458,7 @@ class VNCCS_SavePLY:
             # 1. Try Native Extraction (Primary)
             splats = ply_data.get("splats")
             native_success = False
+            apply_scale_filter = not bool(ply_data.get("skip_scale_filter"))
             
             if splats is not None and isinstance(splats, dict):
                 try:
@@ -1409,11 +1504,25 @@ class VNCCS_SavePLY:
                              quats = self._rotate_quaternions(quats, R)
                          
                          gs_path = self._get_unique_path(output_dir, filename, "gaussians", "ply")
-                         save_gs_ply(gs_path, means, scales, quats, colors, opacities)
+                         self._save_gs_ply_safe(
+                             gs_path,
+                             means,
+                             scales,
+                             quats,
+                             colors,
+                             opacities,
+                             apply_scale_filter=apply_scale_filter,
+                         )
                          saved_files.append(gs_path)
                          print(f"💾 [SavePLY] SUCCESS: Saved gaussians (Native): {os.path.basename(gs_path)} ({len(means)} pts)")
                          native_success = True
                 except Exception as e:
+                    if isinstance(e, OSError) and getattr(e, "errno", None) == 28:
+                        raise RuntimeError(
+                            "SavePLY failed: no space left on device while writing Gaussian PLY. "
+                            "Free disk space or lower splat_upsample_max_points; fallback is disabled "
+                            "for storage errors to avoid leaving a broken 0 KB PLY."
+                        ) from e
                     print(f"⚠️ [SavePLY] Native extraction failed, falling back: {e}")
             
             # 2. Fallback to Helper (if splats missing or native failed)
@@ -1433,7 +1542,15 @@ class VNCCS_SavePLY:
                     colors = (colors - 0.5) / SH_C0
 
                     gs_path = self._get_unique_path(output_dir, filename, "gaussians", "ply")
-                    save_gs_ply(gs_path, means, scales, quats, colors, opacities)
+                    self._save_gs_ply_safe(
+                        gs_path,
+                        means,
+                        scales,
+                        quats,
+                        colors,
+                        opacities,
+                        apply_scale_filter=apply_scale_filter,
+                    )
                     saved_files.append(gs_path)
                     print(f"💾 [SavePLY] SUCCESS: Saved gaussians (Fallback): {os.path.basename(gs_path)} ({len(means)} pts)")
                 else:
@@ -1470,7 +1587,7 @@ class VNCCS_SavePLY:
             dummy_quats[:, 0] = 1.0
             dummy_opacities = torch.ones(N) * 100.0 # Opaque
             
-            save_gs_ply(pc_path, means, dummy_scales, dummy_quats, colors_sh, dummy_opacities)
+            self._save_gs_ply_safe(pc_path, means, dummy_scales, dummy_quats, colors_sh, dummy_opacities)
             # save_scene_ply(pc_path, means, colors) # OLD method (simple points)
             
             saved_files.append(pc_path)
@@ -1495,22 +1612,17 @@ class VNCCS_BackgroundPreview:
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {
-                "preview_width": ("STRING", {
-                    "default": "512",
-                    "tooltip": "Preview window width in pixels (integer)"
-                }),
-            },
+            "required": {},
             "optional": {
                 "ply_path": ("STRING", {
                     "forceInput": True,
                     "tooltip": "Path to a Gaussian Splatting PLY file"
                 }),
-                "extrinsics": ("EXTRINSICS", {
-                    "tooltip": "4x4 camera extrinsics matrix for initial view"
+                "camera_poses": ("TENSOR", {
+                    "tooltip": "Optional: camera poses tensor from WorldMirror V2. Used to initialize the viewer camera."
                 }),
-                "intrinsics": ("INTRINSICS", {
-                    "tooltip": "3x3 camera intrinsics matrix for FOV"
+                "camera_intrinsics": ("TENSOR", {
+                    "tooltip": "Optional: camera intrinsics tensor from WorldMirror V2. Used for viewer FOV."
                 }),
             },
         }
@@ -1538,17 +1650,95 @@ class VNCCS_BackgroundPreview:
         if ply_path:
             return hash(ply_path)
         return None
-    
-    def preview(self, ply_path=None, preview_width=512, extrinsics=None, intrinsics=None, **kwargs):
+
+    def _tensor_to_list(self, value):
+        if value is None:
+            return None
+        if hasattr(value, "detach"):
+            value = value.detach().cpu().float()
+            return value.tolist()
+        if isinstance(value, np.ndarray):
+            return value.astype(np.float32).tolist()
+        if isinstance(value, (list, tuple)):
+            return value
+        return None
+
+    def _camera_intrinsics_to_preview(self, camera_intrinsics):
+        if camera_intrinsics is None or not hasattr(camera_intrinsics, "detach"):
+            return None
+        intrs = camera_intrinsics.detach().cpu().float()
+        if intrs.dim() == 4:
+            intrs = intrs[0]
+        if intrs.dim() == 3:
+            intrs = intrs[0]
+        if intrs.shape[-2:] != (3, 3):
+            return None
+        return intrs.tolist()
+
+    def _camera_poses_to_preview_extrinsics(self, camera_poses):
+        if camera_poses is None or not hasattr(camera_poses, "detach"):
+            return None
+        poses = camera_poses.detach().cpu().float()
+        if poses.dim() == 4:
+            poses = poses[0]
+        if poses.dim() == 2:
+            poses = poses.unsqueeze(0)
+        if poses.dim() != 3 or poses.shape[-2] not in (3, 4) or poses.shape[-1] != 4:
+            return None
+
+        if poses.shape[-2] == 3:
+            bottom = torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=poses.dtype).view(1, 1, 4)
+            poses = torch.cat([poses, bottom.repeat(poses.shape[0], 1, 1)], dim=1)
+
+        c2w = poses[0].clone()
+        centers = poses[:, :3, 3]
+        c2w[:3, 3] = centers.mean(dim=0)
+
+        # WorldMirror/Panorama nodes output c2w. The browser viewer receives
+        # w2c-style extrinsics and reconstructs camera center as -R^T t.
+        R = c2w[:3, :3]
+        t = c2w[:3, 3]
+        w2c = torch.eye(4, dtype=c2w.dtype)
+        w2c[:3, :3] = R.T
+        w2c[:3, 3] = -(R.T @ t)
+        return w2c.tolist()
+
+    def _view_info_for_path(self, path):
+        output_dir = folder_paths.get_output_directory()
+        temp_dir = folder_paths.get_temp_directory()
+
+        path_norm = path.replace("\\", "/")
+        output_dir_norm = output_dir.replace("\\", "/")
+        temp_dir_norm = temp_dir.replace("\\", "/")
+
+        if path_norm.startswith(output_dir_norm):
+            rel_path = os.path.relpath(path, output_dir).replace("\\", "/")
+            file_type = "output"
+        elif path_norm.startswith(temp_dir_norm):
+            rel_path = os.path.relpath(path, temp_dir).replace("\\", "/")
+            file_type = "temp"
+        else:
+            rel_path = os.path.basename(path)
+            file_type = "output"
+
+        return {
+            "rel_path": rel_path,
+            "subfolder": os.path.dirname(rel_path).replace("\\", "/"),
+            "filename": os.path.basename(rel_path),
+            "type": file_type,
+            "size_mb": round(os.path.getsize(path) / (1024 * 1024), 2),
+        }
+
+    def preview(
+        self,
+        ply_path=None,
+        camera_poses=None,
+        camera_intrinsics=None,
+        **kwargs,
+    ):
         """Prepare PLY file for gsplat.js preview."""
         import glob
-        
-        # Ensure preview_width is an int
-        try:
-            width_val = int(preview_width) if preview_width else 512
-        except (ValueError, TypeError):
-            width_val = 512
-        
+
         # If no path provided, we can't preview
         if not ply_path:
             return {"ui": {}, "result": ("", "")}
@@ -1557,44 +1747,29 @@ class VNCCS_BackgroundPreview:
         if not os.path.exists(ply_path):
             print(f"[VNCCS_BackgroundPreview] PLY file not found: {ply_path}")
             return {"ui": {"error": [f"File not found: {ply_path}"]}, "result": ("", "")}
-        
-        filename = os.path.basename(ply_path)
-        # Prepare relative path and type for ComfyUI /view endpoint
-        output_dir = folder_paths.get_output_directory()
-        temp_dir = folder_paths.get_temp_directory()
-        
-        file_type = "output"
-        rel_path = ""
-        
-        # Force forward slashes for Windows compatibility in browser URLs
-        ply_path_norm = ply_path.replace("\\", "/")
-        output_dir_norm = output_dir.replace("\\", "/")
-        temp_dir_norm = temp_dir.replace("\\", "/")
 
-        if ply_path_norm.startswith(output_dir_norm):
-            rel_path = os.path.relpath(ply_path, output_dir).replace("\\", "/")
-            file_type = "output"
-        elif ply_path_norm.startswith(temp_dir_norm):
-            rel_path = os.path.relpath(ply_path, temp_dir).replace("\\", "/")
-            file_type = "temp"
+        output_dir = folder_paths.get_output_directory()
+        ply_info = self._view_info_for_path(ply_path)
+
+        preview_path = os.path.splitext(ply_path)[0] + ".splat"
+        if os.path.exists(preview_path):
+            preview_info = self._view_info_for_path(preview_path)
+            preview_format = "splat"
         else:
-            rel_path = os.path.basename(ply_path)
-            file_type = "output" # Fallback
-            
-        subfolder = os.path.dirname(rel_path).replace("\\", "/")
-        filename = os.path.basename(rel_path)
-            
-        file_size = os.path.getsize(ply_path)
-        file_size_mb = file_size / (1024 * 1024)
+            preview_path = ply_path
+            preview_info = ply_info
+            preview_format = "ply"
         
         print(f"🔍 [VNCCS_BackgroundPreview] Preparing UI Data:")
         print(f"   - Full Path: {ply_path}")
-        print(f"   - Filename: {filename}")
-        print(f"   - Subfolder: {subfolder}")
-        print(f"   - Type: {file_type}")
-        print(f"   - Size: {file_size_mb:.2f} MB")
-        
-        # Find latest recorded video (optional/legacy)
+        print(f"   - Filename: {ply_info['filename']}")
+        print(f"   - Subfolder: {ply_info['subfolder']}")
+        print(f"   - Type: {ply_info['type']}")
+        print(f"   - Size: {ply_info['size_mb']:.2f} MB")
+        if preview_path != ply_path:
+            print(f"   - Preview cache: {preview_info['filename']} ({preview_info['size_mb']:.2f} MB)")
+
+        # Find latest recorded video from the viewer, if one was exported.
         video_path = ""
         try:
             pattern = os.path.join(output_dir, "gaussian-recording-*.mp4")
@@ -1607,19 +1782,26 @@ class VNCCS_BackgroundPreview:
             print(f"   ⚠️ Error finding video: {e}")
             
         ui_data = {
-            "filename": [filename],
-            "subfolder": [subfolder],
-            "type": [file_type],
-            "ply_path": [rel_path],
-            "file_size_mb": [round(file_size_mb, 2)],
-            "preview_width": [preview_width],
+            "filename": [ply_info["filename"]],
+            "subfolder": [ply_info["subfolder"]],
+            "type": [ply_info["type"]],
+            "ply_path": [ply_info["rel_path"]],
+            "file_size_mb": [ply_info["size_mb"]],
+            "preview_filename": [preview_info["filename"]],
+            "preview_subfolder": [preview_info["subfolder"]],
+            "preview_type": [preview_info["type"]],
+            "preview_path": [preview_info["rel_path"]],
+            "preview_file_size_mb": [preview_info["size_mb"]],
+            "preview_format": [preview_format],
         }
         
         # Add camera parameters if provided
+        extrinsics = self._camera_poses_to_preview_extrinsics(camera_poses)
+        # Do not forward WorldMirror intrinsics to the browser viewer by default:
+        # viewer_gaussian.html switches into native-resolution rendering whenever
+        # intrinsics are present, which is much heavier for multi-million splats.
         if extrinsics is not None:
             ui_data["extrinsics"] = [extrinsics]
-        if intrinsics is not None:
-            ui_data["intrinsics"] = [intrinsics]
         
         print(f"✅ [VNCCS_BackgroundPreview] UI data ready. Returning to frontend.")
         return {"ui": ui_data, "result": (video_path, ply_path)}
@@ -2790,4 +2972,3 @@ NODE_CATEGORY_MAPPINGS = {
     "VNCCS_PLYSceneRenderer": "VNCCS/3D",
     "VNCCS_SplatRefiner": "VNCCS/3D",
 }
-

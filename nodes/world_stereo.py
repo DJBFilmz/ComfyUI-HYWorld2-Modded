@@ -11,6 +11,7 @@ import os
 import sys
 import json
 import math
+from contextlib import contextmanager
 import numpy as np
 import torch
 
@@ -34,6 +35,70 @@ _WORLDSTEREO_PATH = os.path.join(PROJECT_ROOT, "worldstereo")
 if _WORLDSTEREO_PATH not in sys.path:
     sys.path.insert(0, _WORLDSTEREO_PATH)
 
+def _fallback_camera_backward_forward(c2w, distance):
+    c2w[:3, 3:4] = (c2w @ np.array([0, 0, distance, 1.0], dtype=np.float32).reshape(4, 1))[:3]
+    return c2w
+
+
+def _fallback_camera_left_right(c2w, distance):
+    c2w[:3, 3:4] = (c2w @ np.array([distance, 0, 0, 1.0], dtype=np.float32).reshape(4, 1))[:3]
+    return c2w
+
+
+def _fallback_native_camera_rotation(c2w, medium_depth, phi, theta):
+    R_elevation = np.array([[1, 0, 0, 0],
+                            [0, np.cos(theta), -np.sin(theta), 0],
+                            [0, np.sin(theta), np.cos(theta), 0],
+                            [0, 0, 0, 1]], dtype=np.float32)
+    R_azimuth = np.array([[np.cos(phi), 0, np.sin(phi), 0],
+                          [0, 1, 0, 0],
+                          [-np.sin(phi), 0, np.cos(phi), 0],
+                          [0, 0, 0, 1]], dtype=np.float32)
+    dummy_c2w = np.array([[1, 0, 0, 0],
+                          [0, 1, 0, 0],
+                          [0, 0, 1, -medium_depth],
+                          [0, 0, 0, 1]], dtype=np.float32)
+    dummy_c2w = R_azimuth @ R_elevation @ dummy_c2w
+    dummy_c2w[:3, 3] += np.array([0, 0, medium_depth], dtype=np.float32)
+    return c2w @ dummy_c2w
+
+
+def _fallback_axis_angle_to_matrix(axis, angle):
+    axis = axis / np.linalg.norm(axis)
+    x, y, z = axis
+    c, s = np.cos(angle), np.sin(angle)
+    C = 1 - c
+    return np.array([
+        [c + x * x * C, x * y * C - z * s, x * z * C + y * s],
+        [y * x * C + z * s, c + y * y * C, y * z * C - x * s],
+        [z * x * C - y * s, z * y * C + x * s, c + z * z * C],
+    ], dtype=np.float32)
+
+
+def _fallback_camera_rotation(c2w, medium_depth, phi, theta):
+    z0 = c2w[2, 3]
+    if z0 != 0 and phi != 0:
+        axis_origin = c2w @ np.array([0, 0, medium_depth, 1], dtype=np.float32).reshape(4, 1)
+        axis_origin = axis_origin[:3, 0]
+        axis_origin[2] = 0
+        R = np.eye(4, dtype=np.float32)
+        R[:3, :3] = _fallback_axis_angle_to_matrix(np.array([0, 0, 1], dtype=np.float32), -phi)
+        T1 = np.eye(4, dtype=np.float32)
+        T2 = np.eye(4, dtype=np.float32)
+        T1[:3, 3] = -axis_origin
+        T2[:3, 3] = axis_origin
+        return T2 @ R @ T1 @ c2w
+    return _fallback_native_camera_rotation(c2w, medium_depth, phi, theta)
+
+
+def _fallback_interpolate_poses(poses, M):
+    if poses.shape[0] == M:
+        return poses
+    indices = np.linspace(0, poses.shape[0] - 1, M)
+    nearest = np.clip(np.round(indices).astype(int), 0, poses.shape[0] - 1)
+    return poses[nearest]
+
+
 try:
     # 1. Try importing via the default package path
     from src.camera_utils import (
@@ -44,7 +109,7 @@ try:
         interpolate_poses,
     )
     CAMERA_UTILS_AVAILABLE = True
-except ImportError:
+except Exception as first_import_error:
     try:
         # 2. Fallback: Import directly to bypass the contested "src" namespace
         from camera_utils import (
@@ -55,19 +120,29 @@ except ImportError:
             interpolate_poses,
         )
         CAMERA_UTILS_AVAILABLE = True
-    except ImportError as e:
+    except Exception as e:
         print("\n" + "="*80)
+        print(f"[WorldStereo DEBUG] src.camera_utils import error: {first_import_error}")
         print(f"[WorldStereo DEBUG] Real camera_utils import error: {e}")
         import traceback
         traceback.print_exc()
         print("="*80 + "\n")
-        CAMERA_UTILS_AVAILABLE = False
+        camera_backward_forward = _fallback_camera_backward_forward
+        camera_left_right = _fallback_camera_left_right
+        camera_rotation = _fallback_camera_rotation
+        native_camera_rotation = _fallback_native_camera_rotation
+        interpolate_poses = _fallback_interpolate_poses
+        CAMERA_UTILS_AVAILABLE = True
+        CAMERA_UTILS_FALLBACK = True
+else:
+    CAMERA_UTILS_FALLBACK = False
 
 try:
     import folder_paths
     FOLDER_PATHS_AVAILABLE = True
 except ImportError:
-    FOLDER_AVAILABLE = False
+    folder_paths = None
+    FOLDER_PATHS_AVAILABLE = False
 
 try:
     from PIL import Image as PILImage
@@ -80,6 +155,113 @@ try:
     PYTORCH3D_AVAILABLE = True
 except ImportError:
     PYTORCH3D_AVAILABLE = False
+
+
+@contextmanager
+def _temporary_worldstereo_runtime_patches(patch_diffusers=False):
+    """Limit WorldStereo compatibility monkey-patches to the code block that needs them."""
+    import torch.distributed as dist
+
+    env_keys = ("RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT")
+    original_env = {key: os.environ.get(key) for key in env_keys}
+    os.environ["RANK"] = "0"
+    os.environ["WORLD_SIZE"] = "1"
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "29500"
+
+    class DummyProcessGroup:
+        def __init__(self):
+            self.group_name = "dummy_group"
+
+        def __getattr__(self, name):
+            def _fallback_func(*args, **kwargs):
+                return args[0] if args else None
+            return _fallback_func
+
+    def _dummy_dist_func(*args, **kwargs):
+        return args[0] if args else None
+
+    def _dummy_all_gather(tensor_list, tensor, *args, **kwargs):
+        if tensor_list:
+            tensor_list[0].copy_(tensor)
+        return tensor_list
+
+    _dummy_pg = DummyProcessGroup()
+    attr_patchers = {
+        "is_initialized": lambda: True,
+        "get_rank": lambda *args, **kwargs: 0,
+        "get_world_size": lambda *args, **kwargs: 1,
+        "barrier": lambda *args, **kwargs: None,
+        "new_group": lambda *args, **kwargs: _dummy_pg,
+        "all_reduce": _dummy_dist_func,
+        "broadcast": _dummy_dist_func,
+        "all_gather": _dummy_all_gather,
+        "reduce_scatter": lambda output, input_list, *args, **kwargs: output,
+        "get_backend": lambda *args, **kwargs: "gloo",
+        "init_process_group": lambda *args, **kwargs: None,
+    }
+
+    patched_attrs = []
+    for mod_name, mod in list(sys.modules.items()):
+        if mod_name == "torch.distributed" or mod_name.startswith("torch.distributed."):
+            if mod is None:
+                continue
+            for attr, patched in attr_patchers.items():
+                if hasattr(mod, attr):
+                    patched_attrs.append((mod, attr, getattr(mod, attr)))
+                    try:
+                        setattr(mod, attr, patched)
+                    except Exception:
+                        patched_attrs.pop()
+
+    if dist not in [item[0] for item in patched_attrs]:
+        for attr, patched in attr_patchers.items():
+            if hasattr(dist, attr):
+                patched_attrs.append((dist, attr, getattr(dist, attr)))
+                setattr(dist, attr, patched)
+
+    original_signature_keys = None
+    pipeline_utils = None
+    if patch_diffusers:
+        import diffusers.pipelines.pipeline_utils as pipeline_utils
+        original_signature_keys = pipeline_utils.DiffusionPipeline._get_signature_keys
+
+        @staticmethod
+        def patched_get_signature_keys(obj):
+            expected_modules, optional_parameters = original_signature_keys(obj)
+
+            if isinstance(expected_modules, list):
+                expected_modules = [x for x in expected_modules if x != "device"]
+            elif isinstance(expected_modules, set):
+                expected_modules = expected_modules - {"device"}
+
+            if isinstance(optional_parameters, list):
+                if "device" not in optional_parameters:
+                    optional_parameters.append("device")
+            elif isinstance(optional_parameters, set):
+                optional_parameters = optional_parameters | {"device"}
+
+            return expected_modules, optional_parameters
+
+        pipeline_utils.DiffusionPipeline._get_signature_keys = patched_get_signature_keys
+
+    try:
+        yield
+    finally:
+        if pipeline_utils is not None:
+            pipeline_utils.DiffusionPipeline._get_signature_keys = original_signature_keys
+
+        for mod, attr, original in reversed(patched_attrs):
+            try:
+                setattr(mod, attr, original)
+            except Exception:
+                pass
+
+        for key, value in original_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -530,125 +712,26 @@ class VNCCS_LoadWorldStereoModel:
         base_model_dir = base_model_dir.replace("\\", "/")
         moge_dir = moge_dir.replace("\\", "/")
 
-        # ── Monkey-patch torch.distributed to bypass Windows Gloo network bugs ──
-        import torch.distributed as dist
-        
-        # Set environment variables as a secondary fallback defense
-        os.environ["RANK"] = "0"
-        os.environ["WORLD_SIZE"] = "1"
-        os.environ["MASTER_ADDR"] = "127.0.0.1"
-        os.environ["MASTER_PORT"] = "29500"
+        with _temporary_worldstereo_runtime_patches(patch_diffusers=True):
+            from models.worldstereo_wrapper import WorldStereo
 
-        # Dummy Process Group class to satisfy PyTorch's DeviceMesh
-        class DummyProcessGroup:
-            def __init__(self):
-                self.group_name = "dummy_group"
-                
-            def __getattr__(self, name):
-                def _fallback_func(*args, **kwargs):
-                    return args[0] if args else None
-                return _fallback_func
-
-        # Generic no-op function that returns the first argument (the tensor) if present
-        def _dummy_dist_func(*args, **kwargs):
-            return args[0] if args else None
-
-        _dummy_pg = DummyProcessGroup()
-
-        dist.is_initialized = lambda: True
-        dist.get_rank = lambda *args, **kwargs: 0
-        dist.get_world_size = lambda *args, **kwargs: 1
-        dist.barrier = lambda *args, **kwargs: None
-        dist.new_group = lambda *args, **kwargs: _dummy_pg
-        dist.all_reduce = _dummy_dist_func
-        dist.broadcast = _dummy_dist_func
-        dist.all_gather = lambda tensor_list, tensor, *args, **kwargs: tensor_list
-        dist.reduce_scatter = lambda output, input_list, *args, **kwargs: output
-        dist.get_backend = lambda *args, **kwargs: "gloo"
-        dist.init_process_group = lambda *args, **kwargs: None
-
-        # Deep-patch all loaded torch.distributed submodules to prevent binding leaks
-        import sys
-        for mod_name, mod in list(sys.modules.items()):
-            if mod_name.startswith("torch.distributed") and mod:
-                for attr in ["init_process_group", "barrier", "broadcast", "all_reduce", "all_gather", "reduce_scatter", "new_group", "get_backend"]:
-                    if hasattr(mod, attr):
-                        try:
-                            if attr == "new_group":
-                                setattr(mod, attr, lambda *args, **kwargs: _dummy_pg)
-                            elif attr == "get_backend":
-                                setattr(mod, attr, lambda *args, **kwargs: "gloo")
-                            elif attr in ["all_reduce", "broadcast"]:
-                                setattr(mod, attr, _dummy_dist_func)
-                            else:
-                                setattr(mod, attr, lambda *args, **kwargs: None)
-                        except Exception:
-                            pass
-                if hasattr(mod, "is_initialized"):
-                    try:
-                        mod.is_initialized = lambda: True
-                    except Exception:
-                        pass
-                if hasattr(mod, "get_rank"):
-                    try:
-                        mod.get_rank = lambda *args, **kwargs: 0
-                    except Exception:
-                        pass
-                if hasattr(mod, "get_world_size"):
-                    try:
-                        mod.get_world_size = lambda *args, **kwargs: 1
-                    except Exception:
-                        pass
-                if hasattr(mod, "get_backend"):
-                    try:
-                        mod.get_backend = lambda *args, **kwargs: "gloo"
-                    except Exception:
-                        pass
-
-        # ── Monkey-patch Diffusers to bypass WorldStereo's required 'device' parameter bug ──
-        import diffusers.pipelines.pipeline_utils
-        _orig_get_signature_keys = diffusers.pipelines.pipeline_utils.DiffusionPipeline._get_signature_keys
-
-        @staticmethod
-        def patched_get_signature_keys(obj):
-            expected_modules, optional_parameters = _orig_get_signature_keys(obj)
-            
-            # Safely handle expected_modules whether it is a list or a set
-            if isinstance(expected_modules, list):
-                expected_modules = [x for x in expected_modules if x != "device"]
-            elif isinstance(expected_modules, set):
-                expected_modules = expected_modules - {"device"}
-                
-            # Safely handle optional_parameters whether it is a list or a set
-            if isinstance(optional_parameters, list):
-                if "device" not in optional_parameters:
-                    optional_parameters.append("device")
-            elif isinstance(optional_parameters, set):
-                optional_parameters = optional_parameters | {"device"}
-                
-            return expected_modules, optional_parameters
-
-        diffusers.pipelines.pipeline_utils.DiffusionPipeline._get_signature_keys = patched_get_signature_keys
-
-        from models.worldstereo_wrapper import WorldStereo
-
-        # Resolve MoGeModel class import based on your installed MoGe library version
-        try:
-            from moge.model.v2 import MoGeModel
-        except ImportError:
+            # Resolve MoGeModel class import based on your installed MoGe library version
             try:
-                from moge.model.v1 import MoGeModel
+                from moge.model.v2 import MoGeModel
             except ImportError:
-                from moge.model import MoGeModel  
+                try:
+                    from moge.model.v1 import MoGeModel
+                except ImportError:
+                    from moge.model import MoGeModel
 
-        # ── Load WorldStereo pipeline ─────────────────────────────────────────
-        print(f"[WorldStereo] Loading pipeline (model_type={model_type}, precision={precision}) ...")
-        parent_dir = os.path.dirname(transformer_dir)
-        worldstereo = WorldStereo.from_pretrained(
-            parent_dir,
-            subfolder=model_type,
-            device=device
-        )
+            # ── Load WorldStereo pipeline ─────────────────────────────────────
+            print(f"[WorldStereo] Loading pipeline (model_type={model_type}, precision={precision}) ...")
+            parent_dir = os.path.dirname(transformer_dir)
+            worldstereo = WorldStereo.from_pretrained(
+                parent_dir,
+                subfolder=model_type,
+                device=device
+            )
         pipeline = worldstereo.pipeline
 
         # ── Apply precision to transformer ────────────────────────────────────
@@ -986,15 +1069,16 @@ class VNCCS_WorldStereoGenerate:
 
             # ── Preprocess Pipeline Inputs for the Slice ──
             print(f"[WorldStereo] Slice {b + 1} processing: depth estimation + point rendering...")
-            pipeline_inputs = _prepare_pipeline_inputs(
-                image_pil=img_pil,
-                c2ws=c2ws_abs,
-                intrs=intrs_abs,
-                moge_model=moge_model,
-                device=device,
-                width=W,
-                height=H,
-            )
+            with _temporary_worldstereo_runtime_patches():
+                pipeline_inputs = _prepare_pipeline_inputs(
+                    image_pil=img_pil,
+                    c2ws=c2ws_abs,
+                    intrs=intrs_abs,
+                    moge_model=moge_model,
+                    device=device,
+                    width=W,
+                    height=H,
+                )
 
             # ── Generator Setup ──
             generator = None

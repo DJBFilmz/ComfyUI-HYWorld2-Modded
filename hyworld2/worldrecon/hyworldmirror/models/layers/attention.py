@@ -9,13 +9,25 @@ import torch
 
 try:
     from flash_attn_interface import flash_attn_func as flash_attn_func_v3
+    flash_attn_func_v2 = None
     _USE_FLASH_ATTN_V3 = True
 except ImportError:
-    from flash_attn.flash_attn_interface import flash_attn_func as flash_attn_func_v2
+    flash_attn_func_v3 = None
     _USE_FLASH_ATTN_V3 = False
+    try:
+        from flash_attn import flash_attn_func as flash_attn_func_v2
+    except ImportError:
+        try:
+            from flash_attn.flash_attn_interface import flash_attn_func as flash_attn_func_v2
+        except ImportError:
+            flash_attn_func_v2 = None
 from ...comm.padding import minimal_pad_to_divisible, depad_by_length, pad_by_length
 import torch.distributed as dist
 from ...comm.communication import _All2All, _Allgather
+
+
+def _get_flash_attn_func():
+    return flash_attn_func_v3 if _USE_FLASH_ATTN_V3 else flash_attn_func_v2
 
 
 class Attention(nn.Module):
@@ -55,7 +67,8 @@ class Attention(nn.Module):
         return q, k, v, B, N, C
 
     def _apply_attention(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
-        if q.dtype==torch.bfloat16 or q.dtype==torch.float16:
+        flash_attn_func = _get_flash_attn_func()
+        if callable(flash_attn_func) and (q.dtype==torch.bfloat16 or q.dtype==torch.float16):
             if q.is_contiguous():
                 q = q.transpose(1,2)
             else:
@@ -69,9 +82,9 @@ class Attention(nn.Module):
             else:
                 v = v.transpose(1, 2).contiguous()
             if _USE_FLASH_ATTN_V3:
-                x = flash_attn_func_v3(q, k, v)
+                x = flash_attn_func(q, k, v)
             else:
-                x = flash_attn_func_v2(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
+                x = flash_attn_func(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
             if x.is_contiguous():
                 x = x.transpose(1, 2)
             else:

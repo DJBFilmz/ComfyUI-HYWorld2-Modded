@@ -8,6 +8,22 @@ import folder_paths
 
 from .world_mirror_v1 import equirect_to_perspective
 
+
+def _resolve_input_image_path(image_path):
+    raw_path = str(image_path or "").replace("\\", os.sep)
+    if os.path.isabs(raw_path):
+        raise ValueError("absolute paths are not allowed")
+
+    normalized = os.path.normpath(raw_path)
+    if normalized in ("", ".", "..") or normalized.startswith(".." + os.sep):
+        raise ValueError("parent-directory paths are not allowed")
+
+    input_dir = os.path.abspath(folder_paths.get_input_directory())
+    candidate = os.path.abspath(os.path.join(input_dir, normalized))
+    if os.path.commonpath([input_dir, candidate]) != input_dir:
+        raise ValueError("path escapes ComfyUI input directory")
+    return candidate
+
 class VNCCS_PanoramaMapper:
     """
     VNCCS Panorama Mapper Node
@@ -43,9 +59,12 @@ class VNCCS_PanoramaMapper:
             empty = torch.zeros((1, 512, 512, 3))
             return (empty, empty, empty, empty, empty)
 
-        # ComfyUI image paths are usually relative to input dir
-        if not os.path.isabs(image_path):
-            image_path = os.path.join(folder_paths.get_input_directory(), image_path)
+        try:
+            image_path = _resolve_input_image_path(image_path)
+        except ValueError as e:
+            print(f"⚠️ [VNCCS] Invalid panorama image path: {e}")
+            empty = torch.zeros((1, 512, 512, 3))
+            return (empty, empty, empty, empty, empty)
 
         if not os.path.exists(image_path):
             print(f"⚠️ [VNCCS] Panorama image not found at: {image_path}")

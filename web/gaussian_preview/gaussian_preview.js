@@ -41,6 +41,8 @@ app.registerExtension({
                 iframe.style.minHeight = "0";
                 iframe.style.border = "none";
                 iframe.style.backgroundColor = "#1a1a1a";
+                iframe.allowFullscreen = true;
+                iframe.setAttribute("allow", "fullscreen; clipboard-write");
 
                 // Point to gsplat.js HTML viewer (with cache buster)
                 iframe.src = `/extensions/${EXTENSION_FOLDER}/gaussian_preview/static/viewer_gaussian.html?v=` + Date.now();
@@ -68,30 +70,24 @@ app.registerExtension({
                     setValue(v) { }
                 });
 
-                // Store reference to node for dynamic resizing
+                // Store reference to node for dynamic widget sizing. The node
+                // size is the source of truth; resizing the node reveals more or
+                // less of the 3D viewport without changing scene framing.
                 const node = this;
-                let currentNodeSize = [512, 580];
-
-                widget.computeSize = () => currentNodeSize;
+                widget.computeSize = function () {
+                    const isNodeResizeClamp = app.canvas?.resizing_node === node;
+                    const width = Math.max(240, node.size[0] - 20);
+                    if (isNodeResizeClamp) {
+                        return [width, 80];
+                    }
+                    const top = this.last_y ?? 120;
+                    const height = Math.max(80, node.size[1] - top - 8);
+                    return [width, height];
+                };
 
                 // Store references
                 this.gaussianViewerIframe = iframe;
                 this.gaussianInfoPanel = infoPanel;
-
-                // Function to resize node dynamically
-                this.resizeToAspectRatio = function (imageWidth, imageHeight) {
-                    const aspectRatio = imageWidth / imageHeight;
-                    const nodeWidth = 512;
-                    const viewerHeight = Math.round(nodeWidth / aspectRatio);
-                    const nodeHeight = viewerHeight + 60;  // Add space for info panel
-
-                    currentNodeSize = [nodeWidth, nodeHeight];
-                    node.setSize(currentNodeSize);
-                    node.setDirtyCanvas(true, true);
-                    app.graph.setDirtyCanvas(true, true);
-
-                    console.log("[GeomPack Gaussian] Resized node to:", nodeWidth, "x", nodeHeight, "(aspect ratio:", aspectRatio.toFixed(2), ")");
-                };
 
                 // Track iframe load state
                 let iframeLoaded = false;
@@ -155,9 +151,6 @@ app.registerExtension({
                     }
                 });
 
-                // Set initial node size
-                this.setSize([512, 580]);
-
                 // Handle execution
                 const onExecuted = this.onExecuted;
                 this.onExecuted = function (message) {
@@ -172,21 +165,18 @@ app.registerExtension({
                     // The message IS the UI data (not message.ui)
                     if (message?.ply_path && message.ply_path[0]) {
                         const filename = message.filename?.[0];
-                        const rel_path = message.ply_path[0];
                         const fileSizeMb = message.file_size_mb?.[0] || 'N/A';
                         const subfolder = message.subfolder?.[0] || "";
                         const type = message.type?.[0] || "output";
+                        const previewFilename = message.preview_filename?.[0] || filename;
+                        const previewSubfolder = message.preview_subfolder?.[0] || subfolder;
+                        const previewType = message.preview_type?.[0] || type;
+                        const previewSizeMb = message.preview_file_size_mb?.[0] || fileSizeMb;
+                        const previewFormat = message.preview_format?.[0] || "ply";
 
                         // Extract camera parameters if provided
                         const extrinsics = message.extrinsics?.[0] || null;
                         const intrinsics = message.intrinsics?.[0] || null;
-
-                        // Resize node to match image aspect ratio from intrinsics
-                        if (intrinsics && intrinsics[0] && intrinsics[1]) {
-                            const imageWidth = intrinsics[0][2] * 2;   // cx * 2
-                            const imageHeight = intrinsics[1][2] * 2;  // cy * 2
-                            this.resizeToAspectRatio(imageWidth, imageHeight);
-                        }
 
                         // Update info panel
                         infoPanel.innerHTML = `
@@ -195,11 +185,13 @@ app.registerExtension({
                                 <span style="color: #6cc;">${filename}</span>
                                 <span style="color: #888;">Size:</span>
                                 <span>${fileSizeMb} MB</span>
+                                <span style="color: #888;">Preview:</span>
+                                <span>${previewFormat.toUpperCase()} · ${previewSizeMb} MB</span>
                             </div>
                         `;
 
                         // ComfyUI serves output files via /view API endpoint
-                        const filepath = `/view?filename=${encodeURIComponent(filename)}&type=${encodeURIComponent(type)}&subfolder=${encodeURIComponent(subfolder)}`;
+                        const filepath = `/view?filename=${encodeURIComponent(previewFilename)}&type=${encodeURIComponent(previewType)}&subfolder=${encodeURIComponent(previewSubfolder)}`;
 
                         // Function to fetch and send data to iframe
                         const fetchAndSend = async () => {
@@ -208,7 +200,7 @@ app.registerExtension({
                             }
 
                             try {
-                                // Fetch the PLY file from parent context (authenticated)
+                                // Fetch the preview file from parent context (authenticated)
                                 const response = await fetch(filepath);
                                 if (!response.ok) {
                                     throw new Error(`HTTP ${response.status}: ${response.statusText}`);
@@ -219,14 +211,16 @@ app.registerExtension({
                                 iframe.contentWindow.postMessage({
                                     type: "LOAD_MESH_DATA",
                                     data: arrayBuffer,
-                                    filename: filename,
+                                    filename: previewFilename,
+                                    sourceFilename: filename,
+                                    format: previewFormat,
                                     extrinsics: extrinsics,
                                     intrinsics: intrinsics,
                                     timestamp: Date.now()
                                 }, "*", [arrayBuffer]);
                             } catch (error) {
-                                console.error("[VNCCS.GaussianPreview] Error fetching PLY:", error);
-                                infoPanel.innerHTML = `<div style="color: #ff6b6b;">Error loading PLY: ${error.message}</div>`;
+                                console.error("[VNCCS.GaussianPreview] Error fetching preview data:", error);
+                                infoPanel.innerHTML = `<div style="color: #ff6b6b;">Error loading preview: ${error.message}</div>`;
                             }
                         };
 
