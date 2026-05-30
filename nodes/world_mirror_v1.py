@@ -1333,6 +1333,67 @@ class VNCCS_SavePLY:
         base = re.sub(r"[^A-Za-z0-9._ -]+", "_", base).strip(" ._")
         return base or "output"
 
+    def _safe_quantile(self, values, q, max_values=1_000_000):
+        flat = values.detach().cpu().float().reshape(-1)
+        if flat.numel() > max_values:
+            step = max(1, flat.numel() // max_values)
+            flat = flat[::step][:max_values]
+        return torch.quantile(flat, q)
+
+    def _save_gs_ply_safe(self, path, means, scales, rotations, rgbs, opacities, quantile_threshold=0.95):
+        from plyfile import PlyData, PlyElement
+
+        means = means.detach().cpu().float().reshape(-1, 3)
+        scales = scales.detach().cpu().float().reshape(-1, 3).clamp_min(1e-8)
+        rotations = rotations.detach().cpu().float().reshape(-1, 4)
+        rgbs = rgbs.detach().cpu().float().reshape(-1, 3)
+        opacities = opacities.detach().cpu().float().reshape(-1)
+
+        n = min(means.shape[0], scales.shape[0], rotations.shape[0], rgbs.shape[0], opacities.shape[0])
+        if n == 0:
+            raise ValueError("No Gaussian splats to save")
+        means, scales, rotations, rgbs, opacities = (
+            means[:n], scales[:n], rotations[:n], rgbs[:n], opacities[:n]
+        )
+
+        max_scale = scales.max(dim=-1)[0]
+        scale_threshold = self._safe_quantile(max_scale, quantile_threshold)
+        keep = max_scale <= scale_threshold
+        kept = int(keep.sum().item())
+        if kept <= 0:
+            keep = torch.ones_like(max_scale, dtype=torch.bool)
+            kept = int(keep.sum().item())
+        if kept != n:
+            print(f"📉 [SavePLY] Scale filter: {n} -> {kept} gaussians")
+
+        means = means[keep]
+        scales = scales[keep]
+        rotations = rotations[keep]
+        rgbs = rgbs[keep]
+        opacities = opacities[keep]
+
+        attributes = ["x", "y", "z", "nx", "ny", "nz"]
+        attributes += [f"f_dc_{i}" for i in range(3)]
+        attributes += ["opacity"]
+        attributes += [f"scale_{i}" for i in range(3)]
+        attributes += [f"rot_{i}" for i in range(4)]
+
+        means_np = means.numpy()
+        attributes_data = np.concatenate(
+            (
+                means_np,
+                np.zeros_like(means_np),
+                rgbs.numpy(),
+                opacities[..., None].numpy(),
+                scales.log().numpy(),
+                rotations.numpy(),
+            ),
+            axis=1,
+        )
+        elements = np.empty(means.shape[0], dtype=[(attribute, "f4") for attribute in attributes])
+        elements[:] = list(map(tuple, attributes_data))
+        PlyData([PlyElement.describe(elements, "vertex")]).write(str(path))
+
 
     def save_ply(self, ply_data, filename="output", save_pointcloud=False, save_gaussians=True,
                  rotate_x=0.0, rotate_y=0.0, rotate_z=0.0):
@@ -1396,7 +1457,7 @@ class VNCCS_SavePLY:
                              quats = self._rotate_quaternions(quats, R)
                          
                          gs_path = self._get_unique_path(output_dir, filename, "gaussians", "ply")
-                         save_gs_ply(gs_path, means, scales, quats, colors, opacities)
+                         self._save_gs_ply_safe(gs_path, means, scales, quats, colors, opacities)
                          saved_files.append(gs_path)
                          print(f"💾 [SavePLY] SUCCESS: Saved gaussians (Native): {os.path.basename(gs_path)} ({len(means)} pts)")
                          native_success = True
@@ -1420,7 +1481,7 @@ class VNCCS_SavePLY:
                     colors = (colors - 0.5) / SH_C0
 
                     gs_path = self._get_unique_path(output_dir, filename, "gaussians", "ply")
-                    save_gs_ply(gs_path, means, scales, quats, colors, opacities)
+                    self._save_gs_ply_safe(gs_path, means, scales, quats, colors, opacities)
                     saved_files.append(gs_path)
                     print(f"💾 [SavePLY] SUCCESS: Saved gaussians (Fallback): {os.path.basename(gs_path)} ({len(means)} pts)")
                 else:
@@ -1457,7 +1518,7 @@ class VNCCS_SavePLY:
             dummy_quats[:, 0] = 1.0
             dummy_opacities = torch.ones(N) * 100.0 # Opaque
             
-            save_gs_ply(pc_path, means, dummy_scales, dummy_quats, colors_sh, dummy_opacities)
+            self._save_gs_ply_safe(pc_path, means, dummy_scales, dummy_quats, colors_sh, dummy_opacities)
             # save_scene_ply(pc_path, means, colors) # OLD method (simple points)
             
             saved_files.append(pc_path)

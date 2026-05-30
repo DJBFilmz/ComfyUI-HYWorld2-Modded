@@ -4,10 +4,12 @@ WorldMirror V2 ComfyUI nodes — uses HY-World-2.0 (tencent/HY-World-2.0).
 Nodes:
   - VNCCS_LoadWorldMirrorV2Model   — download + load V2 model
   - VNCCS_WorldMirrorV2_3D         — V2 inference, PLY_DATA output
+  - VNCCS_WorldMirrorV2_3D_Experimental — experimental V2 inference copy
 """
 
 import os
 import sys
+import copy
 import numpy as np
 import torch
 from torchvision import transforms
@@ -58,6 +60,7 @@ try:
         segment_sky,
         download_file_from_url,
     )
+    from hyworld2.worldrecon.hyworldmirror.models.utils.geometry import depth_to_world_coords_points
     V2_UTILS_AVAILABLE = True
 except Exception as _e:
     print(f"⚠️ [VNCCS V2] Could not import V2 utilities: {_e}")
@@ -216,6 +219,12 @@ def _voxel_prune_splats_dict(splats, voxel_size):
         else:
             colors_for_prune = colors.reshape(colors.shape[0], -1)[:, :3]
         weights = get_item("weights").detach().cpu().reshape(-1) if "weights" in splats else torch.ones_like(opacities)
+        if weights.shape[0] != opacities.shape[0]:
+            print(
+                f"⚠️ [V2] Ignoring stale splat weights during voxel prune: "
+                f"weights={weights.shape[0]}, opacities={opacities.shape[0]}"
+            )
+            weights = torch.ones_like(opacities)
         means, scales, quats, colors_new, opacities = _voxel_prune_gaussians(
             means, scales, quats, colors_for_prune, opacities, weights, voxel_size=voxel_size
         )
@@ -228,7 +237,69 @@ def _voxel_prune_splats_dict(splats, voxel_size):
         else:
             pruned[color_key].append(colors_new)
     out.update(pruned)
+    # Weights are only used as a merge/prune helper. After voxel merging they no
+    # longer map 1:1 to the pruned gaussians, so keeping them causes later
+    # cross-chunk pruning to mix tensors with incompatible lengths.
+    out.pop("weights", None)
     return out
+
+
+def _replace_splat_colors_from_images(splats, imgs_tensor):
+    if not isinstance(splats, dict) or imgs_tensor is None:
+        return splats
+    means = splats.get("means")
+    if means is None:
+        return splats
+
+    B, S, _, H, W = imgs_tensor.shape
+    rgb = imgs_tensor.permute(0, 1, 3, 4, 2).reshape(B, S * H * W, 3)
+    sh_dc = (rgb - 0.5) / 0.28209479177387814
+
+    out = dict(splats)
+    if isinstance(means, list):
+        out["sh"] = [sh_dc[i, :m.shape[0]].to(m.device, dtype=m.dtype)[:, None, :] for i, m in enumerate(means)]
+    elif isinstance(means, torch.Tensor):
+        out["sh"] = sh_dc[:, :means.shape[1]].to(means.device, dtype=means.dtype)[:, :, None, :]
+    else:
+        return splats
+    return out
+
+
+def _tune_splats(splats, scale_multiplier=1.0, opacity_floor=0.0):
+    if not isinstance(splats, dict):
+        return splats
+    out = dict(splats)
+
+    def map_value(value, fn):
+        if isinstance(value, list):
+            return [fn(v) if isinstance(v, torch.Tensor) else v for v in value]
+        if isinstance(value, torch.Tensor):
+            return fn(value)
+        return value
+
+    if scale_multiplier != 1.0 and "scales" in out:
+        out["scales"] = map_value(out["scales"], lambda t: t * float(scale_multiplier))
+    if opacity_floor > 0.0 and "opacities" in out:
+        floor = float(opacity_floor)
+        out["opacities"] = map_value(out["opacities"], lambda t: t.clamp_min(floor))
+    return out
+
+
+def _log_splat_stats(splats):
+    if not isinstance(splats, dict):
+        print("[V2 DEBUG] splats stats: none")
+        return
+
+    def first_tensor(key):
+        value = splats.get(key)
+        if isinstance(value, list):
+            return value[0] if value and isinstance(value[0], torch.Tensor) else None
+        return value if isinstance(value, torch.Tensor) else None
+
+    for key in ("scales", "opacities", "weights"):
+        value = first_tensor(key)
+        if value is not None:
+            print("[V2 DEBUG] splats." + _tensor_stats_line(key, value))
 
 
 def _module_has_meta_tensors(module):
@@ -273,10 +344,17 @@ def _tensor_stats_line(name, value):
     t = value.detach().cpu().float()
     if t.numel() == 0:
         return f"{name}=empty"
+    flat = t.flatten()
+    sample_note = ""
+    max_stats_values = 1_000_000
+    if flat.numel() > max_stats_values:
+        step = max(1, flat.numel() // max_stats_values)
+        flat = flat[::step][:max_stats_values]
+        sample_note = f", sampled={flat.numel()}/{t.numel()}"
     return (
-        f"{name}: min={t.min().item():.4f}, p10={torch.quantile(t.flatten(), 0.10).item():.4f}, "
-        f"median={t.median().item():.4f}, p90={torch.quantile(t.flatten(), 0.90).item():.4f}, "
-        f"max={t.max().item():.4f}"
+        f"{name}: min={flat.min().item():.4f}, p10={torch.quantile(flat, 0.10).item():.4f}, "
+        f"median={flat.median().item():.4f}, p90={torch.quantile(flat, 0.90).item():.4f}, "
+        f"max={flat.max().item():.4f}{sample_note}"
     )
 
 
@@ -343,6 +421,25 @@ def _log_per_view_points(name, points, S, H, W):
             f"min=({pmin[0]: .4f},{pmin[1]: .4f},{pmin[2]: .4f}) "
             f"max=({pmax[0]: .4f},{pmax[1]: .4f},{pmax[2]: .4f})"
         )
+
+
+def _log_mask_coverage(name, mask):
+    if mask is None:
+        print(f"[V2 DEBUG] {name}: none")
+        return
+    m = np.asarray(mask).astype(bool)
+    if m.ndim == 3:
+        total_kept = int(m.sum())
+        total = int(m.size)
+        print(f"[V2 DEBUG] {name}: kept {total_kept}/{total} ({100.0 * total_kept / max(total, 1):.2f}%)")
+        for i in range(m.shape[0]):
+            kept = int(m[i].sum())
+            count = int(m[i].size)
+            print(f"[V2 DEBUG]   {i:02d}: kept {kept}/{count} ({100.0 * kept / max(count, 1):.2f}%)")
+    else:
+        kept = int(m.sum())
+        count = int(m.size)
+        print(f"[V2 DEBUG] {name}: kept {kept}/{count} ({100.0 * kept / max(count, 1):.2f}%)")
 
 
 def _log_worldmirror_debug(predictions, views, camera_poses, camera_intrinsics, imgs_tensor):
@@ -552,6 +649,10 @@ class VNCCS_WorldMirrorV2_3D:
                     "default": True,
                     "tooltip": "Remove points at depth discontinuities."
                 }),
+                "filter_splats": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Apply filter masks to Gaussian splats. Off keeps panorama coverage and avoids mask-carved black holes."
+                }),
                 "edge_normal_threshold": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 90.0, "step": 0.5}),
                 "edge_depth_threshold":  ("FLOAT", {"default": 0.03, "min": 0.001, "max": 0.5, "step": 0.001}),
                 "apply_confidence_mask": ("BOOLEAN", {
@@ -566,6 +667,10 @@ class VNCCS_WorldMirrorV2_3D:
                     "default": "input_when_available",
                     "tooltip": "input_when_available keeps panorama GS positions locked to supplied cameras. predicted matches official inference."
                 }),
+                "splat_color_source": (["input_image", "model_sh"], {
+                    "default": "input_image",
+                    "tooltip": "input_image colors every Gaussian from the source view RGB, avoiding black SH artifacts. model_sh preserves the model residual SH output."
+                }),
                 "adaptive_target_size": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Clamp target_size to the input resolution, matching the official Gradio flow more closely."
@@ -579,12 +684,20 @@ class VNCCS_WorldMirrorV2_3D:
                     "tooltip": "Keep pixels whose native model mask is at least this value."
                 }),
                 "voxel_prune_splats": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Voxel-merge filtered Gaussian splats after inference."
+                    "default": True,
+                    "tooltip": "Voxel-merge Gaussian splats after inference. Matches official saving flow and keeps panorama files smaller."
                 }),
                 "voxel_size": ("FLOAT", {
                     "default": 0.002, "min": 0.0001, "max": 0.1, "step": 0.0001,
                     "tooltip": "Voxel size used when voxel_prune_splats is enabled."
+                }),
+                "splat_scale_multiplier": ("FLOAT", {
+                    "default": 1.0, "min": 0.25, "max": 4.0, "step": 0.05,
+                    "tooltip": "Multiply Gaussian scale before saving. Increase slightly if dense visible surfaces have pinholes."
+                }),
+                "splat_opacity_floor": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Minimum Gaussian opacity before saving. Raise for debugging holes caused by transparent splats."
                 }),
                 "debug_log": ("BOOLEAN", {
                     "default": False,
@@ -623,16 +736,20 @@ class VNCCS_WorldMirrorV2_3D:
         confidence_percentile = 10.0,
         apply_sky_mask      = False,
         filter_edges        = True,
+        filter_splats       = False,
         edge_normal_threshold = 1.0,
         edge_depth_threshold  = 0.03,
         apply_confidence_mask = False,
         camera_conditioning = "pose+intrinsics",
         splat_camera_source = "input_when_available",
+        splat_color_source = "input_image",
         adaptive_target_size = False,
         apply_model_masks = False,
         model_mask_threshold = 0.5,
-        voxel_prune_splats = False,
+        voxel_prune_splats = True,
         voxel_size = 0.002,
+        splat_scale_multiplier = 1.0,
+        splat_opacity_floor = 0.0,
         debug_log = False,
         camera_intrinsics   = None,
         camera_poses        = None,
@@ -740,7 +857,7 @@ class VNCCS_WorldMirrorV2_3D:
             print(
                 f"🚀 [V2] Inference: {B} images @ {target_size}px, gs={worldmirror.enable_gs}, "
                 f"camera_conditioning={camera_conditioning}, splat_camera_source={splat_camera_source} "
-                f"(effective={effective_splat_camera_source})"
+                f"(effective={effective_splat_camera_source}), splat_color_source={splat_color_source}"
             )
             with torch.no_grad():
                 # Determine the target sequence length
@@ -919,6 +1036,12 @@ class VNCCS_WorldMirrorV2_3D:
             elif depth_model_mask is not None and gs_mask is not None:
                 gs_mask = gs_mask & depth_model_mask
 
+        if debug_log:
+            _log_mask_coverage("pts_filter_mask", pts_mask)
+            _log_mask_coverage("gs_filter_mask", gs_mask)
+            if not filter_splats:
+                print("[V2 DEBUG] gs_filter_mask is diagnostic only; filter_splats=false, so splats are not mask-filtered.")
+
         # ── 7. Filter pts3d ───────────────────────────────────────────────────
         filtered_pts = None
         if "pts3d" in predictions:
@@ -931,8 +1054,13 @@ class VNCCS_WorldMirrorV2_3D:
 
         # ── 8. Filter splats with GS-specific mask ────────────────────────────
         splats = predictions.get("splats")
+        if splat_color_source == "input_image":
+            splats = _replace_splat_colors_from_images(splats, imgs_tensor)
+        splats = _tune_splats(splats, splat_scale_multiplier, splat_opacity_floor)
+        if debug_log:
+            _log_splat_stats(splats)
         splat_mask = gs_mask if gs_mask is not None else pts_mask
-        splats = _apply_mask_to_splats(splats, splat_mask)
+        splats = _apply_mask_to_splats(splats, splat_mask if filter_splats else None)
         if voxel_prune_splats:
             splats = _voxel_prune_splats_dict(splats, voxel_size)
 
@@ -999,6 +1127,476 @@ class VNCCS_WorldMirrorV2_3D:
         )
 
 
+class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
+    """Experimental WorldMirror V2 reconstruction node.
+
+    Kept as a separate ComfyUI node id so new knobs can evolve without
+    changing saved state on the stable reconstruction node.
+    """
+
+    CATEGORY = "VNCCS/3D/Experimental"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        inputs = copy.deepcopy(super().INPUT_TYPES())
+        optional = inputs.setdefault("optional", {})
+        optional["chunked_inference"] = ("BOOLEAN", {
+            "default": False,
+            "tooltip": "Run WorldMirror V2 in sequential view chunks and merge Gaussian splats. Experimental high-res mode."
+        })
+        optional["chunk_size"] = ("INT", {
+            "default": 4, "min": 1, "max": 64, "step": 1,
+            "tooltip": "Number of views processed per model forward when chunked_inference is enabled."
+        })
+        optional["chunk_overlap"] = ("INT", {
+            "default": 0, "min": 0, "max": 16, "step": 1,
+            "tooltip": "Extra views shared between neighboring chunks. Duplicates are only reduced by voxel pruning."
+        })
+        optional["chunk_merge_voxel_prune"] = ("BOOLEAN", {
+            "default": True,
+            "tooltip": "Voxel-merge the final concatenated splats across chunks."
+        })
+        optional["chunk_merge_voxel_size"] = ("FLOAT", {
+            "default": 0.002, "min": 0.0001, "max": 0.1, "step": 0.0001,
+            "tooltip": "Voxel size for final cross-chunk merge."
+        })
+        optional["chunk_keep_diagnostics"] = ("BOOLEAN", {
+            "default": False,
+            "tooltip": "Keep full concatenated depth/normal/debug image outputs. Off saves RAM and keeps only first chunk diagnostics."
+        })
+        optional["chunk_anchor_depth_prior"] = ("BOOLEAN", {
+            "default": True,
+            "tooltip": "Run one low-res all-view pass and feed its depth as a shared prior to high-res chunks."
+        })
+        optional["chunk_anchor_target_size"] = ("INT", {
+            "default": 518, "min": 252, "max": 1400, "step": 14,
+            "tooltip": "Resolution for the low-res all-view anchor pass."
+        })
+        optional["splat_upsample_mode"] = (["none", "depth_backproject"], {
+            "default": "none",
+            "tooltip": "Experimental: replace model splats with dense high-res splats from upsampled depth and high-res RGB."
+        })
+        optional["splat_upsample_size"] = ("INT", {
+            "default": 1022, "min": 252, "max": 1400, "step": 14,
+            "tooltip": "High-res splat grid size. Model inference can stay at target_size=518."
+        })
+        optional["splat_upsample_depth_source"] = (["gs_depth", "depth"], {
+            "default": "gs_depth",
+            "tooltip": "Depth tensor to upsample and backproject into dense high-res splats."
+        })
+        optional["splat_upsample_scale"] = ("FLOAT", {
+            "default": 0.003, "min": 0.0001, "max": 0.05, "step": 0.0001,
+            "tooltip": "Constant Gaussian scale for high-res backprojected splats."
+        })
+        optional["splat_upsample_opacity"] = ("FLOAT", {
+            "default": 0.9, "min": 0.01, "max": 1.0, "step": 0.01,
+            "tooltip": "Constant Gaussian opacity for high-res backprojected splats."
+        })
+        optional["splat_upsample_voxel_prune"] = ("BOOLEAN", {
+            "default": True,
+            "tooltip": "Voxel-merge high-res backprojected splats before saving."
+        })
+        optional["splat_upsample_voxel_size"] = ("FLOAT", {
+            "default": 0.0015, "min": 0.0001, "max": 0.1, "step": 0.0001,
+            "tooltip": "Voxel size for high-res backprojected splat merge."
+        })
+        optional["splat_upsample_max_points"] = ("INT", {
+            "default": 5000000, "min": 0, "max": 50000000, "step": 100000,
+            "tooltip": "Deterministically downsample high-res splats to this many points. 0 disables the cap."
+        })
+        return inputs
+
+    def _chunk_ranges(self, total, chunk_size, chunk_overlap):
+        chunk_size = max(1, int(chunk_size))
+        chunk_overlap = max(0, min(int(chunk_overlap), chunk_size - 1))
+        step = max(1, chunk_size - chunk_overlap)
+        ranges = []
+        start = 0
+        while start < total:
+            end = min(total, start + chunk_size)
+            ranges.append((start, end))
+            if end >= total:
+                break
+            start += step
+        return ranges
+
+    def _slice_like_views(self, value, indices, total):
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor) and value.shape[0] == total:
+            return value[indices.to(value.device)]
+        return value
+
+    def _splat_value_to_points(self, value):
+        if isinstance(value, list):
+            if not value or not isinstance(value[0], torch.Tensor):
+                return None
+            return value[0]
+        if isinstance(value, torch.Tensor):
+            return value[0] if value.dim() >= 3 and value.shape[0] == 1 else value
+        return None
+
+    def _merge_splats(self, splat_dicts):
+        keys = ("means", "scales", "quats", "sh", "colors", "opacities", "weights")
+        merged = {}
+        expected_count = None
+        for key in keys:
+            parts = []
+            for splats in splat_dicts:
+                if not isinstance(splats, dict) or key not in splats:
+                    continue
+                value = self._splat_value_to_points(splats[key])
+                if isinstance(value, torch.Tensor):
+                    parts.append(value.detach().cpu())
+            if parts:
+                value = torch.cat(parts, dim=0)
+                if key == "means":
+                    expected_count = value.shape[0]
+                elif expected_count is not None and value.shape[0] != expected_count:
+                    print(
+                        f"⚠️ [V2 EXP] Dropping merged splat key '{key}' due to length mismatch: "
+                        f"{value.shape[0]} != {expected_count}"
+                    )
+                    continue
+                merged[key] = [value]
+        return merged if "means" in merged else None
+
+    def _cat_optional_tensors(self, values, dim):
+        tensors = [v.detach().cpu() for v in values if isinstance(v, torch.Tensor)]
+        if not tensors:
+            return None
+        return torch.cat(tensors, dim=dim)
+
+    def _depth_prior_from_anchor(self, anchor_output, source="depth"):
+        raw = anchor_output[5]
+        if not isinstance(raw, dict):
+            return None
+        depth = raw.get(source)
+        if depth is None and source != "depth":
+            depth = raw.get("depth")
+        if not isinstance(depth, torch.Tensor):
+            return None
+        if depth.dim() == 5:
+            depth = depth[0]
+        if depth.dim() == 3:
+            depth = depth[..., None]
+        if depth.dim() != 4:
+            return None
+        return depth.detach().cpu().float()
+
+    def _prepare_highres_views(self, images, camera_intrinsics, upsample_size):
+        image_tensors = []
+        intrinsics = camera_intrinsics.clone().float() if isinstance(camera_intrinsics, torch.Tensor) else None
+        total = int(images.shape[0])
+        for i in range(total):
+            img_np = (images[i].detach().cpu().numpy()[..., :3] * 255).astype(np.uint8)
+            pil_img = Image.fromarray(img_np)
+            t, orig_w, orig_h, new_w, new_h = _resize_to_tensor(pil_img, upsample_size)
+
+            if new_h > upsample_size:
+                crop = (new_h - upsample_size) // 2
+                t = t[:, crop:crop + upsample_size, :]
+                if intrinsics is not None:
+                    intrinsics[i, 1, 2] -= crop
+            if new_w > upsample_size:
+                crop = (new_w - upsample_size) // 2
+                t = t[:, :, crop:crop + upsample_size]
+                if intrinsics is not None:
+                    intrinsics[i, 0, 2] -= crop
+
+            if intrinsics is not None:
+                sx, sy = new_w / orig_w, new_h / orig_h
+                intrinsics[i, 0, 0] *= sx
+                intrinsics[i, 1, 1] *= sy
+                intrinsics[i, 0, 2] *= sx
+                intrinsics[i, 1, 2] *= sy
+
+            image_tensors.append(t)
+
+        return torch.stack(image_tensors).unsqueeze(0), intrinsics
+
+    def _build_upsampled_splats(
+        self,
+        output,
+        original_images,
+        camera_poses,
+        camera_intrinsics,
+        upsample_size,
+        depth_source,
+        splat_scale,
+        splat_opacity,
+        voxel_prune,
+        voxel_size,
+        max_points,
+    ):
+        if not V2_UTILS_AVAILABLE:
+            print("⚠️ [V2 EXP] splat upsample skipped: V2 utilities unavailable.")
+            return output
+        if camera_poses is None or camera_intrinsics is None:
+            print("⚠️ [V2 EXP] splat upsample skipped: camera_poses/camera_intrinsics required.")
+            return output
+
+        raw = output[5]
+        if not isinstance(raw, dict):
+            return output
+        depth = raw.get(depth_source)
+        if depth is None and depth_source != "depth":
+            depth = raw.get("depth")
+        if not isinstance(depth, torch.Tensor):
+            print(f"⚠️ [V2 EXP] splat upsample skipped: missing depth source '{depth_source}'.")
+            return output
+
+        highres_imgs, highres_intrs = self._prepare_highres_views(original_images, camera_intrinsics, upsample_size)
+        S, _, H, W = highres_imgs.shape[1:]
+        if depth.dim() == 5:
+            depth_low = depth[0, ..., 0]
+        elif depth.dim() == 4 and depth.shape[-1] == 1:
+            depth_low = depth[..., 0]
+        elif depth.dim() == 4:
+            depth_low = depth[0]
+        else:
+            print(f"⚠️ [V2 EXP] splat upsample skipped: unsupported depth shape {tuple(depth.shape)}.")
+            return output
+
+        depth_hi = torch.nn.functional.interpolate(
+            depth_low.detach().cpu().float().unsqueeze(1),
+            size=(H, W),
+            mode="bilinear",
+            align_corners=False,
+        )[:, 0]
+
+        poses = camera_poses.detach().cpu().float()
+        intrs = highres_intrs.detach().cpu().float()
+        pts, _, _ = depth_to_world_coords_points(depth_hi, poses, intrs)
+        means = pts.reshape(1, S * H * W, 3)
+        sh = ((highres_imgs.permute(0, 1, 3, 4, 2).reshape(1, S * H * W, 3) - 0.5) / 0.28209479177387814).float()
+        scales = torch.full_like(means, float(splat_scale))
+        opacities = torch.full((1, means.shape[1]), float(splat_opacity), dtype=torch.float32)
+        quats = torch.zeros((1, means.shape[1], 4), dtype=torch.float32)
+        quats[..., 0] = 1.0
+
+        splats = {
+            "means": means,
+            "scales": scales,
+            "quats": quats,
+            "opacities": opacities,
+            "sh": sh[:, :, None, :],
+        }
+        n_before = means.shape[1]
+        if voxel_prune:
+            splats = _voxel_prune_splats_dict(splats, voxel_size)
+            pruned_means = self._splat_value_to_points(splats.get("means")) if isinstance(splats, dict) else None
+            if isinstance(pruned_means, torch.Tensor):
+                print(f"🧪 [V2 EXP] Upsample voxel prune: {n_before} -> {pruned_means.shape[0]} gaussians")
+
+        if max_points and max_points > 0 and isinstance(splats, dict):
+            current_means = self._splat_value_to_points(splats.get("means"))
+            if isinstance(current_means, torch.Tensor) and current_means.shape[0] > max_points:
+                n = current_means.shape[0]
+                idx = torch.linspace(0, n - 1, int(max_points), dtype=torch.long)
+                for key, value in list(splats.items()):
+                    points = self._splat_value_to_points(value)
+                    if isinstance(points, torch.Tensor) and points.shape[0] == n:
+                        splats[key] = [points[idx]]
+                print(f"🧪 [V2 EXP] Upsample point cap: {n} -> {int(max_points)} gaussians")
+
+        ply_data = dict(output[0])
+        ply_data.update({
+            "splats": splats,
+            "images": highres_imgs,
+            "camera_poses": poses.unsqueeze(0),
+            "camera_intrs": intrs.unsqueeze(0),
+            "pts3d": None,
+            "pts3d_filtered": None,
+        })
+        raw_new = dict(raw)
+        raw_new.update({
+            "splats": splats,
+            "images": highres_imgs,
+            "camera_poses": poses.unsqueeze(0),
+            "camera_intrs": intrs.unsqueeze(0),
+        })
+
+        print(
+            f"🧪 [V2 EXP] Upsampled splats: {S} views @ {H}x{W}, "
+            f"{n_before} raw gaussians from {depth_source}"
+        )
+        return (
+            ply_data,
+            output[1],
+            output[2],
+            poses.unsqueeze(0),
+            intrs.unsqueeze(0),
+            raw_new,
+            output[6],
+            output[7],
+            output[8],
+            output[9],
+            output[10],
+            output[11],
+            output[12],
+        )
+
+    def _merge_chunk_outputs(self, outputs, chunk_merge_voxel_prune, chunk_merge_voxel_size, chunk_keep_diagnostics):
+        first = outputs[0]
+        ply_datas = [out[0] for out in outputs]
+        merged_splats = self._merge_splats([ply.get("splats") for ply in ply_datas if isinstance(ply, dict)])
+        if chunk_merge_voxel_prune and merged_splats is not None:
+            merged_splats = _voxel_prune_splats_dict(merged_splats, chunk_merge_voxel_size)
+
+        merged_ply = dict(ply_datas[0])
+        merged_ply.update({
+            "splats": merged_splats,
+            "pts3d": None,
+            "pts3d_filtered": None,
+            "filter_mask": None,
+            "gs_filter_mask": None,
+            "images": first[5].get("images") if isinstance(first[5], dict) else None,
+        })
+
+        cam_poses = self._cat_optional_tensors([out[3] for out in outputs], dim=1)
+        cam_intrs = self._cat_optional_tensors([out[4] for out in outputs], dim=1)
+        if cam_poses is not None:
+            merged_ply["camera_poses"] = cam_poses
+        if cam_intrs is not None:
+            merged_ply["camera_intrs"] = cam_intrs
+
+        merged_raw = dict(first[5]) if isinstance(first[5], dict) else {}
+        merged_raw["splats"] = merged_splats
+        if cam_poses is not None:
+            merged_raw["camera_poses"] = cam_poses
+        if cam_intrs is not None:
+            merged_raw["camera_intrs"] = cam_intrs
+
+        if chunk_keep_diagnostics:
+            image_outputs = [
+                self._cat_optional_tensors([out[i] for out in outputs], dim=0)
+                for i in (1, 2, 6, 7, 8, 9, 10, 11, 12)
+            ]
+        else:
+            image_outputs = [first[i] for i in (1, 2, 6, 7, 8, 9, 10, 11, 12)]
+
+        return (
+            merged_ply,
+            image_outputs[0],
+            image_outputs[1],
+            cam_poses if cam_poses is not None else first[3],
+            cam_intrs if cam_intrs is not None else first[4],
+            merged_raw,
+            image_outputs[2],
+            image_outputs[3],
+            image_outputs[4],
+            image_outputs[5],
+            image_outputs[6],
+            image_outputs[7],
+            image_outputs[8],
+        )
+
+    def run_inference(
+        self,
+        model,
+        images,
+        use_gsplat=True,
+        chunked_inference=False,
+        chunk_size=4,
+        chunk_overlap=0,
+        chunk_merge_voxel_prune=True,
+        chunk_merge_voxel_size=0.002,
+        chunk_keep_diagnostics=False,
+        chunk_anchor_depth_prior=True,
+        chunk_anchor_target_size=518,
+        splat_upsample_mode="none",
+        splat_upsample_size=1022,
+        splat_upsample_depth_source="gs_depth",
+        splat_upsample_scale=0.003,
+        splat_upsample_opacity=0.9,
+        splat_upsample_voxel_prune=True,
+        splat_upsample_voxel_size=0.0015,
+        splat_upsample_max_points=5_000_000,
+        **kwargs,
+    ):
+        if not chunked_inference:
+            output = super().run_inference(model, images, use_gsplat=use_gsplat, **kwargs)
+            if splat_upsample_mode == "depth_backproject":
+                output = self._build_upsampled_splats(
+                    output,
+                    images,
+                    kwargs.get("camera_poses"),
+                    kwargs.get("camera_intrinsics"),
+                    splat_upsample_size,
+                    splat_upsample_depth_source,
+                    splat_upsample_scale,
+                    splat_upsample_opacity,
+                    splat_upsample_voxel_prune,
+                    splat_upsample_voxel_size,
+                    splat_upsample_max_points,
+                )
+            return output
+
+        total = int(images.shape[0])
+        ranges = self._chunk_ranges(total, chunk_size, chunk_overlap)
+        print(
+            f"🧪 [V2 EXP] Chunked inference: {total} views, {len(ranges)} chunks, "
+            f"chunk_size={chunk_size}, overlap={chunk_overlap}, target_size={kwargs.get('target_size', 952)}"
+        )
+
+        anchor_depth_prior = None
+        if chunk_anchor_depth_prior and kwargs.get("depth_prior") is None:
+            anchor_kwargs = dict(kwargs)
+            anchor_kwargs["target_size"] = chunk_anchor_target_size
+            anchor_kwargs["depth_prior"] = None
+            anchor_kwargs["debug_log"] = False
+            anchor_kwargs["voxel_prune_splats"] = False
+            print(
+                f"🧪 [V2 EXP] Anchor pass: {total} views @ {chunk_anchor_target_size}px "
+                "for shared depth prior"
+            )
+            anchor_out = super().run_inference(
+                model,
+                images,
+                use_gsplat=False,
+                **anchor_kwargs,
+            )
+            anchor_depth_prior = self._depth_prior_from_anchor(anchor_out)
+            if anchor_depth_prior is not None:
+                print(f"🧪 [V2 EXP] Anchor depth prior: {tuple(anchor_depth_prior.shape)}")
+            elif torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        outputs = []
+        for chunk_idx, (start, end) in enumerate(ranges, 1):
+            indices = torch.arange(start, end, dtype=torch.long)
+            chunk_kwargs = dict(kwargs)
+            for key in ("camera_intrinsics", "camera_poses", "depth_prior"):
+                chunk_kwargs[key] = self._slice_like_views(kwargs.get(key), indices, total)
+            if anchor_depth_prior is not None:
+                chunk_kwargs["depth_prior"] = self._slice_like_views(anchor_depth_prior, indices, total)
+            print(f"🧪 [V2 EXP] Chunk {chunk_idx}/{len(ranges)}: views[{start}:{end}]")
+            out = super().run_inference(
+                model,
+                images[indices.to(images.device)] if isinstance(images, torch.Tensor) else images[start:end],
+                use_gsplat=use_gsplat,
+                **chunk_kwargs,
+            )
+            outputs.append(out)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        merged = self._merge_chunk_outputs(
+            outputs,
+            chunk_merge_voxel_prune=chunk_merge_voxel_prune,
+            chunk_merge_voxel_size=chunk_merge_voxel_size,
+            chunk_keep_diagnostics=chunk_keep_diagnostics,
+        )
+        splats = merged[0].get("splats")
+        means = None
+        if isinstance(splats, dict):
+            means = self._splat_value_to_points(splats.get("means"))
+        if isinstance(means, torch.Tensor):
+            print(f"🧪 [V2 EXP] Merged splats: {means.shape[0]} gaussians")
+        return merged
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1021,11 +1619,13 @@ def _get_skyseg_path():
 # ComfyUI registration
 # ─────────────────────────────────────────────────────────────────────────────
 NODE_CLASS_MAPPINGS = {
-    "VNCCS_LoadWorldMirrorV2Model": VNCCS_LoadWorldMirrorV2Model,
-    "VNCCS_WorldMirrorV2_3D":       VNCCS_WorldMirrorV2_3D,
+    "VNCCS_LoadWorldMirrorV2Model":          VNCCS_LoadWorldMirrorV2Model,
+    "VNCCS_WorldMirrorV2_3D":                VNCCS_WorldMirrorV2_3D,
+    "VNCCS_WorldMirrorV2_3D_Experimental":   VNCCS_WorldMirrorV2_3D_Experimental,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "VNCCS_LoadWorldMirrorV2Model": "🌍 Load WorldMirror V2 Model",
-    "VNCCS_WorldMirrorV2_3D":       "🌍 WorldMirror V2 3D Reconstruction",
+    "VNCCS_LoadWorldMirrorV2Model":          "🌍 Load WorldMirror V2 Model",
+    "VNCCS_WorldMirrorV2_3D":                "🌍 WorldMirror V2 3D Reconstruction",
+    "VNCCS_WorldMirrorV2_3D_Experimental":   "🌍 WorldMirror V2 3D Reconstruction Experemental",
 }
