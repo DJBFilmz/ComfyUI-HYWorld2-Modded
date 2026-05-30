@@ -1592,12 +1592,7 @@ class VNCCS_BackgroundPreview:
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {
-                "preview_width": ("STRING", {
-                    "default": "512",
-                    "tooltip": "Preview window width in pixels (integer)"
-                }),
-            },
+            "required": {},
             "optional": {
                 "ply_path": ("STRING", {
                     "forceInput": True,
@@ -1691,7 +1686,6 @@ class VNCCS_BackgroundPreview:
     def preview(
         self,
         ply_path=None,
-        preview_width=512,
         extrinsics=None,
         intrinsics=None,
         camera_poses=None,
@@ -1700,13 +1694,7 @@ class VNCCS_BackgroundPreview:
     ):
         """Prepare PLY file for gsplat.js preview."""
         import glob
-        
-        # Ensure preview_width is an int
-        try:
-            width_val = int(preview_width) if preview_width else 512
-        except (ValueError, TypeError):
-            width_val = 512
-        
+
         # If no path provided, we can't preview
         if not ply_path:
             return {"ui": {}, "result": ("", "")}
@@ -1770,7 +1758,6 @@ class VNCCS_BackgroundPreview:
             "type": [file_type],
             "ply_path": [rel_path],
             "file_size_mb": [round(file_size_mb, 2)],
-            "preview_width": [preview_width],
         }
         
         # Add camera parameters if provided

@@ -68,30 +68,20 @@ app.registerExtension({
                     setValue(v) { }
                 });
 
-                // Store reference to node for dynamic resizing
+                // Store reference to node for dynamic widget sizing. The node
+                // size is the source of truth; resizing the node reveals more or
+                // less of the 3D viewport without changing scene framing.
                 const node = this;
-                let currentNodeSize = [512, 580];
-
-                widget.computeSize = () => currentNodeSize;
+                widget.computeSize = function () {
+                    const width = Math.max(240, node.size[0] - 20);
+                    const top = this.last_y ?? 120;
+                    const height = Math.max(80, node.size[1] - top - 8);
+                    return [width, height];
+                };
 
                 // Store references
                 this.gaussianViewerIframe = iframe;
                 this.gaussianInfoPanel = infoPanel;
-
-                // Function to resize node dynamically
-                this.resizeToAspectRatio = function (imageWidth, imageHeight) {
-                    const aspectRatio = imageWidth / imageHeight;
-                    const nodeWidth = 512;
-                    const viewerHeight = Math.round(nodeWidth / aspectRatio);
-                    const nodeHeight = viewerHeight + 60;  // Add space for info panel
-
-                    currentNodeSize = [nodeWidth, nodeHeight];
-                    node.setSize(currentNodeSize);
-                    node.setDirtyCanvas(true, true);
-                    app.graph.setDirtyCanvas(true, true);
-
-                    console.log("[GeomPack Gaussian] Resized node to:", nodeWidth, "x", nodeHeight, "(aspect ratio:", aspectRatio.toFixed(2), ")");
-                };
 
                 // Track iframe load state
                 let iframeLoaded = false;
@@ -155,9 +145,6 @@ app.registerExtension({
                     }
                 });
 
-                // Set initial node size
-                this.setSize([512, 580]);
-
                 // Handle execution
                 const onExecuted = this.onExecuted;
                 this.onExecuted = function (message) {
@@ -180,13 +167,6 @@ app.registerExtension({
                         // Extract camera parameters if provided
                         const extrinsics = message.extrinsics?.[0] || null;
                         const intrinsics = message.intrinsics?.[0] || null;
-
-                        // Resize node to match image aspect ratio from intrinsics
-                        if (intrinsics && intrinsics[0] && intrinsics[1]) {
-                            const imageWidth = intrinsics[0][2] * 2;   // cx * 2
-                            const imageHeight = intrinsics[1][2] * 2;  // cy * 2
-                            this.resizeToAspectRatio(imageWidth, imageHeight);
-                        }
 
                         // Update info panel
                         infoPanel.innerHTML = `
