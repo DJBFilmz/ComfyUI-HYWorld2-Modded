@@ -8,6 +8,7 @@ Includes equirectangular panorama to perspective views conversion.
 import os
 import sys
 import math
+import re
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -1338,6 +1339,7 @@ class VNCCS_SavePLY:
         return torch.stack([w, x, y, z], dim=1)
 
     def _get_unique_path(self, directory, filename, suffix, extension):
+        filename = self._sanitize_filename(filename)
         counter = 1
         while True:
             # Use 5 digits like ComfyUI SaveImage
@@ -1347,12 +1349,19 @@ class VNCCS_SavePLY:
                 return path
             counter += 1
 
+    def _sanitize_filename(self, filename):
+        base = os.path.basename(str(filename or "output").replace("\\", "/"))
+        base = os.path.splitext(base)[0]
+        base = re.sub(r"[^A-Za-z0-9._ -]+", "_", base).strip(" ._")
+        return base or "output"
+
 
     def save_ply(self, ply_data, filename="output", save_pointcloud=False, save_gaussians=True,
                  rotate_x=0.0, rotate_y=0.0, rotate_z=0.0):
         from src.utils.save_utils import save_scene_ply, save_gs_ply
         
         output_dir = folder_paths.get_output_directory()
+        filename = self._sanitize_filename(filename)
         saved_files = []
         
         R = None
@@ -2790,4 +2799,3 @@ NODE_CATEGORY_MAPPINGS = {
     "VNCCS_PLYSceneRenderer": "VNCCS/3D",
     "VNCCS_SplatRefiner": "VNCCS/3D",
 }
-

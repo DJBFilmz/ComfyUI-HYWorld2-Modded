@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-hyworld2"
-version = "1.1.0"
+version = "1.1.1"
 description = "HY-World 2.0 ComfyUI nodes — WorldMirror V1 & V2 3D reconstruction"
 license = { file = "LICENSE" }
 dependencies = [
@@ -9,15 +9,25 @@ dependencies = [
     "numpy",
     "Pillow",
     "opencv-python",
+    "scipy",
+    "tqdm",
+    "requests",
     "huggingface_hub",
     "safetensors",
     "omegaconf",
     "plyfile",
     "trimesh",
-    "scipy",
-    "tqdm",
     "einops",
+    "jaxtyping",
+    "typeguard",
     "open3d>=0.18.0",
+    "accelerate",
+    "diffusers>=0.36.0",
+    "transformers>=4.40.0",
+    "bitsandbytes>=0.43.0",
+    "optimum-quanto>=0.2.4",
+    "imageio[ffmpeg]",
+    "kornia",
 ]
 
 [project.optional-dependencies]
