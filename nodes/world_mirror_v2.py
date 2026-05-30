@@ -4,7 +4,7 @@ WorldMirror V2 ComfyUI nodes — uses HY-World-2.0 (tencent/HY-World-2.0).
 Nodes:
   - VNCCS_LoadWorldMirrorV2Model   — download + load V2 model
   - VNCCS_WorldMirrorV2_3D         — V2 inference, PLY_DATA output
-  - VNCCS_WorldMirrorV2_3D_Experimental — experimental V2 inference copy
+  - VNCCS_WorldMirrorV2_3D_Advanced — advanced V2 inference/debug copy
 """
 
 import os
@@ -1513,6 +1513,147 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
         return output
 
 
+class VNCCS_WorldMirrorV2_3D_Advanced(VNCCS_WorldMirrorV2_3D_Experimental):
+    """Advanced WorldMirror V2 node with all tuning and debug controls."""
+
+    CATEGORY = "VNCCS/3D/Advanced"
+
+
+class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
+    """Clean WorldMirror V2 node for the panorama-to-dense-splat workflow."""
+
+    CATEGORY = "VNCCS/3D"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("WORLDMIRROR_MODEL",),
+                "images": ("IMAGE",),
+            },
+            "optional": {
+                "target_size": ("INT", {
+                    "default": 518, "min": 252, "max": 1400, "step": 14,
+                    "tooltip": "Model inference resolution. Keep this low for multi-view panorama passes; dense splats can be upsampled separately."
+                }),
+                "apply_sky_mask": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Remove sky-like regions before saving. Useful for outdoor panoramas where sky can create far/infinite splats."
+                }),
+                "camera_conditioning": (["pose+intrinsics", "intrinsics_only", "pose_only", "none"], {
+                    "default": "pose+intrinsics",
+                    "tooltip": "Which input camera priors to pass into WorldMirror V2."
+                }),
+                "splat_camera_source": (["input_when_available", "predicted"], {
+                    "default": "input_when_available",
+                    "tooltip": "Use supplied panorama cameras for Gaussian positions when available."
+                }),
+                "splat_upsample_mode": (["depth_backproject", "none"], {
+                    "default": "depth_backproject",
+                    "tooltip": "Build dense high-resolution splats from model depth and high-resolution view RGB."
+                }),
+                "splat_upsample_size": ("INT", {
+                    "default": 1022, "min": 252, "max": 1400, "step": 14,
+                    "tooltip": "Dense splat grid size. This can be higher than target_size without rerunning the transformer at that resolution."
+                }),
+                "splat_upsample_scale": ("FLOAT", {
+                    "default": 0.003, "min": 0.0001, "max": 0.05, "step": 0.0001,
+                    "tooltip": "Gaussian size for dense backprojected splats."
+                }),
+                "splat_upsample_voxel_prune": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Voxel-merge dense splats to reduce file size."
+                }),
+                "splat_upsample_voxel_size": ("FLOAT", {
+                    "default": 0.0015, "min": 0.0001, "max": 0.1, "step": 0.0001,
+                    "tooltip": "Voxel size for dense splat compression."
+                }),
+                "splat_upsample_max_points": ("INT", {
+                    "default": 10_000_000, "min": 0, "max": 50_000_000, "step": 100_000,
+                    "tooltip": "Depth/distance-aware cap for dense splats. Lower values reduce file size; higher values preserve distant surfaces."
+                }),
+                "splat_upsample_cap_far_bias": ("FLOAT", {
+                    "default": 1.75, "min": 0.0, "max": 8.0, "step": 0.05,
+                    "tooltip": "Preserve proportionally more far splats when applying the point cap."
+                }),
+                "debug_log": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Print camera/depth/splat alignment diagnostics to the ComfyUI console."
+                }),
+                "camera_intrinsics": ("TENSOR", {
+                    "tooltip": "Optional: intrinsics from Equirect360ToViews or WorldStereo."
+                }),
+                "camera_poses": ("TENSOR", {
+                    "tooltip": "Optional: camera poses from Equirect360ToViews or WorldStereo."
+                }),
+                "depth_prior": ("IMAGE", {
+                    "tooltip": "Optional depth prior matching the input views."
+                }),
+            },
+        }
+
+    def run_inference(
+        self,
+        model,
+        images,
+        target_size=518,
+        apply_sky_mask=False,
+        camera_conditioning="pose+intrinsics",
+        splat_camera_source="input_when_available",
+        splat_upsample_mode="depth_backproject",
+        splat_upsample_size=1022,
+        splat_upsample_scale=0.003,
+        splat_upsample_voxel_prune=True,
+        splat_upsample_voxel_size=0.0015,
+        splat_upsample_max_points=10_000_000,
+        splat_upsample_cap_far_bias=1.75,
+        debug_log=False,
+        camera_intrinsics=None,
+        camera_poses=None,
+        depth_prior=None,
+    ):
+        return super().run_inference(
+            model,
+            images,
+            use_gsplat=True,
+            target_size=target_size,
+            offload_scheme="none",
+            confidence_percentile=10.0,
+            apply_sky_mask=apply_sky_mask,
+            filter_edges=True,
+            filter_splats=False,
+            edge_normal_threshold=1.0,
+            edge_depth_threshold=0.03,
+            apply_confidence_mask=False,
+            camera_conditioning=camera_conditioning,
+            splat_camera_source=splat_camera_source,
+            splat_color_source="input_image",
+            adaptive_target_size=False,
+            apply_model_masks=False,
+            model_mask_threshold=0.5,
+            voxel_prune_splats=True,
+            voxel_size=0.002,
+            splat_scale_multiplier=1.0,
+            splat_opacity_floor=0.0,
+            debug_log=debug_log,
+            camera_intrinsics=camera_intrinsics,
+            camera_poses=camera_poses,
+            depth_prior=depth_prior,
+            splat_upsample_mode=splat_upsample_mode,
+            splat_upsample_size=splat_upsample_size,
+            splat_upsample_depth_source="gs_depth",
+            splat_upsample_scale=splat_upsample_scale,
+            splat_upsample_scale_mode="constant",
+            splat_upsample_depth_scale_strength=0.0,
+            splat_upsample_depth_scale_max=3.0,
+            splat_upsample_opacity=0.9,
+            splat_upsample_voxel_prune=splat_upsample_voxel_prune,
+            splat_upsample_voxel_size=splat_upsample_voxel_size,
+            splat_upsample_max_points=splat_upsample_max_points,
+            splat_upsample_cap_far_bias=splat_upsample_cap_far_bias,
+        )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1536,12 +1677,14 @@ def _get_skyseg_path():
 # ─────────────────────────────────────────────────────────────────────────────
 NODE_CLASS_MAPPINGS = {
     "VNCCS_LoadWorldMirrorV2Model":          VNCCS_LoadWorldMirrorV2Model,
-    "VNCCS_WorldMirrorV2_3D":                VNCCS_WorldMirrorV2_3D,
+    "VNCCS_WorldMirrorV2_3D":                VNCCS_WorldMirrorV2_3D_Clean,
+    "VNCCS_WorldMirrorV2_3D_Advanced":       VNCCS_WorldMirrorV2_3D_Advanced,
     "VNCCS_WorldMirrorV2_3D_Experimental":   VNCCS_WorldMirrorV2_3D_Experimental,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "VNCCS_LoadWorldMirrorV2Model":          "🌍 Load WorldMirror V2 Model",
     "VNCCS_WorldMirrorV2_3D":                "🌍 WorldMirror V2 3D Reconstruction",
-    "VNCCS_WorldMirrorV2_3D_Experimental":   "🌍 WorldMirror V2 3D Reconstruction Experemental",
+    "VNCCS_WorldMirrorV2_3D_Advanced":       "🌍 WorldMirror V2 3D Reconstruction Advanced",
+    "VNCCS_WorldMirrorV2_3D_Experimental":   "🌍 WorldMirror V2 3D Reconstruction Advanced",
 }
