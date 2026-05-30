@@ -358,26 +358,18 @@
                 console.log('[GaussianViewer] Target Z distance:', targetZ);
             }
 
-            // Determine the target position (what the camera looks at)
-            // For the INITIAL view (matching original image), look STRAIGHT AHEAD along Z axis
-            // NOT at the scene center - that would tilt the camera
-            let targetX = 0, targetY = 0;
-            let orbitZ = targetZ;  // For orbiting, use a closer point
+            // OrbitControls rotates around its target. Keep the target extremely
+            // close to the camera so mouse rotation behaves like turning in
+            // place instead of orbiting around the scene.
+            let pivotDistance = 0.01;
             if (splat && splat.bounds) {
                 const center = splat.bounds.center();
                 const size = splat.bounds.size();
-
-                // Use scene center Z for the view direction
-                targetZ = center.z;
-
-                // For orbit center, use distance to closest object + 50%
-                // Camera is at origin, so minZ is the distance to closest point
-                const minZ = center.z - size.z / 2;
-                orbitZ = minZ * 1.5;  // 50% past the closest point
+                const maxDim = Math.max(size.x, size.y, size.z);
+                pivotDistance = Math.min(0.05, Math.max(0.005, maxDim * 0.002));
 
                 console.log('[GaussianViewer] Scene center:', center.x, -center.y, center.z);
-                console.log('[GaussianViewer] Closest point Z:', minZ.toFixed(1));
-                console.log('[GaussianViewer] Orbit center Z:', orbitZ.toFixed(1), '(closest + 50%)');
+                console.log('[GaussianViewer] Pivot distance from camera:', pivotDistance.toFixed(4));
             }
 
             // SHARP uses Y-down coordinate system, so flip camera Y as well
@@ -389,8 +381,7 @@
             // and look at the scene center.
 
             const camPos = new SPLAT.Vector3(camPosX, camPosY, camPosZ);
-            // Use orbitZ for the target - closer to camera for better orbit feel
-            const targetPos = new SPLAT.Vector3(targetX, targetY, orbitZ);
+            const targetPos = new SPLAT.Vector3(camPosX, camPosY, camPosZ + pivotDistance);
 
             // Store for reset
             initialCameraData = {

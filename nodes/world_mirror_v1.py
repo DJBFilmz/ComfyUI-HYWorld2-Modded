@@ -1603,11 +1603,11 @@ class VNCCS_BackgroundPreview:
                     "forceInput": True,
                     "tooltip": "Path to a Gaussian Splatting PLY file"
                 }),
-                "extrinsics": ("EXTRINSICS", {
-                    "tooltip": "4x4 camera extrinsics matrix for initial view"
+                "camera_poses": ("TENSOR", {
+                    "tooltip": "Optional: camera poses tensor from WorldMirror V2. Used to initialize the viewer camera."
                 }),
-                "intrinsics": ("INTRINSICS", {
-                    "tooltip": "3x3 camera intrinsics matrix for FOV"
+                "camera_intrinsics": ("TENSOR", {
+                    "tooltip": "Optional: camera intrinsics tensor from WorldMirror V2. Used for viewer FOV."
                 }),
             },
         }
@@ -1635,8 +1635,69 @@ class VNCCS_BackgroundPreview:
         if ply_path:
             return hash(ply_path)
         return None
-    
-    def preview(self, ply_path=None, preview_width=512, extrinsics=None, intrinsics=None, **kwargs):
+
+    def _tensor_to_list(self, value):
+        if value is None:
+            return None
+        if hasattr(value, "detach"):
+            value = value.detach().cpu().float()
+            return value.tolist()
+        if isinstance(value, np.ndarray):
+            return value.astype(np.float32).tolist()
+        if isinstance(value, (list, tuple)):
+            return value
+        return None
+
+    def _camera_intrinsics_to_preview(self, camera_intrinsics):
+        if camera_intrinsics is None or not hasattr(camera_intrinsics, "detach"):
+            return None
+        intrs = camera_intrinsics.detach().cpu().float()
+        if intrs.dim() == 4:
+            intrs = intrs[0]
+        if intrs.dim() == 3:
+            intrs = intrs[0]
+        if intrs.shape[-2:] != (3, 3):
+            return None
+        return intrs.tolist()
+
+    def _camera_poses_to_preview_extrinsics(self, camera_poses):
+        if camera_poses is None or not hasattr(camera_poses, "detach"):
+            return None
+        poses = camera_poses.detach().cpu().float()
+        if poses.dim() == 4:
+            poses = poses[0]
+        if poses.dim() == 2:
+            poses = poses.unsqueeze(0)
+        if poses.dim() != 3 or poses.shape[-2] not in (3, 4) or poses.shape[-1] != 4:
+            return None
+
+        if poses.shape[-2] == 3:
+            bottom = torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=poses.dtype).view(1, 1, 4)
+            poses = torch.cat([poses, bottom.repeat(poses.shape[0], 1, 1)], dim=1)
+
+        c2w = poses[0].clone()
+        centers = poses[:, :3, 3]
+        c2w[:3, 3] = centers.mean(dim=0)
+
+        # WorldMirror/Panorama nodes output c2w. The browser viewer receives
+        # w2c-style extrinsics and reconstructs camera center as -R^T t.
+        R = c2w[:3, :3]
+        t = c2w[:3, 3]
+        w2c = torch.eye(4, dtype=c2w.dtype)
+        w2c[:3, :3] = R.T
+        w2c[:3, 3] = -(R.T @ t)
+        return w2c.tolist()
+
+    def preview(
+        self,
+        ply_path=None,
+        preview_width=512,
+        extrinsics=None,
+        intrinsics=None,
+        camera_poses=None,
+        camera_intrinsics=None,
+        **kwargs,
+    ):
         """Prepare PLY file for gsplat.js preview."""
         import glob
         
@@ -1713,6 +1774,18 @@ class VNCCS_BackgroundPreview:
         }
         
         # Add camera parameters if provided
+        extrinsics_from_poses = self._camera_poses_to_preview_extrinsics(camera_poses)
+        if extrinsics is not None:
+            extrinsics = self._tensor_to_list(extrinsics)
+        elif extrinsics_from_poses is not None:
+            extrinsics = extrinsics_from_poses
+        # Do not forward WorldMirror intrinsics to the browser viewer by default:
+        # viewer_gaussian.html switches into native-resolution rendering whenever
+        # intrinsics are present, which is much heavier for multi-million splats.
+        # Keep the socket for graph compatibility, but use camera_poses only for
+        # the initial camera center.
+        if intrinsics is not None:
+            intrinsics = self._tensor_to_list(intrinsics)
         if extrinsics is not None:
             ui_data["extrinsics"] = [extrinsics]
         if intrinsics is not None:
