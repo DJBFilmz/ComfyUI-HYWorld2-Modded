@@ -159,10 +159,14 @@ app.registerExtension({
                     // The message IS the UI data (not message.ui)
                     if (message?.ply_path && message.ply_path[0]) {
                         const filename = message.filename?.[0];
-                        const rel_path = message.ply_path[0];
                         const fileSizeMb = message.file_size_mb?.[0] || 'N/A';
                         const subfolder = message.subfolder?.[0] || "";
                         const type = message.type?.[0] || "output";
+                        const previewFilename = message.preview_filename?.[0] || filename;
+                        const previewSubfolder = message.preview_subfolder?.[0] || subfolder;
+                        const previewType = message.preview_type?.[0] || type;
+                        const previewSizeMb = message.preview_file_size_mb?.[0] || fileSizeMb;
+                        const previewFormat = message.preview_format?.[0] || "ply";
 
                         // Extract camera parameters if provided
                         const extrinsics = message.extrinsics?.[0] || null;
@@ -175,11 +179,13 @@ app.registerExtension({
                                 <span style="color: #6cc;">${filename}</span>
                                 <span style="color: #888;">Size:</span>
                                 <span>${fileSizeMb} MB</span>
+                                <span style="color: #888;">Preview:</span>
+                                <span>${previewFormat.toUpperCase()} · ${previewSizeMb} MB</span>
                             </div>
                         `;
 
                         // ComfyUI serves output files via /view API endpoint
-                        const filepath = `/view?filename=${encodeURIComponent(filename)}&type=${encodeURIComponent(type)}&subfolder=${encodeURIComponent(subfolder)}`;
+                        const filepath = `/view?filename=${encodeURIComponent(previewFilename)}&type=${encodeURIComponent(previewType)}&subfolder=${encodeURIComponent(previewSubfolder)}`;
 
                         // Function to fetch and send data to iframe
                         const fetchAndSend = async () => {
@@ -188,7 +194,7 @@ app.registerExtension({
                             }
 
                             try {
-                                // Fetch the PLY file from parent context (authenticated)
+                                // Fetch the preview file from parent context (authenticated)
                                 const response = await fetch(filepath);
                                 if (!response.ok) {
                                     throw new Error(`HTTP ${response.status}: ${response.statusText}`);
@@ -199,14 +205,16 @@ app.registerExtension({
                                 iframe.contentWindow.postMessage({
                                     type: "LOAD_MESH_DATA",
                                     data: arrayBuffer,
-                                    filename: filename,
+                                    filename: previewFilename,
+                                    sourceFilename: filename,
+                                    format: previewFormat,
                                     extrinsics: extrinsics,
                                     intrinsics: intrinsics,
                                     timestamp: Date.now()
                                 }, "*", [arrayBuffer]);
                             } catch (error) {
-                                console.error("[VNCCS.GaussianPreview] Error fetching PLY:", error);
-                                infoPanel.innerHTML = `<div style="color: #ff6b6b;">Error loading PLY: ${error.message}</div>`;
+                                console.error("[VNCCS.GaussianPreview] Error fetching preview data:", error);
+                                infoPanel.innerHTML = `<div style="color: #ff6b6b;">Error loading preview: ${error.message}</div>`;
                             }
                         };
 

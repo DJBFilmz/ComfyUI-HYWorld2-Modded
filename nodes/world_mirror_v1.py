@@ -1342,6 +1342,49 @@ class VNCCS_SavePLY:
             flat = flat[::step][:max_values]
         return torch.quantile(flat, q)
 
+    def _save_splat_preview_cache(self, path, means, scales, rotations, rgbs, opacities, chunk_size=1_000_000):
+        """Write gsplat.js' compact 32-byte/gaussian binary preview cache."""
+        splat_path = os.path.splitext(str(path))[0] + ".splat"
+        tmp_path = f"{splat_path}.tmp"
+        n = int(means.shape[0])
+        sh_c0 = 0.28209479177387814
+
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+        try:
+            with open(tmp_path, "wb") as handle:
+                for start in range(0, n, chunk_size):
+                    end = min(start + chunk_size, n)
+                    count = end - start
+                    block = np.zeros((count, 32), dtype=np.uint8)
+                    floats = block.view("<f4").reshape(count, 8)
+
+                    floats[:, 0:3] = means[start:end].numpy()
+                    floats[:, 3:6] = scales[start:end].numpy()
+
+                    rgb = (rgbs[start:end] * sh_c0 + 0.5).clamp(0.0, 1.0)
+                    block[:, 24:27] = (rgb.numpy() * 255.0 + 0.5).astype(np.uint8)
+
+                    alpha = opacities[start:end]
+                    if alpha.numel() and (float(alpha.min()) < 0.0 or float(alpha.max()) > 1.0):
+                        alpha = torch.sigmoid(alpha)
+                    block[:, 27] = (alpha.clamp(0.0, 1.0).numpy() * 255.0 + 0.5).astype(np.uint8)
+
+                    quat = rotations[start:end]
+                    quat = quat / quat.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+                    block[:, 28:32] = (quat.clamp(-1.0, 1.0).numpy() * 128.0 + 128.0).clip(0, 255).astype(np.uint8)
+
+                    handle.write(block.tobytes())
+
+            os.replace(tmp_path, splat_path)
+            size_mb = os.path.getsize(splat_path) / (1024 * 1024)
+            print(f"⚡ [SavePLY] Wrote preview splat cache: {os.path.basename(splat_path)} ({size_mb:.2f} MB)")
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
+
     def _save_gs_ply_safe(
         self,
         path,
@@ -1361,9 +1404,15 @@ class VNCCS_SavePLY:
         rgbs = rgbs.detach().cpu().float().reshape(-1, 3)
         opacities = opacities.detach().cpu().float().reshape(-1)
 
-        n = min(means.shape[0], scales.shape[0], rotations.shape[0], rgbs.shape[0], opacities.shape[0])
+        n = min(means.shape[0], scales.shape[0], rotations.shape[0], opacities.shape[0])
         if n == 0:
             raise ValueError("No Gaussian splats to save")
+        if rgbs.shape[0] == 1 and n > 1:
+            rgbs = rgbs.expand(n, -1)
+        elif rgbs.shape[0] != n:
+            n = min(n, rgbs.shape[0])
+        if opacities.shape[0] == 1 and n > 1:
+            opacities = opacities.expand(n)
         means, scales, rotations, rgbs, opacities = (
             means[:n], scales[:n], rotations[:n], rgbs[:n], opacities[:n]
         )
@@ -1415,6 +1464,10 @@ class VNCCS_SavePLY:
         try:
             PlyData([PlyElement.describe(elements, "vertex")]).write(tmp_path)
             os.replace(tmp_path, str(path))
+            try:
+                self._save_splat_preview_cache(path, means, scales, rotations, rgbs, opacities)
+            except Exception as cache_error:
+                print(f"⚠️ [SavePLY] Preview splat cache failed: {cache_error}")
         except Exception:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
@@ -1683,11 +1736,35 @@ class VNCCS_BackgroundPreview:
         w2c[:3, 3] = -(R.T @ t)
         return w2c.tolist()
 
+    def _view_info_for_path(self, path):
+        output_dir = folder_paths.get_output_directory()
+        temp_dir = folder_paths.get_temp_directory()
+
+        path_norm = path.replace("\\", "/")
+        output_dir_norm = output_dir.replace("\\", "/")
+        temp_dir_norm = temp_dir.replace("\\", "/")
+
+        if path_norm.startswith(output_dir_norm):
+            rel_path = os.path.relpath(path, output_dir).replace("\\", "/")
+            file_type = "output"
+        elif path_norm.startswith(temp_dir_norm):
+            rel_path = os.path.relpath(path, temp_dir).replace("\\", "/")
+            file_type = "temp"
+        else:
+            rel_path = os.path.basename(path)
+            file_type = "output"
+
+        return {
+            "rel_path": rel_path,
+            "subfolder": os.path.dirname(rel_path).replace("\\", "/"),
+            "filename": os.path.basename(rel_path),
+            "type": file_type,
+            "size_mb": round(os.path.getsize(path) / (1024 * 1024), 2),
+        }
+
     def preview(
         self,
         ply_path=None,
-        extrinsics=None,
-        intrinsics=None,
         camera_poses=None,
         camera_intrinsics=None,
         **kwargs,
@@ -1703,44 +1780,29 @@ class VNCCS_BackgroundPreview:
         if not os.path.exists(ply_path):
             print(f"[VNCCS_BackgroundPreview] PLY file not found: {ply_path}")
             return {"ui": {"error": [f"File not found: {ply_path}"]}, "result": ("", "")}
-        
-        filename = os.path.basename(ply_path)
-        # Prepare relative path and type for ComfyUI /view endpoint
-        output_dir = folder_paths.get_output_directory()
-        temp_dir = folder_paths.get_temp_directory()
-        
-        file_type = "output"
-        rel_path = ""
-        
-        # Force forward slashes for Windows compatibility in browser URLs
-        ply_path_norm = ply_path.replace("\\", "/")
-        output_dir_norm = output_dir.replace("\\", "/")
-        temp_dir_norm = temp_dir.replace("\\", "/")
 
-        if ply_path_norm.startswith(output_dir_norm):
-            rel_path = os.path.relpath(ply_path, output_dir).replace("\\", "/")
-            file_type = "output"
-        elif ply_path_norm.startswith(temp_dir_norm):
-            rel_path = os.path.relpath(ply_path, temp_dir).replace("\\", "/")
-            file_type = "temp"
+        output_dir = folder_paths.get_output_directory()
+        ply_info = self._view_info_for_path(ply_path)
+
+        preview_path = os.path.splitext(ply_path)[0] + ".splat"
+        if os.path.exists(preview_path):
+            preview_info = self._view_info_for_path(preview_path)
+            preview_format = "splat"
         else:
-            rel_path = os.path.basename(ply_path)
-            file_type = "output" # Fallback
-            
-        subfolder = os.path.dirname(rel_path).replace("\\", "/")
-        filename = os.path.basename(rel_path)
-            
-        file_size = os.path.getsize(ply_path)
-        file_size_mb = file_size / (1024 * 1024)
+            preview_path = ply_path
+            preview_info = ply_info
+            preview_format = "ply"
         
         print(f"🔍 [VNCCS_BackgroundPreview] Preparing UI Data:")
         print(f"   - Full Path: {ply_path}")
-        print(f"   - Filename: {filename}")
-        print(f"   - Subfolder: {subfolder}")
-        print(f"   - Type: {file_type}")
-        print(f"   - Size: {file_size_mb:.2f} MB")
-        
-        # Find latest recorded video (optional/legacy)
+        print(f"   - Filename: {ply_info['filename']}")
+        print(f"   - Subfolder: {ply_info['subfolder']}")
+        print(f"   - Type: {ply_info['type']}")
+        print(f"   - Size: {ply_info['size_mb']:.2f} MB")
+        if preview_path != ply_path:
+            print(f"   - Preview cache: {preview_info['filename']} ({preview_info['size_mb']:.2f} MB)")
+
+        # Find latest recorded video from the viewer, if one was exported.
         video_path = ""
         try:
             pattern = os.path.join(output_dir, "gaussian-recording-*.mp4")
@@ -1753,30 +1815,26 @@ class VNCCS_BackgroundPreview:
             print(f"   ⚠️ Error finding video: {e}")
             
         ui_data = {
-            "filename": [filename],
-            "subfolder": [subfolder],
-            "type": [file_type],
-            "ply_path": [rel_path],
-            "file_size_mb": [round(file_size_mb, 2)],
+            "filename": [ply_info["filename"]],
+            "subfolder": [ply_info["subfolder"]],
+            "type": [ply_info["type"]],
+            "ply_path": [ply_info["rel_path"]],
+            "file_size_mb": [ply_info["size_mb"]],
+            "preview_filename": [preview_info["filename"]],
+            "preview_subfolder": [preview_info["subfolder"]],
+            "preview_type": [preview_info["type"]],
+            "preview_path": [preview_info["rel_path"]],
+            "preview_file_size_mb": [preview_info["size_mb"]],
+            "preview_format": [preview_format],
         }
         
         # Add camera parameters if provided
-        extrinsics_from_poses = self._camera_poses_to_preview_extrinsics(camera_poses)
-        if extrinsics is not None:
-            extrinsics = self._tensor_to_list(extrinsics)
-        elif extrinsics_from_poses is not None:
-            extrinsics = extrinsics_from_poses
+        extrinsics = self._camera_poses_to_preview_extrinsics(camera_poses)
         # Do not forward WorldMirror intrinsics to the browser viewer by default:
         # viewer_gaussian.html switches into native-resolution rendering whenever
         # intrinsics are present, which is much heavier for multi-million splats.
-        # Keep the socket for graph compatibility, but use camera_poses only for
-        # the initial camera center.
-        if intrinsics is not None:
-            intrinsics = self._tensor_to_list(intrinsics)
         if extrinsics is not None:
             ui_data["extrinsics"] = [extrinsics]
-        if intrinsics is not None:
-            ui_data["intrinsics"] = [intrinsics]
         
         print(f"✅ [VNCCS_BackgroundPreview] UI data ready. Returning to frontend.")
         return {"ui": ui_data, "result": (video_path, ply_path)}

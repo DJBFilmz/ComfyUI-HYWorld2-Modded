@@ -155,7 +155,6 @@
         let controls = null;
         let animationId = null;
         let currentSplat = null;
-        let originalScales = null;  // Store original scales for dynamic adjustment
 
         // Default focal length
         // Default focal length (pixel-space, sane default for 512px view)
@@ -443,9 +442,10 @@
             console.log('[GaussianViewer] Auto-fit complete. Camera at:', camera.position.z, 'Looking at:', targetPos.z);
         }
 
-        // Load a PLY file from ArrayBuffer data
-        async function loadPLYFromData(arrayBuffer, filename, extrinsics, intrinsics) {
-            console.log(`[GaussianViewer] 📥 loadPLYFromData started for ${filename}`);
+        // Load a PLY or compact .splat file from ArrayBuffer data
+        async function loadSplatFromData(arrayBuffer, filename, format, extrinsics, intrinsics) {
+            format = (format || 'ply').toLowerCase();
+            console.log(`[GaussianViewer] 📥 loadSplatFromData started for ${filename} (${format})`);
             try {
                 // Reset lock state
                 isResolutionLocked = false;
@@ -488,14 +488,21 @@
 
                 console.log('[GaussianViewer] Loading from data, size:', arrayBuffer.byteLength);
 
-                // Create a blob URL from the data
-                const blob = new Blob([arrayBuffer], { type: 'application/octet-stream' });
-                const blobUrl = URL.createObjectURL(blob);
-
-                // Load the PLY file from blob URL using PLYLoader
-                console.log('[GaussianViewer] ⏳ Calling SPLAT.PLYLoader.LoadAsync...');
-                await SPLAT.PLYLoader.LoadAsync(blobUrl, scene);
-                console.log('[GaussianViewer] ✅ SPLAT.PLYLoader.LoadAsync finished. Scene objects now:', scene.objects.length);
+                if (format === 'splat') {
+                    console.log('[GaussianViewer] ⏳ Calling SPLAT.Loader.LoadFromArrayBuffer...');
+                    SPLAT.Loader.LoadFromArrayBuffer(arrayBuffer, scene);
+                    console.log('[GaussianViewer] ✅ SPLAT.Loader.LoadFromArrayBuffer finished. Scene objects now:', scene.objects.length);
+                } else {
+                    const blob = new Blob([arrayBuffer], { type: 'application/octet-stream' });
+                    const blobUrl = URL.createObjectURL(blob);
+                    try {
+                        console.log('[GaussianViewer] ⏳ Calling SPLAT.PLYLoader.LoadAsync...');
+                        await SPLAT.PLYLoader.LoadAsync(blobUrl, scene);
+                        console.log('[GaussianViewer] ✅ SPLAT.PLYLoader.LoadAsync finished. Scene objects now:', scene.objects.length);
+                    } finally {
+                        URL.revokeObjectURL(blobUrl);
+                    }
+                }
 
                 if (scene.objects.length > 0) {
                     currentSplat = scene.objects[scene.objects.length - 1];
@@ -503,9 +510,6 @@
                 } else {
                     console.error('[GaussianViewer] ❌ CRITICAL: No object added to scene after loading!');
                 }
-
-                // Clean up blob URL
-                URL.revokeObjectURL(blobUrl);
 
                 // Get the loaded splat (last object in scene)
                 if (scene.objects && scene.objects.length > 0) {
@@ -519,24 +523,18 @@
                         console.log('[GaussianViewer] Scene bounds size:', size.x, size.y, size.z);
                     }
 
-                    // Store original scales and log statistics
+                    // Apply initial scale compensation in-place. Avoid storing a full
+                    // second copy of scales; 10M splats already means 30M floats.
                     if (currentSplat.data && currentSplat.data.scales) {
                         const scales = currentSplat.data.scales;
                         const numGaussians = scales.length / 3;
                         let minScale = Infinity, maxScale = -Infinity, sumScale = 0;
 
-                        // Store a copy of original scales (BEFORE compensation) for dynamic adjustment
-                        // The stored scales include the compensation factor so user scale=1 shows correct size
-                        originalScales = new Float32Array(scales.length);
-                        for (let i = 0; i < scales.length; i++) {
-                            // Apply compensation: gaussians need to be larger when focal length is scaled down
-                            originalScales[i] = scales[i] * gaussianScaleCompensation;
-                        }
-                        console.log('[GaussianViewer] Stored compensated scales (factor:', gaussianScaleCompensation.toFixed(2), 'x)');
-
-                        // Apply compensated scales immediately
-                        for (let i = 0; i < scales.length; i++) {
-                            scales[i] = originalScales[i];
+                        if (gaussianScaleCompensation !== 1.0) {
+                            for (let i = 0; i < scales.length; i++) {
+                                scales[i] *= gaussianScaleCompensation;
+                            }
+                            console.log('[GaussianViewer] Applied scale compensation:', gaussianScaleCompensation.toFixed(2), 'x');
                         }
 
                         // Mark data as changed so gsplat.js re-uploads to GPU
@@ -571,12 +569,12 @@
                     } else {
                         console.warn('[GaussianViewer] ⚠️ No scales/positions data found on currentSplat.data!');
                         console.log('[GaussianViewer] currentSplat.data keys:', Object.keys(currentSplat.data || {}));
-                        originalScales = null;
                     }
 
                     // Reset scale when loading new splat
                     scaleInput.value = 1.0;
                     currentScale = 1.0;
+                    lastScaleValue = 1.0;
                 }
 
                 // Set camera from extrinsics and intrinsics if provided
@@ -603,7 +601,7 @@
 
             } catch (err) {
                 console.error('[GaussianViewer] Load error:', err);
-                showError('Failed to load PLY: ' + err.message);
+                showError('Failed to load splat preview: ' + err.message);
 
                 window.parent.postMessage({
                     type: 'MESH_ERROR',
@@ -799,15 +797,18 @@
             // Apply scale to current splat by modifying the underlying scale data
             // gsplat.js applies Math.exp() during PLY loading, so data.scales contains LINEAR values
             // To multiply visual size by factor f, we multiply the scale values directly
-            if (currentSplat && currentSplat.data && currentSplat.data.scales && originalScales) {
+            if (currentSplat && currentSplat.data && currentSplat.data.scales) {
                 console.log('[GaussianViewer] Updating gaussian scales with factor:', newScale);
 
                 const scales = currentSplat.data.scales;
+                const ratio = newScale / lastScaleValue;
 
-                // Apply scale factor by multiplying (scales are in linear space)
+                // Apply only the delta from the previous UI value. This keeps scale
+                // edits reversible without retaining a full duplicate scale buffer.
                 for (let i = 0; i < scales.length; i++) {
-                    scales[i] = originalScales[i] * newScale;
+                    scales[i] *= ratio;
                 }
+                lastScaleValue = newScale;
 
                 // Mark data as changed to trigger GPU re-upload
                 // gsplat.js checks data.changed and data.detached
@@ -872,12 +873,11 @@
                 }
 
                 console.log('[GaussianViewer] Scale update complete. New scale[0]:', scales[0].toFixed(6),
-                    'original[0]:', originalScales[0].toFixed(6), 'multiplier:', newScale);
+                    'ratio:', ratio.toFixed(4), 'multiplier:', newScale);
             } else if (currentSplat) {
-                console.log('[GaussianViewer] Cannot update scales - missing data or originalScales');
+                console.log('[GaussianViewer] Cannot update scales - missing scale data');
                 console.log('[GaussianViewer] currentSplat.data:', !!currentSplat.data);
                 console.log('[GaussianViewer] currentSplat.data.scales:', !!(currentSplat.data && currentSplat.data.scales));
-                console.log('[GaussianViewer] originalScales:', !!originalScales);
             }
         }
 
@@ -891,11 +891,11 @@
         // Listen for messages from parent
         window.addEventListener('message', (event) => {
             console.log('[GaussianViewer] 📨 Received message from parent:', event.data.type);
-            const { type, data, filename, extrinsics, intrinsics } = event.data;
+            const { type, data, filename, format, extrinsics, intrinsics } = event.data;
 
             if (type === 'LOAD_MESH_DATA' && data) {
                 console.log('[GaussianViewer] 📦 Processing LOAD_MESH_DATA. Size:', (data.byteLength / (1024 * 1024)).toFixed(2), 'MB');
-                loadPLYFromData(data, filename || 'gaussian.ply', extrinsics, intrinsics);
+                loadSplatFromData(data, filename || 'gaussian.ply', format || 'ply', extrinsics, intrinsics);
             } else {
                 console.warn('[GaussianViewer] ⚠️ Unknown message type or missing data:', type);
             }
