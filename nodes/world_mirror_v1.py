@@ -904,42 +904,12 @@ class VNCCS_Equirect360ToViews:
                 "panorama": ("IMAGE",),
             },
             "optional": {
-                "quality": (["Standard (518)", "Marble HD (1022)", "Marble Ultra (1526)"], {"default": "Standard (518)"}),
                 # Unlocked limits for Brute Force/Consensus experiments
                 "fov": ("INT", {"default": 90, "min": 1, "max": 179}),
                 "yaw_step": ("INT", {"default": 45, "min": 1, "max": 180}),
-                "pitches": ("STRING", {"default": "0,-30,30"}),
-                "output_size": ("INT", {"default": 518, "min": 252, "max": 1022, "step": 14}),
+                "pitches": ("STRING", {"default": "0,-60,60"}),
+                "output_size": ("INT", {"default": 518, "min": 252, "max": 4096, "step": 14}),
                 "dynamic_fov": ("BOOLEAN", {"default": True, "tooltip": "Automatically reduce FOV looking up/down to minimize stretching"}),
-                "yaw_offset": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 1.0, "tooltip": "Global rotation offset to align walls with cardinal directions (0, 90, 180, 270)"}),
-                "pose_convention": ([
-                    "opencv_c2w",
-                    "opencv_w2c",
-                    "opengl_c2w",
-                    "opengl_w2c",
-                    "flip_pitch",
-                    "flip_yaw",
-                    "flip_pitch_yaw",
-                ], {
-                    "default": "opencv_c2w",
-                    "tooltip": "Camera pose convention exported to WorldMirror. Views are unchanged; only camera_poses changes."
-                }),
-                "pose_yaw_offset": ("FLOAT", {
-                    "default": 0.0, "min": -45.0, "max": 45.0, "step": 0.5,
-                    "tooltip": "Pose-only yaw calibration. Does not change extracted images."
-                }),
-                "pose_pitch_offset": ("FLOAT", {
-                    "default": 0.0, "min": -30.0, "max": 30.0, "step": 0.5,
-                    "tooltip": "Pose-only pitch calibration. Does not change extracted images."
-                }),
-                "pose_roll_offset": ("FLOAT", {
-                    "default": 0.0, "min": -30.0, "max": 30.0, "step": 0.5,
-                    "tooltip": "Pose-only roll calibration. Does not change extracted images."
-                }),
-                "intrinsics_focal_scale": ("FLOAT", {
-                    "default": 1.0, "min": 0.5, "max": 1.5, "step": 0.01,
-                    "tooltip": "Scales exported fx/fy only. Use to calibrate angular/radial drift without changing views."
-                }),
                 "sampling_mode": (["bilinear", "bicubic"], {
                     "default": "bilinear",
                     "tooltip": "Perspective extraction resampling. bilinear is safer for 3D reconstruction; bicubic is sharper but can create colored edge ringing."
@@ -952,19 +922,11 @@ class VNCCS_Equirect360ToViews:
     FUNCTION = "extract_views"
     CATEGORY = "VNCCS/3D"
     
-    def extract_views(self, panorama, quality="Standard (518)", fov=90, yaw_step=45, pitches="0,-30,30", output_size=518,
+    def extract_views(self, panorama, quality="Standard (518)", fov=90, yaw_step=45, pitches="0,-60,60", output_size=518,
                       dynamic_fov=True, yaw_offset=0.0, pose_convention="opencv_c2w",
                       pose_yaw_offset=0.0, pose_pitch_offset=0.0, pose_roll_offset=0.0,
                       intrinsics_focal_scale=1.0, sampling_mode="bilinear"):
-        
-        # Override output_size if Marble quality is selected
-        if "Standard" in quality:
-            output_size = 518
-        elif "HD" in quality:
-            output_size = 1022
-        elif "Ultra" in quality:
-            output_size = 1526
-            
+
         pitch_list = [int(p.strip()) for p in pitches.split(",")]
         
         img_np = (panorama[0].cpu().numpy() * 255).astype(np.uint8)
@@ -1228,13 +1190,6 @@ class VNCCS_SavePLY:
                 "ply_data": ("PLY_DATA",),
                 "filename": ("STRING", {"default": "output"}),
             },
-            "optional": {
-                "save_pointcloud": ("BOOLEAN", {"default": False}),
-                "save_gaussians": ("BOOLEAN", {"default": True}),
-                "rotate_x": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 5.0}),
-                "rotate_y": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 5.0}),
-                "rotate_z": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 5.0}),
-            }
         }
     
     RETURN_TYPES = ("STRING",)
@@ -1490,6 +1445,9 @@ class VNCCS_SavePLY:
         output_dir = folder_paths.get_output_directory()
         filename = self._sanitize_filename(filename)
         saved_files = []
+        save_pointcloud = False
+        save_gaussians = True
+        rotate_x = rotate_y = rotate_z = 0.0
         
         R = None
         if rotate_x != 0 or rotate_y != 0 or rotate_z != 0:

@@ -717,11 +717,11 @@ class VNCCS_WorldMirrorV2_3D:
 
     RETURN_TYPES  = (
         "PLY_DATA", "IMAGE", "IMAGE", "TENSOR", "TENSOR", "VNCCS_SPLAT",
-        "IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE",
+        "IMAGE", "IMAGE",
     )
     RETURN_NAMES  = (
         "ply_data", "depth_maps", "normal_maps", "camera_poses", "camera_intrinsics", "raw_splats",
-        "depth_conf", "pts3d_conf", "depth_mask", "gs_depth_conf", "gs_depth_mask", "filter_mask", "gs_filter_mask",
+        "filter_mask", "gs_filter_mask",
     )
     FUNCTION      = "run_inference"
     CATEGORY      = "VNCCS/3D"
@@ -1112,18 +1112,12 @@ class VNCCS_WorldMirrorV2_3D:
         predictions["images"] = imgs_tensor   # needed by SplatRefiner
 
         fallback_shape = (S, H, W)
-        depth_conf_out = _map_to_comfy_image(predictions.get("depth_conf"), fallback_shape)
-        pts3d_conf_out = _map_to_comfy_image(predictions.get("pts3d_conf"), fallback_shape)
-        depth_mask_out = _map_to_comfy_image(predictions.get("depth_mask"), fallback_shape, normalize=False)
-        gs_depth_conf_out = _map_to_comfy_image(predictions.get("gs_depth_conf"), fallback_shape)
-        gs_depth_mask_out = _map_to_comfy_image(predictions.get("gs_depth_mask"), fallback_shape, normalize=False)
         filter_mask_out = _map_to_comfy_image(pts_mask, fallback_shape, normalize=False)
         gs_filter_mask_out = _map_to_comfy_image(gs_mask, fallback_shape, normalize=False)
 
         return (
             ply_data, depth_out, normals_out, cam_poses, cam_intrs, predictions,
-            depth_conf_out, pts3d_conf_out, depth_mask_out, gs_depth_conf_out,
-            gs_depth_mask_out, filter_mask_out, gs_filter_mask_out,
+            filter_mask_out, gs_filter_mask_out,
         )
 
 
@@ -1145,7 +1139,7 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
             "tooltip": "Experimental: replace model splats with dense high-res splats from upsampled depth and high-res RGB."
         })
         optional["splat_upsample_size"] = ("INT", {
-            "default": 1022, "min": 252, "max": 1400, "step": 14,
+            "default": 1022, "min": 252, "max": 4096, "step": 14,
             "tooltip": "High-res splat grid size. Model inference can stay at target_size=518."
         })
         optional["splat_upsample_depth_source"] = (["gs_depth", "depth"], {
@@ -1498,11 +1492,6 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
             raw_new,
             output[6],
             output[7],
-            output[8],
-            output[9],
-            output[10],
-            output[11],
-            output[12],
         )
 
     def run_inference(
@@ -1590,7 +1579,7 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
                     "tooltip": "Build dense high-resolution splats from model depth and high-resolution view RGB."
                 }),
                 "splat_upsample_size": ("INT", {
-                    "default": 1022, "min": 252, "max": 1400, "step": 14,
+                    "default": 1022, "min": 252, "max": 4096, "step": 14,
                     "tooltip": "Dense splat grid size. This can be higher than target_size without rerunning the transformer at that resolution."
                 }),
                 "splat_upsample_scale": ("FLOAT", {

@@ -171,10 +171,19 @@
         let fullscreenFlight = false;
         let fovReference = null;
         let viewportScaleCompensation = 1.0;
+        let renderActiveUntil = 0;
+        let lastRenderTime = 0;
 
         // Default focal length
         // Default focal length (pixel-space, sane default for 512px view)
         const DEFAULT_FOCAL_LENGTH = 600;
+        const PREVIEW_FRAME_INTERVAL_MS = 1000 / 12;
+        const FULLSCREEN_FRAME_INTERVAL_MS = 1000 / 30;
+        const IDLE_HEARTBEAT_MS = 5000;
+
+        function invalidateRender(durationMs = 500) {
+            renderActiveUntil = Math.max(renderActiveUntil, performance.now() + durationMs);
+        }
 
         // Initialize the viewer
         function initViewer() {
@@ -194,14 +203,28 @@
                 // Handle resize
                 const resize = () => {
                     resizeRendererToCanvas();
+                    invalidateRender(800);
                 };
                 window.addEventListener('resize', resize);
+                document.addEventListener('visibilitychange', () => {
+                    if (!document.hidden) invalidateRender(800);
+                });
                 resize();
 
                 // Start render loop
                 const frame = () => {
-                    controls.update();
-                    renderer.render(scene, camera);
+                    const now = performance.now();
+                    const interval = fullscreenFlight ? FULLSCREEN_FRAME_INTERVAL_MS : PREVIEW_FRAME_INTERVAL_MS;
+                    const active = now < renderActiveUntil;
+                    const heartbeat = currentSplat && now - lastRenderTime > IDLE_HEARTBEAT_MS;
+
+                    if ((active || heartbeat) && now - lastRenderTime >= interval) {
+                        controls.update();
+                        renderer.render(scene, camera);
+                        lastRenderTime = now;
+                    } else if (active) {
+                        controls.update();
+                    }
                     animationId = requestAnimationFrame(frame);
                 };
                 frame();
@@ -252,6 +275,7 @@
                 camera.position.z + forward.z * pivotDistance
             );
             controls.setCameraTarget(target);
+            invalidateRender(800);
         }
 
         function setFPSControlsFromCamera() {
@@ -264,6 +288,7 @@
             controls.lookSpeed = 0.7;
             controls.dampening = 0.35;
             canvas.focus?.();
+            invalidateRender(800);
         }
 
         function updateFullscreenButton() {
@@ -349,6 +374,7 @@
             renderer.setSize(width, height);
             applyFovReference(width, height);
             applyViewportScaleCompensation(height);
+            invalidateRender(500);
         }
 
         function setFullscreenFlight(enabled) {
@@ -365,6 +391,7 @@
             }
             updateFullscreenButton();
             resizeRendererToCanvas();
+            invalidateRender(enabled ? 2000 : 1000);
         }
 
         async function toggleFullscreen() {
@@ -766,6 +793,7 @@
                 if (extrinsics || intrinsics) {
                     setCameraFromExtrinsics(extrinsics, intrinsics, currentSplat);
                     if (controls) controls.update();
+                    invalidateRender(1200);
                 } else {
                     // Otherwise, auto-fit to see the whole thing
                     autoFitCamera();
@@ -786,6 +814,7 @@
                 }, '*');
 
                 console.log('[GaussianViewer] Loaded successfully');
+                invalidateRender(2500);
 
             } catch (err) {
                 console.error('[GaussianViewer] Load error:', err);
@@ -836,6 +865,7 @@
                     console.log('[GaussianViewer] Reset camera to default position (0, 0, 5)');
                 }
                 controls.update();
+                invalidateRender(1000);
             }
         }
 
@@ -1006,6 +1036,7 @@
                 // gsplat.js checks data.changed and data.detached
                 markCurrentSplatDirty();
                 console.log('[GaussianViewer] Marked splat dirty after scale update');
+                invalidateRender(1200);
 
                 // Get the render data (could be _renderData or renderData)
                 const renderData = renderer._renderData || renderer.renderData;
@@ -1073,6 +1104,13 @@
         }
 
         scaleInput.addEventListener('change', (e) => updateGaussianScale(e.target.value));
+
+        ['pointerdown', 'pointermove', 'wheel', 'touchstart', 'touchmove'].forEach((eventName) => {
+            canvas.addEventListener(eventName, () => invalidateRender(900), { passive: true });
+        });
+        ['keydown', 'keyup'].forEach((eventName) => {
+            window.addEventListener(eventName, () => invalidateRender(900), { passive: true });
+        });
 
         // Event listeners
         document.getElementById('resetCamera').addEventListener('click', resetCamera);
