@@ -11,6 +11,8 @@ import os
 import sys
 import json
 import math
+import hashlib
+import importlib
 from contextlib import contextmanager
 import numpy as np
 import torch
@@ -35,6 +37,79 @@ _WORLDSTEREO_PATH = os.path.join(PROJECT_ROOT, "worldstereo")
 if _WORLDSTEREO_PATH not in sys.path:
     sys.path.insert(0, _WORLDSTEREO_PATH)
 
+
+def _prepend_package_search_path(package_name: str, search_path: str):
+    """Allow WorldStereo's local namespace packages to coexist with ComfyUI modules."""
+    if not os.path.isdir(search_path):
+        return
+
+    module = sys.modules.get(package_name)
+    if module is None:
+        import types
+        module = types.ModuleType(package_name)
+        sys.modules[package_name] = module
+
+    search_path = os.path.abspath(search_path)
+    existing_paths = list(getattr(module, "__path__", []) or [])
+    normalized = {os.path.normcase(os.path.abspath(p)) for p in existing_paths}
+    if os.path.normcase(search_path) not in normalized:
+        existing_paths.insert(0, search_path)
+
+    module.__path__ = existing_paths
+    module.__package__ = package_name
+    spec = getattr(module, "__spec__", None)
+    if spec is not None:
+        spec.submodule_search_locations = existing_paths
+
+
+def _import_worldstereo_class(base_dir: str = PROJECT_ROOT):
+    worldstereo_path = _prepare_worldstereo_import_paths(base_dir)
+    try:
+        from models.worldstereo_wrapper import WorldStereo
+        return WorldStereo
+    except ModuleNotFoundError as e:
+        if e.name not in ("models.worldstereo_wrapper", "models"):
+            raise
+
+    wrapper_path = os.path.join(worldstereo_path, "models", "worldstereo_wrapper.py")
+    if not os.path.exists(wrapper_path):
+        raise FileNotFoundError(f"worldstereo_wrapper.py not found at {wrapper_path!r}")
+
+    spec = importlib.util.spec_from_file_location("models.worldstereo_wrapper", wrapper_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not create import spec for {wrapper_path!r}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["models.worldstereo_wrapper"] = module
+    spec.loader.exec_module(module)
+    return module.WorldStereo
+
+
+def _prepare_worldstereo_import_paths(base_dir: str = PROJECT_ROOT) -> str:
+    worldstereo_path = None
+    for name in os.listdir(base_dir):
+        if name.lower() == "worldstereo":
+            worldstereo_path = os.path.join(base_dir, name)
+            break
+    if worldstereo_path is None:
+        worldstereo_path = os.path.join(base_dir, "worldstereo")
+
+    world_models_path = os.path.join(worldstereo_path, "models")
+    world_src_path = os.path.join(worldstereo_path, "src")
+
+    for path in (base_dir, worldstereo_path, world_src_path):
+        if os.path.isdir(path) and path not in sys.path:
+            sys.path.insert(0, path)
+
+    _prepend_package_search_path("models", world_models_path)
+    _prepend_package_search_path("src", world_src_path)
+    importlib.invalidate_caches()
+    return worldstereo_path
+
+
+_prepare_worldstereo_import_paths()
+
+
 def _fallback_camera_backward_forward(c2w, distance):
     c2w[:3, 3:4] = (c2w @ np.array([0, 0, distance, 1.0], dtype=np.float32).reshape(4, 1))[:3]
     return c2w
@@ -42,6 +117,11 @@ def _fallback_camera_backward_forward(c2w, distance):
 
 def _fallback_camera_left_right(c2w, distance):
     c2w[:3, 3:4] = (c2w @ np.array([distance, 0, 0, 1.0], dtype=np.float32).reshape(4, 1))[:3]
+    return c2w
+
+
+def _camera_up_down(c2w, distance):
+    c2w[:3, 3:4] = (c2w @ np.array([0, distance, 0, 1.0], dtype=np.float32).reshape(4, 1))[:3]
     return c2w
 
 
@@ -286,6 +366,27 @@ def _c2w_to_w2c(c2ws: torch.Tensor) -> torch.Tensor:
     return torch.linalg.inv(c2ws)
 
 
+def _opencv_look_at_c2w(cam_pos: np.ndarray, target: np.ndarray) -> np.ndarray:
+    z_axis = target - cam_pos
+    z_axis = z_axis / max(np.linalg.norm(z_axis), 1e-8)
+
+    world_down = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    if abs(float(np.dot(world_down, z_axis))) > 0.99:
+        world_down = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+
+    x_axis = np.cross(world_down, z_axis)
+    x_axis = x_axis / max(np.linalg.norm(x_axis), 1e-8)
+    y_axis = np.cross(z_axis, x_axis)
+    y_axis = y_axis / max(np.linalg.norm(y_axis), 1e-8)
+
+    c2w = np.eye(4, dtype=np.float32)
+    c2w[:3, 0] = x_axis
+    c2w[:3, 1] = y_axis
+    c2w[:3, 2] = z_axis
+    c2w[:3, 3] = cam_pos
+    return c2w
+
+
 def _build_trajectory(
     preset: str,
     num_frames: int,
@@ -345,7 +446,7 @@ def _build_trajectory(
         c2ws_np = []
         for j in range(1, num_frames + 1):
             c2w = c2w_start.copy()
-            c2w = camera_backward_forward(c2w, -speed * j)  # negative = forward
+            c2w = camera_backward_forward(c2w, speed * j)
             c2ws_np.append(c2w)
 
     elif preset == "zoom_in":
@@ -357,7 +458,7 @@ def _build_trajectory(
         c2ws_np = []
         for j in range(1, num_frames + 1):
             c2w = c2w_start.copy()
-            c2w = camera_backward_forward(c2w, -radius * j / num_frames)
+            c2w = camera_backward_forward(c2w, radius * j / num_frames)
             c2ws_np.append(c2w)
 
     elif preset == "zoom_out":
@@ -369,7 +470,38 @@ def _build_trajectory(
         c2ws_np = []
         for j in range(1, num_frames + 1):
             c2w = c2w_start.copy()
-            c2w = camera_backward_forward(c2w, radius * j / num_frames)
+            c2w = camera_backward_forward(c2w, -radius * j / num_frames)
+            c2ws_np.append(c2w)
+
+    elif preset == "stereo_orbit":
+        c2ws_np = []
+        target = np.array([0.0, 0.0, median_depth], dtype=np.float32)
+        orbit_radius = max(float(speed), 1e-4)
+        angles = np.linspace(0.0, 2.0 * math.pi, num_frames, endpoint=False, dtype=np.float32)
+        for angle in angles:
+            cam_pos = np.array(
+                [orbit_radius * math.cos(float(angle)), orbit_radius * math.sin(float(angle)), 0.0],
+                dtype=np.float32,
+            )
+            c2ws_np.append(_opencv_look_at_c2w(cam_pos, target))
+
+    elif preset == "left_right":
+        if not CAMERA_UTILS_AVAILABLE:
+            raise RuntimeError(
+                "left_right preset requires worldstereo camera_utils. "
+                "Ensure worldstereo/ is present in the repo root."
+            )
+        c2ws_np = []
+        offsets = np.linspace(-radius, radius, num_frames, dtype=np.float32)
+        for offset in offsets:
+            c2w = camera_left_right(c2w_start.copy(), float(offset))
+            c2ws_np.append(c2w)
+
+    elif preset == "up_down":
+        c2ws_np = []
+        offsets = np.linspace(-radius, radius, num_frames, dtype=np.float32)
+        for offset in offsets:
+            c2w = _camera_up_down(c2w_start.copy(), float(offset))
             c2ws_np.append(c2w)
 
     elif preset == "aerial":
@@ -422,7 +554,281 @@ def _get_models_base() -> str:
     )
 
 
-def _download_worldstereo_components(model_type: str) -> tuple:
+WORLDSTEREO_TURBO_LORAS = {
+    "none": None,
+    "CausVid 14B rank32 v2": {
+        "repo_id": "Kijai/WanVideo_comfy",
+        "filename": "Wan21_CausVid_14B_T2V_lora_rank32_v2.safetensors",
+        "adapter_name": "causvid_14b_rank32_v2",
+    },
+    "AccVid I2V 480P 14B rank32": {
+        "repo_id": "Kijai/WanVideo_comfy",
+        "filename": "Wan21_AccVid_I2V_480P_14B_lora_rank32_fp16.safetensors",
+        "adapter_name": "accvid_i2v_480p_14b_rank32",
+    },
+}
+
+
+def _download_worldstereo_turbo_lora(lora_name: str):
+    spec = WORLDSTEREO_TURBO_LORAS.get(lora_name)
+    if spec is None:
+        return None, None
+
+    from huggingface_hub import hf_hub_download
+
+    lora_dir = os.path.join(_get_models_base(), "loras", "wan")
+    os.makedirs(lora_dir, exist_ok=True)
+    lora_path = os.path.join(lora_dir, spec["filename"])
+
+    if not os.path.exists(lora_path):
+        print(f"[WorldStereo] Downloading turbo LoRA: {lora_name} ...")
+        lora_path = hf_hub_download(
+            repo_id=spec["repo_id"],
+            filename=spec["filename"],
+            local_dir=lora_dir,
+        )
+    else:
+        print(f"[WorldStereo] Turbo LoRA cached: {lora_path}")
+
+    return lora_path, spec
+
+
+def _call_lora_method(method_name: str, calls):
+    last_error = None
+    for call in calls:
+        try:
+            return call()
+        except TypeError as e:
+            last_error = e
+    if last_error is not None:
+        raise last_error
+    raise AttributeError(method_name)
+
+
+def _apply_worldstereo_turbo_lora(pipeline, lora_name: str, lora_strength: float):
+    lora_path, spec = _download_worldstereo_turbo_lora(lora_name)
+    if spec is None:
+        return None
+
+    adapter_name = spec["adapter_name"]
+    lora_strength = float(lora_strength)
+    half_dtype = _worldstereo_half_dtype()
+
+    # LoRA injection needs regular module weights; run it before fp8 quant/freeze.
+    for name in ("text_encoder", "image_encoder", "transformer", "vae"):
+        _move_module_to_half(getattr(pipeline, name, None), half_dtype)
+
+    try:
+        _call_lora_method(
+            "load_lora_weights",
+            (
+                lambda: pipeline.load_lora_weights(
+                    os.path.dirname(lora_path),
+                    weight_name=os.path.basename(lora_path),
+                    adapter_name=adapter_name,
+                ),
+                lambda: pipeline.load_lora_weights(lora_path, adapter_name=adapter_name),
+            ),
+        )
+        _call_lora_method(
+            "set_adapters",
+            (
+                lambda: pipeline.set_adapters([adapter_name], adapter_weights=[lora_strength]),
+                lambda: pipeline.set_adapters([adapter_name], weights=[lora_strength]),
+                lambda: pipeline.set_adapters(adapter_name, adapter_weights=lora_strength),
+            ),
+        )
+        _call_lora_method(
+            "fuse_lora",
+            (
+                lambda: pipeline.fuse_lora(adapter_names=[adapter_name], lora_scale=1.0),
+                lambda: pipeline.fuse_lora(lora_scale=1.0),
+                lambda: pipeline.fuse_lora(),
+            ),
+        )
+        if hasattr(pipeline, "unload_lora_weights"):
+            try:
+                pipeline.unload_lora_weights()
+            except Exception as e:
+                print(f"[WorldStereo] Turbo LoRA adapter cleanup skipped ({type(e).__name__}: {e})")
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to apply WorldStereo turbo LoRA {lora_name!r} from {lora_path}: {e}"
+        ) from e
+
+    print(f"[WorldStereo] Turbo LoRA applied and fused: {lora_name} (strength={lora_strength})")
+    return lora_path
+
+
+def _worldstereo_half_dtype() -> torch.dtype:
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    if torch.cuda.is_available():
+        return torch.float16
+    return torch.bfloat16
+
+
+def _move_module_to_half(module, dtype: torch.dtype):
+    if module is not None and hasattr(module, "to"):
+        module.to(dtype=dtype)
+    return module
+
+
+def _apply_worldstereo_precision(pipeline, precision: str):
+    """Apply non-fp32 precision to every heavy WorldStereo module."""
+    half_dtype = _worldstereo_half_dtype()
+    module_names = ("text_encoder", "image_encoder", "transformer", "vae")
+
+    for name in module_names:
+        _move_module_to_half(getattr(pipeline, name, None), half_dtype)
+
+    if precision == "bf16":
+        print(f"[WorldStereo] bf16/fp16 runtime dtype applied: {half_dtype}")
+        return "bf16"
+
+    if precision != "fp8":
+        raise ValueError(f"Unsupported precision: {precision!r}")
+
+    try:
+        from optimum.quanto import freeze, qfloat8_e4m3fn, quantize
+    except ImportError:
+        print("[WorldStereo] optimum-quanto not installed; falling back to bf16/fp16 weights")
+        return "bf16"
+
+    quantized = []
+    skipped = []
+    for name in module_names:
+        module = getattr(pipeline, name, None)
+        if module is None:
+            continue
+        try:
+            quantize(module, weights=qfloat8_e4m3fn)
+            freeze(module)
+            quantized.append(name)
+        except Exception as e:
+            skipped.append(f"{name} ({type(e).__name__}: {e})")
+            _move_module_to_half(module, half_dtype)
+
+    if quantized:
+        print(f"[WorldStereo] fp8 weight quantization applied: {', '.join(quantized)}")
+    if skipped:
+        print(f"[WorldStereo] fp8 unavailable for: {', '.join(skipped)}; kept at {half_dtype}")
+    return "fp8" if quantized else "bf16"
+
+
+def _apply_worldstereo_transformer_export_precision(pipeline, precision: str):
+    half_dtype = _worldstereo_half_dtype()
+    transformer = getattr(pipeline, "transformer", None)
+    if transformer is None:
+        raise RuntimeError("WorldStereo pipeline has no transformer to export.")
+
+    _move_module_to_half(transformer, half_dtype)
+    if precision == "bf16":
+        return "bf16"
+    if precision != "fp8":
+        raise ValueError(f"Unsupported export precision: {precision!r}")
+
+    try:
+        from optimum.quanto import freeze, qfloat8_e4m3fn, quantize
+    except ImportError as e:
+        raise ImportError("optimum-quanto required for fp8 export: pip install optimum-quanto") from e
+
+    quantize(transformer, weights=qfloat8_e4m3fn)
+    freeze(transformer)
+    return "fp8"
+
+
+def _tensor_state_dict_for_safetensors(module):
+    state = {}
+    for key, value in module.state_dict().items():
+        if isinstance(value, torch.Tensor):
+            state[key] = value.detach().cpu().contiguous()
+    return state
+
+
+def _resolve_worldstereo_export_paths(export_path: str, model_type: str, precision: str, turbo_lora: str):
+    export_path = os.path.abspath(os.path.expanduser(export_path.strip()))
+    if export_path.lower().endswith(".safetensors"):
+        output_file = export_path
+    else:
+        suffix = turbo_lora.lower().replace(" ", "_").replace("/", "_").replace("(", "").replace(")", "")
+        suffix = suffix if suffix and suffix != "none" else "clean"
+        output_file = os.path.join(export_path, f"{model_type}-{suffix}-{precision}.safetensors")
+    metadata_file = os.path.splitext(output_file)[0] + ".json"
+    return output_file, metadata_file
+
+
+def _download_hf_repo_missing(repo_id: str, local_dir: str, label: str, allow_patterns=None):
+    from fnmatch import fnmatch
+    from huggingface_hub import HfApi, hf_hub_download
+
+    def _allowed(path: str) -> bool:
+        if allow_patterns is None:
+            return True
+        return any(fnmatch(path, pattern) for pattern in allow_patterns)
+
+    api = HfApi()
+    try:
+        entries = list(api.list_repo_tree(repo_id, recursive=True))
+        remote_files = [
+            (entry.path, getattr(entry, "size", None))
+            for entry in entries
+            if getattr(entry, "path", None) and _allowed(entry.path) and getattr(entry, "size", None) is not None
+        ]
+    except Exception:
+        remote_files = [(path, None) for path in api.list_repo_files(repo_id) if _allowed(path)]
+
+    missing = []
+    mismatched = []
+    for rel_path, remote_size in remote_files:
+        local_path = os.path.join(local_dir, *rel_path.split("/"))
+        if not os.path.exists(local_path):
+            missing.append((rel_path, remote_size))
+        elif remote_size is not None and os.path.getsize(local_path) != remote_size:
+            mismatched.append((rel_path, remote_size, os.path.getsize(local_path)))
+
+    if not missing and not mismatched:
+        print(f"[WorldStereo] {label} cached: {local_dir}")
+        return
+
+    os.makedirs(local_dir, exist_ok=True)
+    total_size = sum(size or 0 for _, size in missing) + sum(size or 0 for _, size, _ in mismatched)
+    size_msg = f", {total_size / (1024 ** 3):.2f} GB" if total_size else ""
+    print(
+        f"[WorldStereo] Resuming {label}: "
+        f"{len(missing)} missing, {len(mismatched)} incomplete/corrupt files{size_msg}"
+    )
+
+    for rel_path, remote_size, local_size in mismatched:
+        local_path = os.path.join(local_dir, *rel_path.split("/"))
+        print(
+            f"[WorldStereo] Re-fetching incomplete file: {rel_path} "
+            f"({local_size} / {remote_size} bytes)"
+        )
+        try:
+            os.remove(local_path)
+        except OSError:
+            pass
+
+    files_to_fetch = [(path, size) for path, size in missing] + [(path, size) for path, size, _ in mismatched]
+    try:
+        from tqdm.auto import tqdm
+        iterator = tqdm(files_to_fetch, desc=f"[WorldStereo] {label}", unit="file")
+    except Exception:
+        iterator = files_to_fetch
+
+    for index, (rel_path, _) in enumerate(iterator, start=1):
+        print(f"[WorldStereo] [{index}/{len(files_to_fetch)}] downloading {rel_path}")
+        hf_hub_download(
+            repo_id=repo_id,
+            filename=rel_path,
+            local_dir=local_dir,
+        )
+
+    print(f"[WorldStereo] {label} cached: {local_dir}")
+
+
+def _download_worldstereo_components(model_type: str, include_moge: bool = True) -> tuple:
     """
     Download all required model components. Returns (transformer_dir, base_model_dir, moge_dir).
     """
@@ -454,29 +860,25 @@ def _download_worldstereo_components(model_type: str) -> tuple:
 
     # 2. Wan2.1 base model (VAE, T5, CLIP)
     base_model_dir = os.path.join(base, "Wan2.1-I2V-14B-480P")
-    wan_vae = os.path.join(base_model_dir, "vae", "diffusion_pytorch_model.safetensors")
-    if not os.path.exists(wan_vae):
-        print(f"[WorldStereo] Downloading Wan2.1-I2V-14B-480P base model (~40 GB) ...")
-        snapshot_download(
-            repo_id="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
-            local_dir=base_model_dir,
-        )
-        print(f"[WorldStereo] Base model cached: {base_model_dir}")
-    else:
-        print(f"[WorldStereo] Base model cached: {base_model_dir}")
+    _download_hf_repo_missing(
+        repo_id="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+        local_dir=base_model_dir,
+        label="Wan2.1-I2V-14B-480P base model",
+    )
 
     # 3. MoGe depth estimator
     moge_dir = os.path.join(base, "MoGe")
-    moge_config = os.path.join(moge_dir, "config.json")
-    if not os.path.exists(moge_config):
-        print(f"[WorldStereo] Downloading MoGe depth estimator ...")
-        snapshot_download(
-            repo_id="Ruicheng/moge-2-vitl-normal",
-            local_dir=moge_dir,
-        )
-        print(f"[WorldStereo] MoGe cached: {moge_dir}")
-    else:
-        print(f"[WorldStereo] MoGe cached: {moge_dir}")
+    if include_moge:
+        moge_config = os.path.join(moge_dir, "config.json")
+        if not os.path.exists(moge_config):
+            print(f"[WorldStereo] Downloading MoGe depth estimator ...")
+            snapshot_download(
+                repo_id="Ruicheng/moge-2-vitl-normal",
+                local_dir=moge_dir,
+            )
+            print(f"[WorldStereo] MoGe cached: {moge_dir}")
+        else:
+            print(f"[WorldStereo] MoGe cached: {moge_dir}")
 
     # 4. Patch transformer config.json to use local base_model path
     config_path = os.path.join(transformer_dir, "config.json")
@@ -497,13 +899,13 @@ def _download_worldstereo_components(model_type: str) -> tuple:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class VNCCS_CameraTrajectoryBuilder:
-    PRESETS = ["circular", "forward", "zoom_in", "zoom_out", "aerial", "custom"]
+    PRESETS = ["circular", "stereo_orbit", "forward", "zoom_in", "zoom_out", "left_right", "up_down", "aerial", "custom"]
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "optional": {
-                "preset": (cls.PRESETS, {"default": "circular"}),
+                "preset": (cls.PRESETS, {"default": "stereo_orbit"}),
                 "num_frames": ("INT", {"default": 25, "min": 4, "max": 81}),
                 "radius": (
                     "FLOAT",
@@ -512,7 +914,7 @@ class VNCCS_CameraTrajectoryBuilder:
                         "min": 0.1,
                         "max": 10.0,
                         "step": 0.1,
-                        "tooltip": "Orbit radius (circular) or travel distance (zoom).",
+                        "tooltip": "Orbit radius, travel distance, or lateral/up-down span depending on preset.",
                     },
                 ),
                 "speed": (
@@ -522,7 +924,7 @@ class VNCCS_CameraTrajectoryBuilder:
                         "min": 0.001,
                         "max": 1.0,
                         "step": 0.001,
-                        "tooltip": "Per-frame translation for forward preset.",
+                        "tooltip": "Per-frame translation for forward preset or parallax radius for stereo_orbit.",
                     },
                 ),
                 "elevation_deg": (
@@ -603,6 +1005,7 @@ class VNCCS_CameraTrajectoryBuilder:
             "intrs": intrs,
             "width": image_width,
             "height": image_height,
+            "preset": preset,
         }
         print(
             f"[Trajectory] preset={preset}, frames={c2ws.shape[0]}, "
@@ -628,19 +1031,35 @@ class VNCCS_LoadWorldStereoModel:
                         "worldstereo-memory-dmd: 34.9 GB distilled, requires 40+ GB VRAM."
                     ),
                 }),
-                "precision": (["bf16", "fp8", "fp4"], {
-                    "default": "bf16",
+                "precision": (["fp8", "bf16"], {
+                    "default": "fp8",
                     "tooltip": (
-                        "bf16: recommended. "
-                        "fp8: transformer weight-only via optimum-quanto. "
-                        "fp4: transformer weight-only via optimum-quanto (lower quality)."
+                        "fp8: quantize all supported heavy modules via optimum-quanto. "
+                        "bf16: half precision fallback, never fp32."
                     ),
                 }),
-                "offload_mode": (["model_cpu_offload", "sequential_cpu_offload", "none"], {
-                    "default": "model_cpu_offload",
+                "turbo_lora": (list(WORLDSTEREO_TURBO_LORAS.keys()), {
+                    "default": "none",
                     "tooltip": (
-                        "model_cpu_offload: move components to CPU between steps. Recommended for 16 GB VRAM. "
+                        "Optional Wan2.1 14B acceleration LoRA. It is downloaded, loaded, fused, "
+                        "then the pipeline is quantized/offloaded."
+                    ),
+                }),
+                "lora_strength": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 2.0,
+                        "step": 0.05,
+                        "tooltip": "Scale for the selected turbo LoRA before fusing.",
+                    },
+                ),
+                "offload_mode": (["sequential_cpu_offload", "model_cpu_offload", "none"], {
+                    "default": "sequential_cpu_offload",
+                    "tooltip": (
                         "sequential_cpu_offload: layer-by-layer, slower but less VRAM. "
+                        "model_cpu_offload: move components to CPU between steps. Faster, but requires more VRAM. "
                         "none: all components stay on GPU."
                     ),
                 }),
@@ -656,53 +1075,19 @@ class VNCCS_LoadWorldStereoModel:
     def load_model(
         self,
         model_type="worldstereo-camera",
-        precision="bf16",
-        offload_mode="model_cpu_offload",
+        precision="fp8",
+        turbo_lora="none",
+        lora_strength=1.0,
+        offload_mode="sequential_cpu_offload",
         device="cuda",
     ):
         import sys
         import os
 
-        # Resolve the parent custom node folder (ComfyUI-HYWorld2)
+        # Resolve and patch WorldStereo import paths. ComfyUI may already own a
+        # top-level "models" module, so make it a namespace package if needed.
         current_dir = os.path.dirname(os.path.dirname(__file__))
-
-        # Locate the "worldstereo" folder case-insensitively
-        worldstereo_path = None
-        for name in os.listdir(current_dir):
-            if name.lower() == "worldstereo":
-                worldstereo_path = os.path.join(current_dir, name)
-                break
-
-        if worldstereo_path:
-            # 1. Add worldstereo root to sys.path
-            if worldstereo_path not in sys.path:
-                sys.path.insert(0, worldstereo_path)
-
-            # 2. Append worldstereo's models directory to ComfyUI's 'models' search paths.
-            world_models_path = os.path.join(worldstereo_path, "models")
-            if "models" in sys.modules:
-                models_module = sys.modules["models"]
-                if hasattr(models_module, "__path__"):
-                    if world_models_path not in models_module.__path__:
-                        models_module.__path__.append(world_models_path)
-
-            # 3. Append worldstereo's src directory to the active 'src' search paths to prevent collisions
-            world_src_path = os.path.join(worldstereo_path, "src")
-            if "src" in sys.modules:
-                src_module = sys.modules["src"]
-                if hasattr(src_module, "__path__"):
-                    if isinstance(src_module.__path__, list):
-                        if world_src_path not in src_module.__path__:
-                            src_module.__path__.append(world_src_path)
-            else:
-                # If 'src' is not yet imported, import it now (will resolve to worldstereo/src)
-                try:
-                    import src
-                    if hasattr(src, "__path__") and isinstance(src.__path__, list):
-                        if world_src_path not in src.__path__:
-                            src.__path__.append(world_src_path)
-                except ImportError:
-                    pass
+        _prepare_worldstereo_import_paths(current_dir)
 
         # ── Call download helper to resolve and prepare directory paths ───────
         transformer_dir, base_model_dir, moge_dir = _download_worldstereo_components(model_type)
@@ -713,7 +1098,7 @@ class VNCCS_LoadWorldStereoModel:
         moge_dir = moge_dir.replace("\\", "/")
 
         with _temporary_worldstereo_runtime_patches(patch_diffusers=True):
-            from models.worldstereo_wrapper import WorldStereo
+            WorldStereo = _import_worldstereo_class(current_dir)
 
             # Resolve MoGeModel class import based on your installed MoGe library version
             try:
@@ -727,38 +1112,17 @@ class VNCCS_LoadWorldStereoModel:
             # ── Load WorldStereo pipeline ─────────────────────────────────────
             print(f"[WorldStereo] Loading pipeline (model_type={model_type}, precision={precision}) ...")
             parent_dir = os.path.dirname(transformer_dir)
+            model_device = "cpu" if device == "cuda" and offload_mode != "none" else device
             worldstereo = WorldStereo.from_pretrained(
                 parent_dir,
                 subfolder=model_type,
-                device=device
+                device=device,
+                model_device=model_device,
             )
         pipeline = worldstereo.pipeline
 
-        # ── Apply precision to transformer ────────────────────────────────────
-        if precision == "bf16":
-            pipeline.transformer.to(torch.bfloat16)
-            if hasattr(pipeline, "vae"):
-                pipeline.vae.to(torch.bfloat16)
-
-        elif precision == "fp8":
-            try:
-                from optimum.quanto import quantize, freeze, qfloat8_e4m3fn
-                pipeline.transformer.to(torch.bfloat16)
-                quantize(pipeline.transformer, weights=qfloat8_e4m3fn)
-                freeze(pipeline.transformer)
-                print("[WorldStereo] fp8 weight quantization applied")
-            except ImportError:
-                raise ImportError("optimum-quanto required for fp8: pip install optimum-quanto")
-
-        elif precision == "fp4":
-            try:
-                from optimum.quanto import quantize, freeze, qint4
-                pipeline.transformer.to(torch.bfloat16)
-                quantize(pipeline.transformer, weights=qint4)
-                freeze(pipeline.transformer)
-                print("[WorldStereo] fp4 (qint4) weight quantization applied")
-            except ImportError:
-                raise ImportError("optimum-quanto required for fp4: pip install optimum-quanto")
+        turbo_lora_path = _apply_worldstereo_turbo_lora(pipeline, turbo_lora, lora_strength)
+        precision = _apply_worldstereo_precision(pipeline, precision)
 
         # ── Apply offloading ──────────────────────────────────────────────────
         if device == "cuda":
@@ -768,6 +1132,8 @@ class VNCCS_LoadWorldStereoModel:
             elif offload_mode == "sequential_cpu_offload":
                 pipeline.enable_sequential_cpu_offload()
                 print("[WorldStereo] sequential_cpu_offload enabled")
+            elif offload_mode == "none":
+                print("[WorldStereo Warning] CPU offload disabled; this is likely too large for normal VRAM.")
 
         # ── Load MoGe on CPU ─────────────────────────────────────────────────
         print("[WorldStereo] Loading MoGe depth estimator ...")
@@ -778,6 +1144,10 @@ class VNCCS_LoadWorldStereoModel:
             actual_moge_path = moge_dir  # Fallback if structure varies
             
         moge_model = MoGeModel.from_pretrained(actual_moge_path).eval()
+        try:
+            moge_model.to(dtype=_worldstereo_half_dtype())
+        except Exception as e:
+            print(f"[WorldStereo] MoGe half precision cast skipped ({type(e).__name__}: {e})")
         print("[WorldStereo] MoGe loaded (CPU)")
 
         print("[WorldStereo] Pipeline ready")
@@ -787,6 +1157,11 @@ class VNCCS_LoadWorldStereoModel:
             "moge":        moge_model,
             "device":      device,
             "model_type":  model_type,
+            "precision":   precision,
+            "offload_mode": offload_mode,
+            "turbo_lora":  turbo_lora,
+            "lora_strength": float(lora_strength),
+            "turbo_lora_path": turbo_lora_path,
         },)
 
 def _prepare_pipeline_inputs(
@@ -812,14 +1187,15 @@ def _prepare_pipeline_inputs(
     img_tensor = T.ToTensor()(image_pil) * 2.0 - 1.0   # [3, H, W], range [-1, 1]
     
     # Create [1, 3, H, W] PyTorch tensor in [0, 1] for pointcloud functions
-    img_tensor_01 = T.ToTensor()(image_pil).unsqueeze(0).float() # [1, 3, H, W]
+    img_tensor_01 = (img_tensor + 1.0).mul(0.5).unsqueeze(0).float() # [1, 3, H, W]
 
     # 2. Depth via MoGe
     torch_device = torch.device(device)
     moge_model = moge_model.to(torch_device)
-    with torch.no_grad():
+    infer_dtype = _worldstereo_half_dtype()
+    with torch.no_grad(), torch.autocast(device_type=torch_device.type, dtype=infer_dtype, enabled=torch_device.type in ("cuda", "cpu")):
         depth_output = moge_model.infer(
-            img_tensor.unsqueeze(0).to(torch_device)
+            img_tensor.unsqueeze(0).to(torch_device, dtype=infer_dtype)
         )
     # MoGe returns dict; extract depth as [1, 1, H, W] PyTorch tensor
     depth_raw = depth_output["depth"]
@@ -833,7 +1209,8 @@ def _prepare_pipeline_inputs(
         depth_tensor = torch.from_numpy(depth_raw).float().unsqueeze(0).unsqueeze(0)
     
     moge_model.to("cpu")
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # 3. W2C matrices as PyTorch Tensors
     w2cs_t = _c2w_to_w2c(c2ws).float()   # [N, 4, 4]
@@ -892,8 +1269,9 @@ def _prepare_pipeline_inputs(
         render_masks_t = render_masks_t.permute(0, 3, 1, 2)  # [N, H, W, 1] → [N, 1, H, W]
 
     # Reshape to [1, C, N, H, W] (batch=1)
-    render_video = render_rgbs_t.unsqueeze(0).permute(0, 2, 1, 3, 4).to(torch_device)   # [1, 3, N, H, W]
-    render_mask  = render_masks_t.unsqueeze(0).permute(0, 2, 1, 3, 4).to(torch_device)  # [1, 1, N, H, W]
+    conditioning_dtype = _worldstereo_half_dtype()
+    render_video = render_rgbs_t.unsqueeze(0).permute(0, 2, 1, 3, 4).to(torch_device, dtype=conditioning_dtype)   # [1, 3, N, H, W]
+    render_mask  = render_masks_t.unsqueeze(0).permute(0, 2, 1, 3, 4).to(torch_device, dtype=conditioning_dtype)  # [1, 1, N, H, W]
 
     # 6. Camera embedding [1, 6, N, H, W]
     camera_emb = get_camera_embedding(
@@ -902,7 +1280,7 @@ def _prepare_pipeline_inputs(
         f=N, h=height, w=width,
         normalize=True,
         is_w2c=False,
-    )
+    ).to(dtype=conditioning_dtype)
 
     return {
         "image":            image_pil,
@@ -915,6 +1293,154 @@ def _prepare_pipeline_inputs(
         "width":            width,
         "num_frames":       N,
     }
+
+
+def _get_pipeline_execution_device(pipeline, fallback_device: str) -> torch.device:
+    execution_device = getattr(pipeline, "_execution_device", None)
+    if callable(execution_device):
+        execution_device = execution_device()
+    if execution_device is None:
+        execution_device = fallback_device
+    return torch.device(execution_device)
+
+
+def _free_pipeline_offload_hooks(pipeline, context: str):
+    if not hasattr(pipeline, "maybe_free_model_hooks"):
+        return
+    try:
+        pipeline.maybe_free_model_hooks()
+    except Exception as e:
+        print(f"[WorldStereo] Offload hook cleanup skipped after {context} ({type(e).__name__}: {e})")
+
+
+def _encode_prompt_cache(
+    pipeline,
+    prompt: str,
+    negative_prompt: str,
+    guidance_scale: float,
+    model_type: str,
+    device: str,
+):
+    do_cfg = guidance_scale > 1.0 and "dmd" not in model_type
+    execution_device = _get_pipeline_execution_device(pipeline, device)
+
+    with torch.no_grad(), torch.autocast(
+        execution_device.type,
+        dtype=_worldstereo_half_dtype(),
+        enabled=execution_device.type in ("cuda", "cpu"),
+    ):
+        embeds = pipeline.encode_prompt(
+            prompt=prompt if prompt else "",
+            negative_prompt=negative_prompt if negative_prompt else None,
+            do_classifier_free_guidance=do_cfg,
+            num_videos_per_prompt=1,
+            prompt_embeds=None,
+            negative_prompt_embeds=None,
+            max_sequence_length=512,
+            device=execution_device,
+        )
+    _free_pipeline_offload_hooks(pipeline, "prompt encode")
+    return embeds
+
+
+def _image_cache_key(image_pil) -> str:
+    hasher = hashlib.sha1()
+    hasher.update(str(image_pil.size).encode("ascii"))
+    hasher.update(image_pil.mode.encode("ascii"))
+    hasher.update(image_pil.tobytes())
+    return hasher.hexdigest()
+
+
+def _encode_image_cache(pipeline, image_pil, device: str):
+    execution_device = _get_pipeline_execution_device(pipeline, device)
+    with torch.no_grad(), torch.autocast(
+        execution_device.type,
+        dtype=_worldstereo_half_dtype(),
+        enabled=execution_device.type in ("cuda", "cpu"),
+    ):
+        image_embeds = pipeline.encode_image(image_pil, execution_device)
+    _free_pipeline_offload_hooks(pipeline, "image encode")
+    return image_embeds
+
+
+def _move_pipeline_inputs(pipeline_inputs: dict, device: str | torch.device):
+    moved = {}
+    for key, value in pipeline_inputs.items():
+        if isinstance(value, torch.Tensor):
+            moved[key] = value.to(device)
+        else:
+            moved[key] = value
+    return moved
+
+
+def _crop_generated_edges(frames: torch.Tensor, intrs: torch.Tensor, crop_percent: float):
+    crop_percent = float(crop_percent)
+    if crop_percent <= 0.0:
+        return frames, intrs
+
+    _, height, width, _ = frames.shape
+    crop_x = int(round(width * crop_percent / 100.0))
+    crop_y = int(round(height * crop_percent / 100.0))
+    max_crop_x = max(0, (width - 16) // 2)
+    max_crop_y = max(0, (height - 16) // 2)
+    crop_x = min(crop_x, max_crop_x)
+    crop_y = min(crop_y, max_crop_y)
+
+    if crop_x == 0 and crop_y == 0:
+        return frames, intrs
+
+    cropped = frames[:, crop_y:height - crop_y, crop_x:width - crop_x, :]
+    adjusted_intrs = intrs.clone()
+    adjusted_intrs[:, 0, 2] -= crop_x
+    adjusted_intrs[:, 1, 2] -= crop_y
+    return cropped.contiguous(), adjusted_intrs
+
+
+def _drop_duplicate_first_frame(
+    frames: torch.Tensor,
+    poses: torch.Tensor,
+    intrs: torch.Tensor,
+    image_pil,
+):
+    if frames.shape[0] <= 1:
+        return frames, poses, intrs, False
+
+    ref_np = np.asarray(image_pil.convert("RGB"), dtype=np.float32) / 255.0
+    ref = torch.from_numpy(ref_np).to(dtype=frames.dtype, device=frames.device)
+    if ref.shape != frames[0].shape:
+        return frames, poses, intrs, False
+
+    diff = (frames[0] - ref).abs()
+    mean_diff = float(diff.mean().item())
+    max_diff = float(diff.max().item())
+    if mean_diff <= 0.006 and max_diff <= 0.04:
+        print(
+            "[WorldStereo] First frame matches source slice; "
+            f"dropping duplicate (mean diff={mean_diff:.5f}, max diff={max_diff:.5f})"
+        )
+        return frames[1:].contiguous(), poses[1:].contiguous(), intrs[1:].contiguous(), True
+
+    print(
+        "[WorldStereo] First frame kept; source comparison differs "
+        f"(mean diff={mean_diff:.5f}, max diff={max_diff:.5f})"
+    )
+    return frames, poses, intrs, False
+
+
+@contextmanager
+def _pipeline_conditioning_cache(pipeline, enabled: bool):
+    old_enabled = getattr(pipeline, "_vnccs_cache_latent_condition", False)
+    old_cache = getattr(pipeline, "_vnccs_latent_condition_cache", None)
+
+    if enabled:
+        pipeline._vnccs_cache_latent_condition = True
+        pipeline._vnccs_latent_condition_cache = {}
+    try:
+        yield
+    finally:
+        if enabled:
+            pipeline._vnccs_latent_condition_cache = old_cache
+            pipeline._vnccs_cache_latent_condition = old_enabled
 
 
 class VNCCS_WorldStereoGenerate:
@@ -938,16 +1464,35 @@ class VNCCS_WorldStereoGenerate:
                 }),
                 "num_inference_steps": ("INT", {
                     "default": 0, "min": 0, "max": 100,
-                    "tooltip": "0 = auto (4 for memory-dmd, 20 for others).",
+                    "tooltip": "0 = auto (4 for turbo LoRA or memory-dmd, 20 for others).",
                 }),
                 "guidance_scale": ("FLOAT", {
                     "default": 5.0, "min": 1.0, "max": 20.0, "step": 0.5,
+                    "tooltip": "Forced to 1.0 automatically when a turbo LoRA is loaded.",
                 }),
                 "seed": ("INT", {
                     "default": -1, "min": -1, "max": 2**31 - 1,
                     "tooltip": "-1 = random.",
                 }),
                 "negative_prompt": ("STRING", {"default": ""}),
+                "cache_conditioning": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Cache T5 prompt embeds, CLIP image embeds, and VAE latent conditioning across slices.",
+                }),
+                "crop_generated_edges": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Crop generated borders from every output frame and adjust intrinsics.",
+                }),
+                "edge_crop_percent": (
+                    "FLOAT",
+                    {
+                        "default": 8.0,
+                        "min": 0.0,
+                        "max": 30.0,
+                        "step": 0.5,
+                        "tooltip": "Percent to crop from each side when crop_generated_edges is enabled.",
+                    },
+                ),
                 "base_camera_poses": ("TENSOR",),
                 "base_camera_intrinsics": ("TENSOR",),
             },
@@ -968,6 +1513,9 @@ class VNCCS_WorldStereoGenerate:
         guidance_scale=5.0,
         seed=-1,
         negative_prompt="",
+        cache_conditioning=True,
+        crop_generated_edges=False,
+        edge_crop_percent=8.0,
         base_camera_poses=None,
         base_camera_intrinsics=None,
     ):
@@ -975,15 +1523,31 @@ class VNCCS_WorldStereoGenerate:
         moge_model = model["moge"]
         device     = model["device"]
         model_type = model["model_type"]
+        turbo_lora = model.get("turbo_lora", "none")
+        has_turbo_lora = turbo_lora not in (None, "", "none")
 
         c2ws  = trajectory["c2ws"]    # [N, 4, 4]
         intrs = trajectory["intrs"]   # [N, 3, 3]
         W     = trajectory["width"]
         H     = trajectory["height"]
         N     = c2ws.shape[0]
+        trajectory_preset = trajectory.get("preset", "")
 
         if num_inference_steps == 0:
-            num_inference_steps = 4 if "dmd" in model_type else 20
+            num_inference_steps = 4 if has_turbo_lora or "dmd" in model_type else 20
+        if has_turbo_lora and guidance_scale != 1.0:
+            print(
+                f"[WorldStereo] Turbo LoRA '{turbo_lora}' loaded; "
+                f"forcing guidance_scale {guidance_scale} -> 1.0"
+            )
+            guidance_scale = 1.0
+        if trajectory_preset == "stereo_orbit" and not crop_generated_edges:
+            crop_generated_edges = True
+            edge_crop_percent = max(float(edge_crop_percent), 6.0)
+            print(
+                "[WorldStereo] stereo_orbit trajectory detected; "
+                f"auto edge crop enabled ({edge_crop_percent:.1f}%)"
+            )
 
         # Extract the total slice count from the input image batch
         B = image.shape[0] if isinstance(image, torch.Tensor) else len(image)
@@ -1025,6 +1589,24 @@ class VNCCS_WorldStereoGenerate:
         all_video_frames = []
         all_camera_poses = []
         all_camera_intrinsics = []
+        cached_prompt_embeds = None
+        cached_negative_prompt_embeds = None
+        image_embeds_cache = {}
+        latent_condition_cache = {}
+
+        if cache_conditioning:
+            print("[WorldStereo] Conditioning cache enabled: T5 prompt, CLIP image, VAE latent condition")
+            cached_prompt_embeds, cached_negative_prompt_embeds = _encode_prompt_cache(
+                pipeline=pipeline,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                guidance_scale=guidance_scale,
+                model_type=model_type,
+                device=device,
+            )
+            cached_prompt_embeds = cached_prompt_embeds.to("cpu")
+            if cached_negative_prompt_embeds is not None:
+                cached_negative_prompt_embeds = cached_negative_prompt_embeds.to("cpu")
 
         # Iterate through each panoramic view slice
         for b in range(B):
@@ -1079,6 +1661,25 @@ class VNCCS_WorldStereoGenerate:
                     width=W,
                     height=H,
                 )
+            if device == "cuda":
+                try:
+                    moge_model.to("cpu")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    pipeline_inputs = _move_pipeline_inputs(pipeline_inputs, "cpu")
+                except Exception as e:
+                    print(f"[WorldStereo] MoGe CPU offload skipped ({type(e).__name__}: {e})")
+
+            cached_image_embeds = None
+            if cache_conditioning:
+                image_key = _image_cache_key(img_pil)
+                cached_image_embeds = image_embeds_cache.get(image_key)
+                if cached_image_embeds is None:
+                    cached_image_embeds = _encode_image_cache(pipeline, img_pil, device).to("cpu")
+                    image_embeds_cache[image_key] = cached_image_embeds
+                    print(f"[WorldStereo] Slice {b + 1} image embedding cached")
+                else:
+                    print(f"[WorldStereo] Slice {b + 1} image embedding reused")
 
             # ── Generator Setup ──
             generator = None
@@ -1087,27 +1688,62 @@ class VNCCS_WorldStereoGenerate:
 
             # ── Diffusion Generation ──
             print(f"[WorldStereo] Slice {b + 1} executing inference for {N} camera frames...")
-            with torch.autocast(device, dtype=torch.bfloat16):
-                output = pipeline(
+            autocast_device = torch.device(device).type
+            with torch.autocast(autocast_device, dtype=_worldstereo_half_dtype()):
+                if device == "cuda":
+                    pipeline_inputs = _move_pipeline_inputs(pipeline_inputs, device)
+                pipeline_kwargs = {
                     **pipeline_inputs,
-                    prompt=prompt if prompt else "",
-                    negative_prompt=negative_prompt if negative_prompt else None,
-                    num_inference_steps=num_inference_steps,
-                    guidance_scale=guidance_scale,
-                    generator=generator,
-                    output_type="pt",
-                )
+                    "num_inference_steps": num_inference_steps,
+                    "guidance_scale": guidance_scale,
+                    "generator": generator,
+                    "output_type": "pt",
+                }
+                if cache_conditioning:
+                    pipeline_kwargs.update({
+                        "prompt": None,
+                        "negative_prompt": None,
+                        "prompt_embeds": cached_prompt_embeds.to(device),
+                        "negative_prompt_embeds": cached_negative_prompt_embeds.to(device) if cached_negative_prompt_embeds is not None else None,
+                        "image_embeds": cached_image_embeds.to(device),
+                    })
+                else:
+                    pipeline_kwargs.update({
+                        "prompt": prompt if prompt else "",
+                        "negative_prompt": negative_prompt if negative_prompt else None,
+                    })
+                with _pipeline_conditioning_cache(pipeline, cache_conditioning):
+                    if cache_conditioning:
+                        pipeline._vnccs_latent_condition_cache = latent_condition_cache
+                    output = pipeline(**pipeline_kwargs)
+                del pipeline_kwargs
+                del pipeline_inputs
 
             # Clean cache immediately to keep low VRAM overhead on sequential slices
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             # ── Extract Generated Frames ──
             frames = output.frames[0].float().cpu().clamp(0.0, 1.0)  # [N, 3, H, W]
             slice_video_frames = frames.permute(0, 2, 3, 1)          # [N, H, W, 3]
+            slice_poses = c2ws_abs.cpu().float()
+            slice_intrs = intrs_abs.cpu().float()
+            slice_video_frames, slice_poses, slice_intrs, _ = _drop_duplicate_first_frame(
+                slice_video_frames,
+                slice_poses,
+                slice_intrs,
+                img_pil,
+            )
+            if crop_generated_edges:
+                slice_video_frames, slice_intrs = _crop_generated_edges(
+                    slice_video_frames,
+                    slice_intrs,
+                    edge_crop_percent,
+                )
 
             all_video_frames.append(slice_video_frames)
-            all_camera_poses.append(c2ws_abs.cpu().float())
-            all_camera_intrinsics.append(intrs_abs.cpu().float())
+            all_camera_poses.append(slice_poses)
+            all_camera_intrinsics.append(slice_intrs)
 
         # Concatenate sequences of all processed slices into unified tensors
         video_frames     = torch.cat(all_video_frames, dim=0)       # [B * N, H, W, 3]
@@ -1119,6 +1755,154 @@ class VNCCS_WorldStereoGenerate:
         return video_frames, camera_poses_out, camera_intrs_out
 
 
+class VNCCS_ExportWorldStereoSingleModel:
+    """Experimental exporter for single-file WorldStereo transformer checkpoints."""
+
+    MODEL_TYPES = VNCCS_LoadWorldStereoModel.MODEL_TYPES
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "export_path": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "tooltip": "Absolute file path ending in .safetensors, or a directory. Can be outside ComfyUI.",
+                    },
+                ),
+            },
+            "optional": {
+                "model_type": (cls.MODEL_TYPES, {"default": "worldstereo-camera"}),
+                "precision": (["bf16", "fp8"], {
+                    "default": "bf16",
+                    "tooltip": "bf16 is reload-safe. fp8 is experimental and requires a future fp8-aware single loader.",
+                }),
+                "turbo_lora": (list(WORLDSTEREO_TURBO_LORAS.keys()), {"default": "none"}),
+                "lora_strength": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05},
+                ),
+                "device": (["cpu", "cuda"], {
+                    "default": "cpu",
+                    "tooltip": "cpu avoids VRAM pressure but needs a lot of RAM. cuda may be faster but risky.",
+                }),
+                "overwrite": ("BOOLEAN", {"default": False}),
+                "write_metadata_json": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("export_info",)
+    FUNCTION = "export_model"
+    CATEGORY = "VNCCS/Video"
+
+    def export_model(
+        self,
+        export_path,
+        model_type="worldstereo-camera",
+        precision="bf16",
+        turbo_lora="none",
+        lora_strength=1.0,
+        device="cpu",
+        overwrite=False,
+        write_metadata_json=True,
+    ):
+        import gc
+        from safetensors.torch import save_file
+
+        if not export_path or not export_path.strip():
+            raise ValueError("export_path is required and may point outside the ComfyUI output folder.")
+        if device == "cuda" and not torch.cuda.is_available():
+            print("[WorldStereo Export] CUDA requested but unavailable; using CPU")
+            device = "cpu"
+
+        output_file, metadata_file = _resolve_worldstereo_export_paths(
+            export_path,
+            model_type,
+            precision,
+            turbo_lora,
+        )
+        if os.path.exists(output_file) and not overwrite:
+            raise FileExistsError(f"Export file already exists: {output_file}")
+        output_dir = os.path.dirname(output_file)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+        transformer_dir, base_model_dir, _ = _download_worldstereo_components(model_type, include_moge=False)
+        transformer_dir = transformer_dir.replace("\\", "/")
+
+        current_dir = os.path.dirname(os.path.dirname(__file__))
+        with _temporary_worldstereo_runtime_patches(patch_diffusers=True):
+            WorldStereo = _import_worldstereo_class(current_dir)
+            print(
+                f"[WorldStereo Export] Loading {model_type} for single-file export "
+                f"(precision={precision}, turbo_lora={turbo_lora}) ..."
+            )
+            worldstereo = WorldStereo.from_pretrained(
+                os.path.dirname(transformer_dir),
+                subfolder=model_type,
+                device=device,
+                model_device=device,
+                transformer_only=True,
+            )
+
+        pipeline = worldstereo.pipeline
+        turbo_lora_path = _apply_worldstereo_turbo_lora(pipeline, turbo_lora, lora_strength)
+        actual_precision = _apply_worldstereo_transformer_export_precision(pipeline, precision)
+
+        transformer = pipeline.transformer
+        state = _tensor_state_dict_for_safetensors(transformer)
+        total_params = sum(t.numel() for t in state.values())
+        total_bytes = sum(t.numel() * t.element_size() for t in state.values())
+        dtype_summary = {}
+        for tensor in state.values():
+            dtype_summary[str(tensor.dtype)] = dtype_summary.get(str(tensor.dtype), 0) + tensor.numel()
+
+        metadata = {
+            "format": "hyworld2_worldstereo_single_transformer_v1",
+            "model_type": model_type,
+            "precision": actual_precision,
+            "turbo_lora": turbo_lora,
+            "lora_strength": str(float(lora_strength)),
+            "turbo_lora_path": turbo_lora_path or "",
+            "base_model_dir": base_model_dir,
+            "worldstereo_transformer_dir": transformer_dir,
+            "num_tensors": str(len(state)),
+            "num_params": str(total_params),
+            "tensor_bytes": str(total_bytes),
+            "dtype_summary": json.dumps(dtype_summary, sort_keys=True),
+            "note": "Contains WorldStereo transformer only: base WAN transformer plus WorldStereo weights. T5/CLIP/VAE are not included.",
+        }
+
+        print(f"[WorldStereo Export] Saving single transformer checkpoint: {output_file}")
+        save_file(state, output_file, metadata=metadata)
+        if write_metadata_json:
+            with open(metadata_file, "w", encoding="utf-8") as fh:
+                json.dump(metadata, fh, indent=2)
+
+        del state
+        del pipeline
+        del worldstereo
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        info = (
+            f"exported={output_file}\n"
+            f"metadata={metadata_file if write_metadata_json else ''}\n"
+            f"precision={actual_precision}\n"
+            f"turbo_lora={turbo_lora}\n"
+            f"tensors={metadata['num_tensors']}\n"
+            f"params={metadata['num_params']}\n"
+            f"bytes={metadata['tensor_bytes']}\n"
+            f"dtypes={metadata['dtype_summary']}"
+        )
+        print(f"[WorldStereo Export] Done:\n{info}")
+        return (info,)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ComfyUI registration
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1127,10 +1911,12 @@ NODE_CLASS_MAPPINGS = {
     "VNCCS_LoadWorldStereoModel":    VNCCS_LoadWorldStereoModel,
     "VNCCS_CameraTrajectoryBuilder": VNCCS_CameraTrajectoryBuilder,
     "VNCCS_WorldStereoGenerate":     VNCCS_WorldStereoGenerate,
+    "VNCCS_ExportWorldStereoSingleModel": VNCCS_ExportWorldStereoSingleModel,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "VNCCS_LoadWorldStereoModel":    "Load WorldStereo Model",
     "VNCCS_CameraTrajectoryBuilder": "Camera Trajectory Builder",
     "VNCCS_WorldStereoGenerate":     "WorldStereo Generate",
+    "VNCCS_ExportWorldStereoSingleModel": "Export WorldStereo Single Model",
 }

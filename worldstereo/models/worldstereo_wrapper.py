@@ -27,6 +27,7 @@ import gc
 import json
 import os
 import types
+from contextlib import contextmanager
 from typing import Any
 
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
@@ -37,6 +38,7 @@ import torch.distributed as dist
 from diffusers.models import AutoencoderKLWan
 from diffusers.schedulers import UniPCMultistepScheduler
 from omegaconf import OmegaConf
+from safetensors.torch import load as load_safetensors_bytes
 from safetensors.torch import load_file as load_safetensors
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
@@ -79,6 +81,52 @@ hf_logging.set_verbosity_error()
 from diffusers.utils import logging as diffusers_logging
 diffusers_logging.set_verbosity_error()
 
+_DIFFUSERS_LOW_MEMORY_LOAD_KWARGS = {
+    "disable_mmap": True,
+    "low_cpu_mem_usage": True,
+    "offload_state_dict": True,
+}
+
+_DIFFUSERS_TRANSFORMER_LOAD_KWARGS = {
+    "disable_mmap": True,
+    "low_cpu_mem_usage": False,
+}
+
+
+def _load_safetensors_cpu(path: str) -> dict[str, torch.Tensor]:
+    try:
+        return load_safetensors(path, device="cpu")
+    except OSError as exc:
+        if "1455" not in str(exc) and "paging file" not in str(exc).lower() and "подкач" not in str(exc).lower():
+            raise
+        rank0_log(
+            "Safetensors mmap failed with Windows pagefile error; retrying without mmap. "
+            "This is slower and requires free system RAM.",
+            "WARNING",
+        )
+        with open(path, "rb") as f:
+            return load_safetensors_bytes(f.read())
+
+
+@contextmanager
+def _disable_diffusers_fp32_keep_modules(*classes):
+    previous_values = []
+    for cls in classes:
+        had_attr = "_keep_in_fp32_modules" in cls.__dict__
+        previous_values.append((cls, had_attr, getattr(cls, "_keep_in_fp32_modules", None)))
+        cls._keep_in_fp32_modules = None
+    try:
+        yield
+    finally:
+        for cls, had_attr, value in previous_values:
+            if had_attr:
+                cls._keep_in_fp32_modules = value
+            else:
+                try:
+                    delattr(cls, "_keep_in_fp32_modules")
+                except AttributeError:
+                    pass
+
 # torch.compile / inductor verbose output
 logging.getLogger("torch._dynamo").setLevel(logging.WARNING)
 logging.getLogger("torch._inductor").setLevel(logging.WARNING)
@@ -93,13 +141,13 @@ SUPPORTED_MODEL_TYPES = ("worldstereo-camera", "worldstereo-memory", "worldstere
 
 
 def _get_half_dtype() -> torch.dtype:
-    """Select the best half-precision dtype based on current GPU capability: bf16 > fp16 > fp32."""
+    """Select a non-fp32 runtime dtype: bf16 when available, otherwise fp16."""
     if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
         return torch.bfloat16
     elif torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 7:
         return torch.float16
     else:
-        return torch.float32
+        return torch.bfloat16
 
 
 class WorldStereo:
@@ -124,6 +172,8 @@ class WorldStereo:
         fsdp: bool = False,
         device_mesh=None,
         device: torch.device | None = None,
+        model_device: torch.device | str | None = None,
+        transformer_only: bool = False,
     ) -> "WorldStereo":
         """
         Build a WorldStereo instance from Hugging Face format
@@ -136,7 +186,11 @@ class WorldStereo:
             sp_world_size: Sequence-Parallel degree (1 = disabled).
             fsdp: Wrap models with PyTorch FSDP.  Requires ``device_mesh``.
             device_mesh: ``DeviceMesh`` with dims ``("rep", "shard")``.
-            device: Target CUDA device.
+            device: Target execution device.
+            model_device: Device used while constructing modules. Use CPU when
+                diffusers offload hooks will manage GPU residency.
+            transformer_only: If True, load only the WorldStereo transformer
+                and skip T5/CLIP/VAE/tokenizers. Intended for checkpoint export.
         """
         if os.path.isdir(repo_id):
             json_cfg_path = os.path.join(repo_id, subfolder, "config.json")
@@ -171,6 +225,8 @@ class WorldStereo:
                 f"Expected one of {SUPPORTED_MODEL_TYPES}."
             )
 
+        model_device = model_device if model_device is not None else device
+
         transformer = cls._load_transformer(
             cfg,
             model_type,
@@ -178,11 +234,14 @@ class WorldStereo:
             sp_world_size=sp_world_size,
             fsdp=fsdp,
             device_mesh=device_mesh,
-            device=device,
+            device=model_device,
         )
 
+        if transformer_only:
+            return cls(pipeline=types.SimpleNamespace(transformer=transformer), cfg=cfg)
+
         text_encoder, image_clip, vae = cls._load_aux(
-            cfg, device=device, device_mesh=device_mesh, fsdp=fsdp, local_files_only=local_files_only
+            cfg, device=model_device, device_mesh=device_mesh, fsdp=fsdp, local_files_only=local_files_only
         )
         image_processor = CLIPImageProcessor.from_pretrained(
             cfg.base_model, do_rescale=False, subfolder="image_processor", local_files_only=local_files_only
@@ -251,20 +310,23 @@ class WorldStereo:
         half_dtype = _get_half_dtype()
         rank0_log(f"Loading transformer ({model_type})… dtype={half_dtype}")
 
-        if model_type == "worldstereo-camera":
-            transformer = WorldStereoModel.from_pretrained(
-                cfg.base_model,
-                subfolder="transformer",
-                controlnet_cfg=cfg.controlnet_cfg,
-                torch_dtype=half_dtype,
-            )
-        else:
-            transformer = WorldStereoRefSModel.from_pretrained(
-                cfg.base_model,
-                subfolder="transformer",
-                controlnet_cfg=cfg.controlnet_cfg,
-                torch_dtype=half_dtype,
-            )
+        with _disable_diffusers_fp32_keep_modules(WorldStereoModel, WorldStereoRefSModel):
+            if model_type == "worldstereo-camera":
+                transformer = WorldStereoModel.from_pretrained(
+                    cfg.base_model,
+                    subfolder="transformer",
+                    controlnet_cfg=cfg.controlnet_cfg,
+                    torch_dtype=half_dtype,
+                    **_DIFFUSERS_TRANSFORMER_LOAD_KWARGS,
+                )
+            else:
+                transformer = WorldStereoRefSModel.from_pretrained(
+                    cfg.base_model,
+                    subfolder="transformer",
+                    controlnet_cfg=cfg.controlnet_cfg,
+                    torch_dtype=half_dtype,
+                    **_DIFFUSERS_TRANSFORMER_LOAD_KWARGS,
+                )
 
         rank0_log("Building ControlNet…")
         transformer.build_controlnet(load_uni3c=False, freeze_backbone=cfg.freeze_backbone)
@@ -280,7 +342,7 @@ class WorldStereo:
                     block.attn1.processor.sp_size = sp_world_size
 
         rank0_log(f"Loading HF safetensors weights from {weights_path}…")
-        weights = load_safetensors(weights_path, device="cpu")
+        weights = _load_safetensors_cpu(weights_path)
 
         result = transformer.load_state_dict(weights, strict=False)
 
@@ -321,7 +383,7 @@ class WorldStereo:
             fsdp_kwargs = dict(
                 mp_policy=MixedPrecisionPolicy(
                     param_dtype=half_dtype,
-                    reduce_dtype=torch.float32,
+                    reduce_dtype=half_dtype,
                 ),
                 mesh=device_mesh["rep", "shard"],
                 reshard_after_forward=True,
@@ -337,7 +399,8 @@ class WorldStereo:
             transformer = transformer.to(device=device)
 
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return transformer.eval()
 
     @staticmethod
@@ -346,19 +409,19 @@ class WorldStereo:
         from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
 
         # ---- text encoder ----
-        rank0_log("Loading TextEncoder (UMT5)…")
+        half_dtype = _get_half_dtype()
+        rank0_log(f"Loading TextEncoder (UMT5)… dtype={half_dtype}")
         text_encoder = UMT5EncoderModel.from_pretrained(
-            cfg.base_model, subfolder="text_encoder", torch_dtype=torch.float32, local_files_only=local_files_only
+            cfg.base_model, subfolder="text_encoder", torch_dtype=half_dtype, local_files_only=local_files_only
         ).eval()
         if _tr.__version__ >= "5.0.0":
             rank0_log("Patching text_encoder.encoder.embed_tokens for transformers>=5.0.0", "WARNING")
             text_encoder.encoder.embed_tokens = text_encoder.shared
-        text_encoder = torch.compile(text_encoder)
 
         # ---- image encoder ----
-        rank0_log("Loading ImageEncoder (CLIP)…")
+        rank0_log(f"Loading ImageEncoder (CLIP)… dtype={half_dtype}")
         image_clip = CLIPVisionModel.from_pretrained(
-            cfg.base_model, subfolder="image_encoder", torch_dtype=torch.float32, local_files_only=local_files_only
+            cfg.base_model, subfolder="image_encoder", torch_dtype=half_dtype, local_files_only=local_files_only
         ).eval()
         if _tr.__version__ >= "5.0.0":
             rank0_log("Patching CLIP vision forward for transformers>=5.0.0", "WARNING")
@@ -389,17 +452,20 @@ class WorldStereo:
             image_clip.vision_model.encoder.forward = types.MethodType(_clip_encoder_forward, image_clip.vision_model.encoder)
 
         # ---- VAE ----
-        vae_dtype = _get_half_dtype()
+        vae_dtype = half_dtype
         rank0_log(f"Loading 3D-VAE… dtype={vae_dtype}")
         vae = AutoencoderKLWan.from_pretrained(
-            cfg.base_model, subfolder="vae", torch_dtype=vae_dtype, local_files_only=local_files_only
+            cfg.base_model,
+            subfolder="vae",
+            torch_dtype=vae_dtype,
+            local_files_only=local_files_only,
+            **_DIFFUSERS_LOW_MEMORY_LOAD_KWARGS,
         ).eval()
-        vae = torch.compile(vae)
 
         if fsdp:
             fsdp_kwargs = dict(
                 mp_policy=MixedPrecisionPolicy(
-                    param_dtype=torch.float32, reduce_dtype=torch.float32,
+                    param_dtype=half_dtype, reduce_dtype=half_dtype,
                 ),
                 mesh=device_mesh["rep", "shard"],
                 reshard_after_forward=True,

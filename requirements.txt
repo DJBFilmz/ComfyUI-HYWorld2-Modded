@@ -37,8 +37,8 @@ accelerate
 # PyTorch3D (required for WorldStereo point rendering) — install manually:
 # pip install "git+https://github.com/facebookresearch/pytorch3d.git@stable"
 
-# MoGe depth estimator (required for WorldStereo) — install manually:
-# pip install "git+https://github.com/microsoft/MoGe.git"
+# MoGe depth estimator (required for WorldStereo)
+git+https://github.com/microsoft/MoGe.git@0286b495230a074aadf1c76cc5c679e943e5d1c6
 
 # WorldStereo
 diffusers>=0.36.0
