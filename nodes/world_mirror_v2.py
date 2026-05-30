@@ -1157,11 +1157,11 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
             "tooltip": "Constant Gaussian scale for high-res backprojected splats."
         })
         optional["splat_upsample_scale_mode"] = (["constant", "depth_adaptive", "footprint_adaptive", "hybrid_adaptive"], {
-            "default": "constant",
+            "default": "depth_adaptive",
             "tooltip": "constant uses one world-space size; depth_adaptive grows with depth; footprint_adaptive follows local 3D spacing; hybrid uses both."
         })
         optional["splat_upsample_depth_scale_strength"] = ("FLOAT", {
-            "default": 0.0, "min": 0.0, "max": 8.0, "step": 0.05,
+            "default": 1.0, "min": 0.0, "max": 8.0, "step": 0.05,
             "tooltip": "Depth growth strength, or local footprint multiplier in footprint/hybrid modes."
         })
         optional["splat_upsample_depth_scale_max"] = ("FLOAT", {
@@ -1181,7 +1181,7 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
             "tooltip": "Voxel size for high-res backprojected splat merge."
         })
         optional["splat_upsample_max_points"] = ("INT", {
-            "default": 14000000, "min": 0, "max": 50000000, "step": 100000,
+            "default": 9_000_000, "min": 0, "max": 50000000, "step": 100000,
             "tooltip": "Depth-aware downsample high-res splats to this many points. 0 disables the cap."
         })
         optional["splat_upsample_cap_far_bias"] = ("FLOAT", {
@@ -1514,13 +1514,13 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
         splat_upsample_size=1022,
         splat_upsample_depth_source="gs_depth",
         splat_upsample_scale=0.003,
-        splat_upsample_scale_mode="constant",
-        splat_upsample_depth_scale_strength=0.0,
+        splat_upsample_scale_mode="depth_adaptive",
+        splat_upsample_depth_scale_strength=1.0,
         splat_upsample_depth_scale_max=3.0,
         splat_upsample_opacity=0.9,
         splat_upsample_voxel_prune=True,
         splat_upsample_voxel_size=0.0015,
-        splat_upsample_max_points=14_000_000,
+        splat_upsample_max_points=9_000_000,
         splat_upsample_cap_far_bias=1.75,
         **kwargs,
     ):
@@ -1569,6 +1569,10 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
                     "default": 518, "min": 252, "max": 1400, "step": 14,
                     "tooltip": "Model inference resolution. Keep this low for multi-view panorama passes; dense splats can be upsampled separately."
                 }),
+                "offload_scheme": (["none", "model_cpu_offload"], {
+                    "default": "none",
+                    "tooltip": "Move model weights to CPU between GPU use to reduce VRAM at the cost of speed."
+                }),
                 "apply_sky_mask": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Remove sky-like regions before saving. Useful for outdoor panoramas where sky can create far/infinite splats."
@@ -1594,11 +1598,11 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
                     "tooltip": "Gaussian size for dense backprojected splats."
                 }),
                 "splat_upsample_scale_mode": (["constant", "depth_adaptive", "footprint_adaptive", "hybrid_adaptive"], {
-                    "default": "constant",
+                    "default": "depth_adaptive",
                     "tooltip": "constant uses one Gaussian size; depth_adaptive grows with depth; footprint_adaptive follows local 3D spacing; hybrid uses both."
                 }),
                 "splat_upsample_depth_scale_strength": ("FLOAT", {
-                    "default": 0.0, "min": 0.0, "max": 8.0, "step": 0.05,
+                    "default": 1.0, "min": 0.0, "max": 8.0, "step": 0.05,
                     "tooltip": "Depth growth strength, or local footprint multiplier in footprint/hybrid modes."
                 }),
                 "splat_upsample_depth_scale_max": ("FLOAT", {
@@ -1614,7 +1618,7 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
                     "tooltip": "Voxel size for dense splat compression."
                 }),
                 "splat_upsample_max_points": ("INT", {
-                    "default": 10_000_000, "min": 0, "max": 50_000_000, "step": 100_000,
+                    "default": 9_000_000, "min": 0, "max": 50_000_000, "step": 100_000,
                     "tooltip": "Depth/distance-aware cap for dense splats. Lower values reduce file size; higher values preserve distant surfaces."
                 }),
                 "splat_upsample_cap_far_bias": ("FLOAT", {
@@ -1642,18 +1646,19 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
         model,
         images,
         target_size=518,
+        offload_scheme="none",
         apply_sky_mask=False,
         camera_conditioning="pose+intrinsics",
         splat_camera_source="input_when_available",
         splat_upsample_mode="depth_backproject",
         splat_upsample_size=1022,
         splat_upsample_scale=0.003,
-        splat_upsample_scale_mode="constant",
-        splat_upsample_depth_scale_strength=0.0,
+        splat_upsample_scale_mode="depth_adaptive",
+        splat_upsample_depth_scale_strength=1.0,
         splat_upsample_depth_scale_max=3.0,
         splat_upsample_voxel_prune=True,
         splat_upsample_voxel_size=0.0015,
-        splat_upsample_max_points=10_000_000,
+        splat_upsample_max_points=9_000_000,
         splat_upsample_cap_far_bias=1.75,
         debug_log=False,
         camera_intrinsics=None,
@@ -1665,7 +1670,7 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
             images,
             use_gsplat=True,
             target_size=target_size,
-            offload_scheme="none",
+            offload_scheme=offload_scheme,
             confidence_percentile=10.0,
             apply_sky_mask=apply_sky_mask,
             filter_edges=True,
