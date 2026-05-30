@@ -189,6 +189,7 @@ class DPTHead(_BaseDPTHead):
         self.activation = activation
         self.is_gsdpt = is_gsdpt
         self.enable_depth_mask = enable_depth_mask
+        self.frames_chunk_size = 2
 
         head_features_2 = 32
         conv2_in_channels = features // 2
@@ -228,7 +229,7 @@ class DPTHead(_BaseDPTHead):
         token_list: List[torch.Tensor],
         images: torch.Tensor,
         patch_start_idx: int,
-        frames_chunk_size: int = 8,
+        frames_chunk_size: int = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Forward pass with optional frame chunking for memory efficiency.
@@ -245,6 +246,8 @@ class DPTHead(_BaseDPTHead):
             Otherwise: (predictions, confidence), [B, S, X, H, W] and [B, S, 1, H, W]
         """
         B, S, _, H, W = images.shape
+        if frames_chunk_size is None:
+            frames_chunk_size = getattr(self, "frames_chunk_size", 2)
 
         # Process all frames together if chunk size not specified or large enough
         if frames_chunk_size is None or frames_chunk_size >= S:
@@ -351,7 +354,7 @@ class DPTHead(_BaseDPTHead):
             img_flat = images.reshape(B * S, -1, H, W)
             img_feat = self.input_merger(img_flat)
             fused = fused + img_feat
-            fused = fused.reshape(B, S, *fused.shape[1:]).float().contiguous()
+            fused = fused.reshape(B, S, *fused.shape[1:]).contiguous()
             if self.enable_depth_mask:
                 depth_mask = depth_mask.reshape(B, S, *depth_mask.shape[1:])
                 return fused, preds, conf, depth_mask

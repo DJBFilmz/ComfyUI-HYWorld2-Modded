@@ -308,7 +308,7 @@ class WorldMirrorPipeline:
                 model_cfg["sp_size"] = sp_size
             if enable_bf16:
                 model_cfg["enable_bf16"] = True
-            model = WorldMirror(**model_cfg).to(device)
+            model = WorldMirror(**model_cfg)
             state = _load_checkpoint_state_dict(ckpt_path)
             _load_state_dict_selective(model, state, source_name=ckpt_path)
             del state
@@ -321,7 +321,7 @@ class WorldMirrorPipeline:
                 model_cfg["sp_size"] = sp_size
             if enable_bf16:
                 model_cfg["enable_bf16"] = True
-            model = WorldMirror(**model_cfg).to(device)
+            model = WorldMirror(**model_cfg)
             state = load_safetensors(os.path.join(model_dir, "model.safetensors"))
             _load_state_dict_selective(model, state, source_name=model_dir)
             del state
@@ -369,6 +369,9 @@ class WorldMirrorPipeline:
         # Disable unused heads
         if disable_heads:
             _disable_heads(model, disable_heads)
+
+        if not (use_fsdp and is_distributed):
+            model.to(device)
 
         # FSDP wrapping
         if use_fsdp and is_distributed:
