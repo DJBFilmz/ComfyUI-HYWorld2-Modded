@@ -163,6 +163,97 @@ def _resize_depth_prior(depth_prior, target_size, expected_count):
     return torch.stack(depth_list).unsqueeze(0)
 
 
+def _align_tensor_sequence_to_count(tensor, target_count, label):
+    if not isinstance(tensor, torch.Tensor) or target_count <= 0:
+        return tensor
+    seq_dim = None
+    seq_count = None
+    if tensor.dim() >= 4 and tensor.shape[0] == 1 and tensor.shape[1] != target_count:
+        seq_dim = 1
+        seq_count = tensor.shape[1]
+    elif tensor.dim() >= 1 and tensor.shape[0] != target_count:
+        seq_dim = 0
+        seq_count = tensor.shape[0]
+    if seq_dim is None or seq_count is None or seq_count <= 0 or seq_count == target_count:
+        return tensor
+    raise RuntimeError(
+        f"WorldMirror V2 received {target_count} images but {seq_count} {label}. "
+        "Upstream nodes must provide one camera pose/intrinsic per image; refusing to guess camera alignment."
+    )
+
+
+def _align_camera_priors_to_image_count(images, camera_poses, camera_intrinsics):
+    if isinstance(images, torch.Tensor):
+        target_count = int(images.shape[0])
+    else:
+        try:
+            target_count = len(images)
+        except Exception:
+            target_count = 0
+    return (
+        _align_tensor_sequence_to_count(camera_poses, target_count, "camera_poses"),
+        _align_tensor_sequence_to_count(camera_intrinsics, target_count, "camera_intrinsics"),
+    )
+
+
+def _extract_pose_tensor(value):
+    if not isinstance(value, torch.Tensor):
+        return None
+    poses = value.detach().cpu().float()
+    if poses.dim() == 4 and poses.shape[0] == 1:
+        poses = poses[0]
+    if poses.dim() == 3 and poses.shape[-2:] == (4, 4):
+        return poses
+    return None
+
+
+def _rescale_input_pose_translation_to_prediction(input_poses, predicted_poses, eps=1e-6):
+    poses = _extract_pose_tensor(input_poses)
+    pred = _extract_pose_tensor(predicted_poses)
+    if poses is None or pred is None or poses.shape[0] != pred.shape[0]:
+        return poses if poses is not None else input_poses
+
+    out = poses.clone()
+    input_t = poses[:, :3, 3]
+    pred_t = pred[:, :3, 3]
+    input_norm = input_t.norm(dim=1)
+
+    starts = [0]
+    for i in range(1, poses.shape[0]):
+        if input_norm[i] <= eps:
+            starts.append(i)
+    starts = sorted(set(starts))
+
+    changed = 0
+    ratios = []
+    for start_idx, end_idx in zip(starts, starts[1:] + [poses.shape[0]]):
+        if end_idx - start_idx <= 1:
+            continue
+        base_input = input_t[start_idx]
+        base_pred = pred_t[start_idx]
+        rel_input = input_t[start_idx:end_idx] - base_input
+        rel_pred = pred_t[start_idx:end_idx] - base_pred
+        rel_input_norm = rel_input.norm(dim=1)
+        rel_pred_norm = rel_pred.norm(dim=1)
+        valid = rel_input_norm > eps
+        if not bool(valid.any()):
+            continue
+        scale = torch.ones_like(rel_input_norm)
+        scale[valid] = rel_pred_norm[valid] / rel_input_norm[valid].clamp_min(eps)
+        out[start_idx:end_idx, :3, 3] = base_input + rel_input * scale[:, None]
+        changed += int(valid.sum().item())
+        ratios.extend(scale[valid].tolist())
+
+    if changed > 0 and ratios:
+        ratios_t = torch.tensor(ratios, dtype=torch.float32)
+        print(
+            "[V2 EXP] Calibrated input camera translation scale from predicted motion: "
+            f"frames={changed}, median={ratios_t.median().item():.4f}, "
+            f"min={ratios_t.min().item():.4f}, max={ratios_t.max().item():.4f}"
+        )
+    return out
+
+
 def _apply_mask_to_splats(splats, mask_np):
     if splats is None or mask_np is None:
         return splats
@@ -879,6 +970,11 @@ class VNCCS_WorldMirrorV2_3D:
 
         # ── 1. Preprocess: ComfyUI IMAGE [B,H,W,C] → tensor [1,S,3,H,W] ─────
         B = images.shape[0]
+        camera_poses, camera_intrinsics = _align_camera_priors_to_image_count(
+            images,
+            camera_poses,
+            camera_intrinsics,
+        )
         tensor_list = []
         adjusted_intrinsics = camera_intrinsics.clone().float() if isinstance(camera_intrinsics, torch.Tensor) else None
 
@@ -1515,7 +1611,10 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
             align_corners=False,
         )[:, 0]
 
-        poses = camera_poses.detach().cpu().float()
+        predicted_poses = raw.get("camera_poses")
+        if predicted_poses is None and len(output) > 3:
+            predicted_poses = output[3]
+        poses = _rescale_input_pose_translation_to_prediction(camera_poses, predicted_poses)
         intrs = highres_intrs.detach().cpu().float()
         pts, _, _ = depth_to_world_coords_points(depth_hi, poses, intrs)
         means = pts.reshape(1, S * H * W, 3)
@@ -1645,6 +1744,12 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
         splat_upsample_cap_far_bias=1.75,
         **kwargs,
     ):
+        kwargs = dict(kwargs)
+        kwargs["camera_poses"], kwargs["camera_intrinsics"] = _align_camera_priors_to_image_count(
+            images,
+            kwargs.get("camera_poses"),
+            kwargs.get("camera_intrinsics"),
+        )
         output = super().run_inference(model, images, use_gsplat=use_gsplat, **kwargs)
         if splat_upsample_mode == "depth_backproject":
             output = self._build_upsampled_splats(

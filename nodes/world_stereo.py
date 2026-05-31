@@ -1939,6 +1939,50 @@ def _crop_generated_edges(frames: torch.Tensor, intrs: torch.Tensor, crop_percen
     return cropped.contiguous(), adjusted_intrs
 
 
+def _resize_frames_and_intrinsics(frames: torch.Tensor, intrs: torch.Tensor, out_width: int, out_height: int):
+    if frames.shape[1] == out_height and frames.shape[2] == out_width:
+        return frames.contiguous(), intrs
+
+    in_height, in_width = frames.shape[1], frames.shape[2]
+    resized = torch.nn.functional.interpolate(
+        frames.permute(0, 3, 1, 2),
+        size=(out_height, out_width),
+        mode="bicubic",
+        align_corners=False,
+    ).permute(0, 2, 3, 1).clamp(0.0, 1.0)
+
+    adjusted_intrs = intrs.clone()
+    adjusted_intrs[:, 0, :] *= float(out_width) / float(in_width)
+    adjusted_intrs[:, 1, :] *= float(out_height) / float(in_height)
+    return resized.contiguous(), adjusted_intrs
+
+
+def _worldstereo_keyframe_indices(num_frames: int, device=None) -> torch.Tensor:
+    keyframe_count = max(1, (int(num_frames) - 1) // 4 + 1)
+    if keyframe_count == 1:
+        return torch.zeros(1, dtype=torch.long, device=device)
+    indices = torch.linspace(0, int(num_frames) - 1, keyframe_count, device=device).round().long()
+    return torch.unique_consecutive(indices.clamp(0, int(num_frames) - 1))
+
+
+def _worldstereo_output_frame_indices(num_condition_frames: int, num_output_frames: int, device=None) -> torch.Tensor:
+    if num_output_frames <= 0:
+        return torch.empty(0, dtype=torch.long, device=device)
+    if num_output_frames == num_condition_frames:
+        return torch.arange(num_condition_frames, dtype=torch.long, device=device)
+    keyframe_indices = _worldstereo_keyframe_indices(num_condition_frames, device=device)
+    if num_output_frames == keyframe_indices.numel():
+        return keyframe_indices
+    if num_output_frames == 1:
+        return torch.zeros(1, dtype=torch.long, device=device)
+    return torch.linspace(
+        0,
+        int(num_condition_frames) - 1,
+        int(num_output_frames),
+        device=device,
+    ).round().long().clamp(0, int(num_condition_frames) - 1)
+
+
 def _drop_duplicate_first_frame(
     frames: torch.Tensor,
     poses: torch.Tensor,
@@ -1947,6 +1991,11 @@ def _drop_duplicate_first_frame(
 ):
     if frames.shape[0] <= 1:
         return frames, poses, intrs, False
+    if poses.shape[0] != frames.shape[0] or intrs.shape[0] != frames.shape[0]:
+        raise RuntimeError(
+            "WorldStereo frame/camera count mismatch before duplicate drop: "
+            f"frames={frames.shape[0]}, poses={poses.shape[0]}, intrinsics={intrs.shape[0]}"
+        )
 
     ref_np = np.asarray(image_pil.convert("RGB"), dtype=np.float32) / 255.0
     ref = torch.from_numpy(ref_np).to(dtype=frames.dtype, device=frames.device)
@@ -2042,6 +2091,10 @@ class VNCCS_WorldStereoGenerate:
                     "default": False,
                     "tooltip": "Crop generated borders from every output frame and adjust intrinsics.",
                 }),
+                "worldmirror_sequence_mode": (["stereo_only", "prepend_source_highres"], {
+                    "default": "stereo_only",
+                    "tooltip": "prepend_source_highres outputs the original high-res source view first, followed by generated frames resized to that source size.",
+                }),
                 "edge_crop_percent": (
                     "FLOAT",
                     {
@@ -2078,6 +2131,7 @@ class VNCCS_WorldStereoGenerate:
         conditioning_frame_mode="auto",
         vae_memory_mode="auto",
         crop_generated_edges=False,
+        worldmirror_sequence_mode="stereo_only",
         edge_crop_percent=8.0,
         base_camera_poses=None,
         base_camera_intrinsics=None,
@@ -2189,8 +2243,11 @@ class VNCCS_WorldStereoGenerate:
             
             # Extract slice image and convert to PIL
             img_slice = image[b] if isinstance(image, torch.Tensor) else image[b]
+            source_h, source_w = int(img_slice.shape[0]), int(img_slice.shape[1])
             img_np  = (img_slice.cpu().numpy()[..., :3] * 255).astype(np.uint8)
-            img_pil = PILImage.fromarray(img_np).resize((W, H), PILImage.Resampling.BICUBIC)
+            source_frame = torch.from_numpy(img_np.astype(np.float32) / 255.0)
+            source_pil = PILImage.fromarray(img_np)
+            img_pil = source_pil.resize((W, H), PILImage.Resampling.BICUBIC)
 
             # Determine the base camera pose for this specific slice
             if base_camera_poses is not None:
@@ -2220,17 +2277,21 @@ class VNCCS_WorldStereoGenerate:
             base_pose_expanded = base_pose_dev.unsqueeze(0).expand(N, -1, -1)  # [N, 4, 4]
             c2ws_abs = torch.bmm(base_pose_expanded, c2ws)                     # [N, 4, 4]
 
-            # Expand base intrinsics across all frames: [N, 3, 3]
-            base_K_dev = base_K.to(intrs.device, dtype=intrs.dtype)
+            base_K_raw = base_K.to(intrs.device, dtype=intrs.dtype)
+            base_K_dev = base_K_raw.clone()
+            base_K_source = base_K_raw.clone()
+            if source_w != W or source_h != H:
+                if base_camera_intrinsics is not None:
+                    base_K_dev[0, :] *= float(W) / float(source_w)
+                    base_K_dev[1, :] *= float(H) / float(source_h)
+                else:
+                    base_K_source[0, :] *= float(source_w) / float(W)
+                    base_K_source[1, :] *= float(source_h) / float(H)
+            # Expand generation-resolution intrinsics across all frames: [N, 3, 3]
             intrs_abs = base_K_dev.unsqueeze(0).expand(N, -1, -1).clone()
             conditioning_frame_indices = None
             if conditioning_frame_mode == "keyframes":
-                conditioning_frame_indices = torch.arange(0, N, 4, dtype=torch.long, device=c2ws_abs.device)
-                if conditioning_frame_indices[-1].item() != N - 1:
-                    conditioning_frame_indices = torch.cat([
-                        conditioning_frame_indices,
-                        torch.tensor([N - 1], dtype=torch.long, device=c2ws_abs.device),
-                    ])
+                conditioning_frame_indices = _worldstereo_keyframe_indices(N, device=c2ws_abs.device)
 
             # ── Preprocess Pipeline Inputs for the Slice ──
             print(f"[WorldStereo] Slice {b + 1} processing: depth estimation + point rendering...")
@@ -2278,14 +2339,15 @@ class VNCCS_WorldStereoGenerate:
                     pipeline_inputs = _move_pipeline_inputs(pipeline_inputs, device)
                 if render_vae_mode == "keyframes":
                     render_video = pipeline_inputs.get("render_video")
-                    if isinstance(render_video, torch.Tensor) and render_video.shape[2] != (N // 4 + 1):
-                        pipeline_inputs["render_video"] = render_video[:, :, ::4].contiguous()
+                    keyframe_indices = _worldstereo_keyframe_indices(N, device=render_video.device) if isinstance(render_video, torch.Tensor) else None
+                    if isinstance(render_video, torch.Tensor) and render_video.shape[2] != keyframe_indices.numel():
+                        pipeline_inputs["render_video"] = render_video.index_select(2, keyframe_indices).contiguous()
                         render_mask = pipeline_inputs.get("render_mask")
                         if isinstance(render_mask, torch.Tensor) and render_mask.shape[2] == render_video.shape[2]:
-                            pipeline_inputs["render_mask"] = render_mask[:, :, ::4].contiguous()
+                            pipeline_inputs["render_mask"] = render_mask.index_select(2, keyframe_indices.to(render_mask.device)).contiguous()
                         camera_embedding = pipeline_inputs.get("camera_embedding")
                         if isinstance(camera_embedding, torch.Tensor) and camera_embedding.shape[2] == render_video.shape[2]:
-                            pipeline_inputs["camera_embedding"] = camera_embedding[:, :, ::4].contiguous()
+                            pipeline_inputs["camera_embedding"] = camera_embedding.index_select(2, keyframe_indices.to(camera_embedding.device)).contiguous()
                         print(
                             "[WorldStereo] Render VAE conditioning sliced to keyframes: "
                             f"{render_video.shape[2]} -> {pipeline_inputs['render_video'].shape[2]}"
@@ -2325,20 +2387,54 @@ class VNCCS_WorldStereoGenerate:
 
             # ── Extract Generated Frames ──
             frames = output.frames[0].float().cpu().clamp(0.0, 1.0)  # [N, 3, H, W]
+            output_frame_count = int(frames.shape[0])
+            output_frame_indices = _worldstereo_output_frame_indices(
+                N,
+                output_frame_count,
+                device=c2ws_abs.device,
+            )
+            if output_frame_count != N:
+                print(
+                    "[WorldStereo] Aligning camera trajectory to decoded frames: "
+                    f"conditioning={N}, decoded={output_frame_count}, "
+                    f"indices={output_frame_indices.detach().cpu().tolist()}"
+                )
             slice_video_frames = frames.permute(0, 2, 3, 1)          # [N, H, W, 3]
-            slice_poses = c2ws_abs.cpu().float()
-            slice_intrs = intrs_abs.cpu().float()
-            slice_video_frames, slice_poses, slice_intrs, _ = _drop_duplicate_first_frame(
+            slice_poses = c2ws_abs.index_select(0, output_frame_indices).cpu().float()
+            slice_intrs = intrs_abs.index_select(0, output_frame_indices).cpu().float()
+            slice_video_frames, slice_poses, slice_intrs, dropped_first = _drop_duplicate_first_frame(
                 slice_video_frames,
                 slice_poses,
                 slice_intrs,
                 img_pil,
             )
+            if worldmirror_sequence_mode == "prepend_source_highres" and not dropped_first and slice_video_frames.shape[0] > 1:
+                print("[WorldStereo] WorldMirror sequence mode: forcing generated first-frame removal; high-res source frame will be prepended.")
+                slice_video_frames = slice_video_frames[1:].contiguous()
+                slice_poses = slice_poses[1:].contiguous()
+                slice_intrs = slice_intrs[1:].contiguous()
             if crop_generated_edges:
                 slice_video_frames, slice_intrs = _crop_generated_edges(
                     slice_video_frames,
                     slice_intrs,
                     edge_crop_percent,
+                )
+            if worldmirror_sequence_mode == "prepend_source_highres":
+                slice_video_frames, slice_intrs = _resize_frames_and_intrinsics(
+                    slice_video_frames,
+                    slice_intrs,
+                    source_w,
+                    source_h,
+                )
+                anchor_frame = source_frame.unsqueeze(0).to(slice_video_frames.dtype)
+                anchor_pose = base_pose.cpu().float().unsqueeze(0)
+                anchor_intr = base_K_source.cpu().float().unsqueeze(0)
+                slice_video_frames = torch.cat([anchor_frame, slice_video_frames], dim=0)
+                slice_poses = torch.cat([anchor_pose, slice_poses], dim=0)
+                slice_intrs = torch.cat([anchor_intr, slice_intrs], dim=0)
+                print(
+                    "[WorldStereo] WorldMirror sequence prepared: "
+                    f"anchor={source_w}x{source_h}, generated_resized={slice_video_frames.shape[0] - 1} frames"
                 )
 
             all_video_frames.append(slice_video_frames)
@@ -2349,6 +2445,12 @@ class VNCCS_WorldStereoGenerate:
         video_frames     = torch.cat(all_video_frames, dim=0)       # [B * N, H, W, 3]
         camera_poses_out = torch.cat(all_camera_poses, dim=0)       # [B * N, 4, 4]
         camera_intrs_out = torch.cat(all_camera_intrinsics, dim=0)  # [B * N, 3, 3]
+        if camera_poses_out.shape[0] != video_frames.shape[0] or camera_intrs_out.shape[0] != video_frames.shape[0]:
+            raise RuntimeError(
+                "WorldStereo output frame/camera count mismatch: "
+                f"frames={video_frames.shape[0]}, poses={camera_poses_out.shape[0]}, "
+                f"intrinsics={camera_intrs_out.shape[0]}"
+            )
 
         print(f"[WorldStereo Batch Loop] Complete. Total of {video_frames.shape[0]} frames prepared for 3D fusion.")
 

@@ -59,6 +59,50 @@ class MaskCamEmbed(nn.Module):
         return add_embeds
 
 
+def _align_controlnet_add_inputs(
+        add_inputs: torch.Tensor,
+        controlnet_inputs: torch.Tensor,
+        post_patch_height: int,
+        post_patch_width: int,
+) -> torch.Tensor:
+    if add_inputs.shape[1] == controlnet_inputs.shape[1]:
+        return add_inputs
+
+    add_tokens = add_inputs.shape[1]
+    control_tokens = controlnet_inputs.shape[1]
+    spatial_tokens = int(post_patch_height) * int(post_patch_width)
+
+    if spatial_tokens > 0 and add_tokens % spatial_tokens == 0 and control_tokens % spatial_tokens == 0:
+        add_frames = add_tokens // spatial_tokens
+        control_frames = control_tokens // spatial_tokens
+        if add_frames > 0 and control_frames > 0:
+            if control_frames == 1:
+                frame_indices = torch.zeros(1, dtype=torch.long, device=add_inputs.device)
+            else:
+                frame_indices = torch.linspace(
+                    0,
+                    add_frames - 1,
+                    control_frames,
+                    device=add_inputs.device,
+                ).round().long().clamp(0, add_frames - 1)
+            return (
+                add_inputs
+                .reshape(add_inputs.shape[0], add_frames, spatial_tokens, add_inputs.shape[2])
+                .index_select(1, frame_indices)
+                .reshape(add_inputs.shape[0], control_tokens, add_inputs.shape[2])
+            )
+
+    ratio = add_tokens / control_tokens
+    if abs(ratio - round(ratio)) < 1e-6:
+        return add_inputs[:, ::int(round(ratio)), :]
+
+    raise RuntimeError(
+        "ControlNet conditioning token mismatch: "
+        f"controlnet={controlnet_inputs.shape}, add_inputs={add_inputs.shape}, "
+        f"post_patch_spatial={spatial_tokens}"
+    )
+
+
 class WorldStereoModel(WanTransformer3DModel):
     r"""
     A Transformer model for video-like data used in the Wan model.
@@ -218,15 +262,12 @@ class WorldStereoModel(WanTransformer3DModel):
             else:
                 add_inputs = render_mask
             add_inputs = self.controlnet.controlnet_mask_embedding(add_inputs)
-            if add_inputs.shape[1] != controlnet_inputs.shape[1]:
-                ratio = add_inputs.shape[1] / controlnet_inputs.shape[1]
-                if abs(ratio - round(ratio)) < 1e-6:
-                    add_inputs = add_inputs[:, ::int(round(ratio)), :]
-                else:
-                    raise RuntimeError(
-                        "ControlNet conditioning token mismatch: "
-                        f"controlnet={controlnet_inputs.shape}, add_inputs={add_inputs.shape}"
-                    )
+            add_inputs = _align_controlnet_add_inputs(
+                add_inputs,
+                controlnet_inputs,
+                post_patch_height,
+                post_patch_width,
+            )
             controlnet_inputs = controlnet_inputs + add_inputs
             ### process controlnet inputs over ###
         else:
@@ -552,15 +593,12 @@ class WorldStereoRefSModel(WanTransformer3DModel):
                 add_inputs = render_mask
 
             add_inputs = self.controlnet.controlnet_mask_embedding(add_inputs)
-            if add_inputs.shape[1] != controlnet_inputs.shape[1]:
-                ratio = add_inputs.shape[1] / controlnet_inputs.shape[1]
-                if abs(ratio - round(ratio)) < 1e-6:
-                    add_inputs = add_inputs[:, ::int(round(ratio)), :]
-                else:
-                    raise RuntimeError(
-                        "ControlNet conditioning token mismatch: "
-                        f"controlnet={controlnet_inputs.shape}, add_inputs={add_inputs.shape}"
-                    )
+            add_inputs = _align_controlnet_add_inputs(
+                add_inputs,
+                controlnet_inputs,
+                post_patch_height,
+                post_patch_width,
+            )
             controlnet_inputs = controlnet_inputs + add_inputs
             ### process controlnet inputs over ###
         else:
