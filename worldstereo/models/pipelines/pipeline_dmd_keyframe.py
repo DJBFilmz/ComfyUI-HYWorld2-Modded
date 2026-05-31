@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import html
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -90,7 +91,7 @@ class RefKFDMDGeneratorPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             transformer: WorldStereoRefSModel,
             vae: AutoencoderKLWan,
             scheduler,
-            device,
+            device=None,
             vae_compile: bool = False,
             vae_compile_mode: str = "max-autotune"
     ):
@@ -265,14 +266,9 @@ class RefKFDMDGeneratorPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             image_embeds=None,
             callback_on_step_end_tensor_inputs=None,
     ):
-        if image is not None and image_embeds is not None:
+        if image is None:
             raise ValueError(
-                f"Cannot forward both `image`: {image} and `image_embeds`: {image_embeds}. Please make sure to"
-                " only forward one of the two."
-            )
-        if image is None and image_embeds is None:
-            raise ValueError(
-                "Provide either `image` or `prompt_embeds`. Cannot leave both `image` and `image_embeds` undefined."
+                "`image` is required for VAE conditioning. `image_embeds` may be provided to skip CLIP encoding."
             )
         if image is not None and not isinstance(image, torch.Tensor) and not isinstance(image, PIL.Image.Image):
             raise ValueError(f"`image` has to be of type `torch.Tensor` or `PIL.Image.Image` but is {type(image)}")
@@ -340,8 +336,30 @@ class RefKFDMDGeneratorPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         else:
             latents = latents.to(device=device, dtype=dtype)
 
+        cache_enabled = bool(getattr(self, "_vnccs_cache_latent_condition", False))
+        cache = getattr(self, "_vnccs_latent_condition_cache", None)
+        cache_key = None
+
         # 5.3 Prepare video_condition tensor (optimized: 1 real frame + 8 zero frames = 9 frames -> 3 latents)
         image = image.unsqueeze(2)  # (b, c, 1, h, w)
+
+        if cache_enabled and cache is not None:
+            image_cpu = image.detach().to("cpu", dtype=torch.float16).contiguous()
+            cache_digest = hashlib.sha1(image_cpu.numpy().tobytes()).hexdigest()
+            cache_key = (
+                tuple(image_cpu.shape),
+                str(image_cpu.dtype),
+                batch_size,
+                height,
+                width,
+                num_frames,
+                latent_cond_mode,
+                str(self.vae.dtype),
+                cache_digest,
+            )
+            cached_condition = cache.get(cache_key)
+            if cached_condition is not None:
+                return latents, cached_condition.to(device=latents.device, dtype=latents.dtype)
 
         # 5.4 Prepare normalization params
         latents_mean = (
@@ -397,6 +415,8 @@ class RefKFDMDGeneratorPipeline(DiffusionPipeline, WanLoraLoaderMixin):
 
         # 5.9 Concatenate mask and latent_condition
         result = torch.concat([mask_lat_size, latent_condition], dim=1)
+        if cache_key is not None:
+            cache[cache_key] = result.detach().to("cpu")
 
         return latents, result
 
@@ -536,8 +556,9 @@ class RefKFDMDGeneratorPipeline(DiffusionPipeline, WanLoraLoaderMixin):
 
         # 5. Prepare latent variables 31% 4.5-4.8s -> 0.5s -> 0.1s (next version)
         num_channels_latents = self.vae.config.z_dim
-        image = self.video_processor.preprocess(image, height=height, width=width).to(device, dtype=torch.float32)
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=True):
+        latent_dtype = self.vae.dtype
+        image = self.video_processor.preprocess(image, height=height, width=width).to(device, dtype=latent_dtype)
+        with torch.no_grad(), torch.autocast("cuda", dtype=latent_dtype, enabled=True):
             latents, condition = self.prepare_latents(
                 image,
                 batch_size * num_videos_per_prompt,
@@ -545,7 +566,7 @@ class RefKFDMDGeneratorPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                 height,
                 width,
                 num_frames,
-                torch.float32,
+                latent_dtype,
                 device,
                 generator,
                 latents,
@@ -553,7 +574,7 @@ class RefKFDMDGeneratorPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             )
 
         ### 5.5 Prepare keyframe render_latent ###
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=True):
+        with torch.no_grad(), torch.autocast("cuda", dtype=latent_dtype, enabled=True):
             # Explicitly cast to VAE weight dtype to avoid input/bias dtype mismatch under autocast
             render_video = render_video.to(dtype=self.vae.dtype)
             if render_video.shape[2] == num_frames // 4 + 1:  # process with divided 21 frames
@@ -572,7 +593,7 @@ class RefKFDMDGeneratorPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                 render_latent = (render_latent - latents_mean) * latents_std
 
         # Prepare reference_latent
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=True):
+        with torch.no_grad(), torch.autocast("cuda", dtype=latent_dtype, enabled=True):
             if reference_video is not None:
                 reference_latent = keyframe_vae_encode(self.vae, reference_video, rescale=True,
                                                        use_compile=self.vae_compile, compile_mode=self.vae_compile_mode)
@@ -603,7 +624,7 @@ class RefKFDMDGeneratorPipeline(DiffusionPipeline, WanLoraLoaderMixin):
 
                 # Only allow gradient backprop on the last step in train mode
                 if mode != "train" or (mode == "train" and i < len(timesteps) - 1):
-                    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=True):
+                    with torch.no_grad(), torch.autocast("cuda", dtype=transformer_dtype, enabled=True):
                         noise_pred = self.transformer(
                             hidden_states=latent_model_input,
                             render_latent=render_latent,
@@ -622,7 +643,7 @@ class RefKFDMDGeneratorPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                             camera_qt_ref=camera_qt_ref,
                         )[0]
                 else:
-                    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=True):
+                    with torch.autocast("cuda", dtype=transformer_dtype, enabled=True):
                         noise_pred = self.transformer(
                             hidden_states=latent_model_input,
                             render_latent=render_latent,
@@ -666,14 +687,14 @@ class RefKFDMDGeneratorPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         # 7. decode latent 2.5% 0.38s
         if not output_type == "latent":
             latents = latents.to(self.vae.dtype)
-            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=True):
+            with torch.no_grad(), torch.autocast("cuda", dtype=latent_dtype, enabled=True):
                 video = keyframe_vae_decode(self.vae, latents, rescale=True)  # (b, c, f, h, w)
             video = self.video_processor.postprocess_video(video, output_type=output_type)
         else:
             video = latents
 
         # Offload all models
-        # self.maybe_free_model_hooks()
+        self.maybe_free_model_hooks()
 
         if not return_dict:
             return (video,)

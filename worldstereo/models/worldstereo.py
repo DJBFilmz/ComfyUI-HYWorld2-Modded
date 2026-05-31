@@ -59,6 +59,50 @@ class MaskCamEmbed(nn.Module):
         return add_embeds
 
 
+def _align_controlnet_add_inputs(
+        add_inputs: torch.Tensor,
+        controlnet_inputs: torch.Tensor,
+        post_patch_height: int,
+        post_patch_width: int,
+) -> torch.Tensor:
+    if add_inputs.shape[1] == controlnet_inputs.shape[1]:
+        return add_inputs
+
+    add_tokens = add_inputs.shape[1]
+    control_tokens = controlnet_inputs.shape[1]
+    spatial_tokens = int(post_patch_height) * int(post_patch_width)
+
+    if spatial_tokens > 0 and add_tokens % spatial_tokens == 0 and control_tokens % spatial_tokens == 0:
+        add_frames = add_tokens // spatial_tokens
+        control_frames = control_tokens // spatial_tokens
+        if add_frames > 0 and control_frames > 0:
+            if control_frames == 1:
+                frame_indices = torch.zeros(1, dtype=torch.long, device=add_inputs.device)
+            else:
+                frame_indices = torch.linspace(
+                    0,
+                    add_frames - 1,
+                    control_frames,
+                    device=add_inputs.device,
+                ).round().long().clamp(0, add_frames - 1)
+            return (
+                add_inputs
+                .reshape(add_inputs.shape[0], add_frames, spatial_tokens, add_inputs.shape[2])
+                .index_select(1, frame_indices)
+                .reshape(add_inputs.shape[0], control_tokens, add_inputs.shape[2])
+            )
+
+    ratio = add_tokens / control_tokens
+    if abs(ratio - round(ratio)) < 1e-6:
+        return add_inputs[:, ::int(round(ratio)), :]
+
+    raise RuntimeError(
+        "ControlNet conditioning token mismatch: "
+        f"controlnet={controlnet_inputs.shape}, add_inputs={add_inputs.shape}, "
+        f"post_patch_spatial={spatial_tokens}"
+    )
+
+
 class WorldStereoModel(WanTransformer3DModel):
     r"""
     A Transformer model for video-like data used in the Wan model.
@@ -120,9 +164,11 @@ class WorldStereoModel(WanTransformer3DModel):
                 self.in_channels, self.controlnet_cfg.conv_out_dim, kernel_size=self.patch_size, stride=self.patch_size
             )
             self.controlnet.controlnet_mask_embedding = MaskCamEmbed(self.controlnet_cfg)
-            # copy weight to controlnet patch embedding
-            self.controlnet.controlnet_patch_embedding.weight.data.copy_(self.patch_embedding.weight.data.clone())
-            self.controlnet.controlnet_patch_embedding.bias.data.copy_(self.patch_embedding.bias.data.clone())
+            # copy weight to controlnet patch embedding unless we are building
+            # an empty meta model for streaming checkpoint load.
+            if not self.patch_embedding.weight.is_meta:
+                self.controlnet.controlnet_patch_embedding.weight.data.copy_(self.patch_embedding.weight.data.clone())
+                self.controlnet.controlnet_patch_embedding.bias.data.copy_(self.patch_embedding.bias.data.clone())
         else:
             # Hardcoded for backward compatibility with open-source uni3c
             self.controlnet_patch_embedding = nn.Conv3d(
@@ -216,6 +262,12 @@ class WorldStereoModel(WanTransformer3DModel):
             else:
                 add_inputs = render_mask
             add_inputs = self.controlnet.controlnet_mask_embedding(add_inputs)
+            add_inputs = _align_controlnet_add_inputs(
+                add_inputs,
+                controlnet_inputs,
+                post_patch_height,
+                post_patch_width,
+            )
             controlnet_inputs = controlnet_inputs + add_inputs
             ### process controlnet inputs over ###
         else:
@@ -428,9 +480,11 @@ class WorldStereoRefSModel(WanTransformer3DModel):
                 self.in_channels, self.controlnet_cfg.conv_out_dim, kernel_size=self.patch_size, stride=self.patch_size
             )
             self.controlnet.controlnet_mask_embedding = MaskCamEmbed(self.controlnet_cfg)
-            # copy weight to controlnet patch embedding
-            self.controlnet.controlnet_patch_embedding.weight.data.copy_(self.patch_embedding.weight.data.clone())
-            self.controlnet.controlnet_patch_embedding.bias.data.copy_(self.patch_embedding.bias.data.clone())
+            # copy weight to controlnet patch embedding unless we are building
+            # an empty meta model for streaming checkpoint load.
+            if not self.patch_embedding.weight.is_meta:
+                self.controlnet.controlnet_patch_embedding.weight.data.copy_(self.patch_embedding.weight.data.clone())
+                self.controlnet.controlnet_patch_embedding.bias.data.copy_(self.patch_embedding.bias.data.clone())
 
         else:
             # Hardcoded for backward compatibility with open-source uni3c
@@ -538,14 +592,13 @@ class WorldStereoRefSModel(WanTransformer3DModel):
             else:
                 add_inputs = render_mask
 
-            # ── Patched to keyframe-slice mask & camera embeds if mask_downsample is 1 ──
-            if self.controlnet_cfg.get("mask_downsample", 4) == 1:
-                F_latent = render_latent.shape[2]
-                F_pixel = add_inputs.shape[2]
-                if F_pixel != F_latent:
-                    add_inputs = add_inputs[:, :, ::4]
-
             add_inputs = self.controlnet.controlnet_mask_embedding(add_inputs)
+            add_inputs = _align_controlnet_add_inputs(
+                add_inputs,
+                controlnet_inputs,
+                post_patch_height,
+                post_patch_width,
+            )
             controlnet_inputs = controlnet_inputs + add_inputs
             ### process controlnet inputs over ###
         else:

@@ -163,6 +163,159 @@ def _resize_depth_prior(depth_prior, target_size, expected_count):
     return torch.stack(depth_list).unsqueeze(0)
 
 
+def _align_tensor_sequence_to_count(tensor, target_count, label):
+    if not isinstance(tensor, torch.Tensor) or target_count <= 0:
+        return tensor
+    seq_dim = None
+    seq_count = None
+    if tensor.dim() >= 4 and tensor.shape[0] == 1 and tensor.shape[1] != target_count:
+        seq_dim = 1
+        seq_count = tensor.shape[1]
+    elif tensor.dim() >= 1 and tensor.shape[0] != target_count:
+        seq_dim = 0
+        seq_count = tensor.shape[0]
+    if seq_dim is None or seq_count is None or seq_count <= 0 or seq_count == target_count:
+        return tensor
+    raise RuntimeError(
+        f"WorldMirror V2 received {target_count} images but {seq_count} {label}. "
+        "Upstream nodes must provide one camera pose/intrinsic per image; refusing to guess camera alignment."
+    )
+
+
+def _align_camera_priors_to_image_count(images, camera_poses, camera_intrinsics):
+    if isinstance(images, torch.Tensor):
+        target_count = int(images.shape[0])
+    else:
+        try:
+            target_count = len(images)
+        except Exception:
+            target_count = 0
+    return (
+        _align_tensor_sequence_to_count(camera_poses, target_count, "camera_poses"),
+        _align_tensor_sequence_to_count(camera_intrinsics, target_count, "camera_intrinsics"),
+    )
+
+
+def _extract_pose_tensor(value):
+    if not isinstance(value, torch.Tensor):
+        return None
+    poses = value.detach().cpu().float()
+    if poses.dim() == 4 and poses.shape[0] == 1:
+        poses = poses[0]
+    if poses.dim() == 3 and poses.shape[-2:] == (4, 4):
+        return poses
+    return None
+
+
+def _rescale_input_pose_translation_to_prediction(input_poses, predicted_poses, eps=1e-6):
+    poses = _extract_pose_tensor(input_poses)
+    pred = _extract_pose_tensor(predicted_poses)
+    if poses is None or pred is None or poses.shape[0] != pred.shape[0]:
+        return poses if poses is not None else input_poses
+
+    out = poses.clone()
+    input_t = poses[:, :3, 3]
+    pred_t = pred[:, :3, 3]
+    input_norm = input_t.norm(dim=1)
+
+    starts = [0]
+    for i in range(1, poses.shape[0]):
+        if input_norm[i] <= eps:
+            starts.append(i)
+    starts = sorted(set(starts))
+
+    changed = 0
+    ratios = []
+    for start_idx, end_idx in zip(starts, starts[1:] + [poses.shape[0]]):
+        if end_idx - start_idx <= 1:
+            continue
+        base_input = input_t[start_idx]
+        base_pred = pred_t[start_idx]
+        rel_input = input_t[start_idx:end_idx] - base_input
+        rel_pred = pred_t[start_idx:end_idx] - base_pred
+        rel_input_norm = rel_input.norm(dim=1)
+        rel_pred_norm = rel_pred.norm(dim=1)
+        valid = rel_input_norm > eps
+        if not bool(valid.any()):
+            continue
+        scale = torch.ones_like(rel_input_norm)
+        scale[valid] = rel_pred_norm[valid] / rel_input_norm[valid].clamp_min(eps)
+        out[start_idx:end_idx, :3, 3] = base_input + rel_input * scale[:, None]
+        changed += int(valid.sum().item())
+        ratios.extend(scale[valid].tolist())
+
+    if changed > 0 and ratios:
+        ratios_t = torch.tensor(ratios, dtype=torch.float32)
+        print(
+            "[V2 EXP] Calibrated input camera translation scale from predicted motion: "
+            f"frames={changed}, median={ratios_t.median().item():.4f}, "
+            f"min={ratios_t.min().item():.4f}, max={ratios_t.max().item():.4f}"
+        )
+    return out
+
+
+def _suppress_generated_surfaces_seen_by_anchors(
+    pts,
+    depth_hi,
+    poses,
+    intrs,
+    anchor_frames,
+    abs_tol=0.035,
+    rel_tol=0.035,
+):
+    if pts.dim() != 4 or depth_hi.dim() != 3 or poses.shape[0] != pts.shape[0]:
+        return torch.ones(depth_hi.shape, dtype=torch.bool)
+
+    S, H, W, _ = pts.shape
+    if anchor_frames.shape[0] != S or not bool(anchor_frames.any()) or not bool((~anchor_frames).any()):
+        return torch.ones((S, H, W), dtype=torch.bool)
+
+    keep = torch.ones((S, H, W), dtype=torch.bool)
+    anchor_ids = torch.where(anchor_frames)[0]
+    generated_ids = torch.where(~anchor_frames)[0]
+    total_generated = int(generated_ids.numel() * H * W)
+    suppressed = 0
+
+    for gen_id_t in generated_ids:
+        gen_id = int(gen_id_t.item())
+        points = pts[gen_id].reshape(-1, 3).float()
+        covered = torch.zeros(points.shape[0], dtype=torch.bool)
+
+        for anchor_id_t in anchor_ids:
+            anchor_id = int(anchor_id_t.item())
+            R = poses[anchor_id, :3, :3].float()
+            t = poses[anchor_id, :3, 3].float()
+            cam = (points - t) @ R
+            z = cam[:, 2]
+            valid = z > 1e-6
+            if not bool(valid.any()):
+                continue
+
+            K = intrs[anchor_id].float()
+            u = torch.round(cam[:, 0] * K[0, 0] / z.clamp_min(1e-6) + K[0, 2]).long()
+            v = torch.round(cam[:, 1] * K[1, 1] / z.clamp_min(1e-6) + K[1, 2]).long()
+            valid = valid & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+            if not bool(valid.any()):
+                continue
+
+            valid_ids = torch.where(valid)[0]
+            anchor_depth = depth_hi[anchor_id, v[valid_ids], u[valid_ids]].float()
+            tol = float(abs_tol) + float(rel_tol) * anchor_depth.abs()
+            same_or_in_front = z[valid_ids] <= anchor_depth + tol
+            covered[valid_ids[same_or_in_front]] = True
+
+        frame_keep = ~covered.reshape(H, W)
+        keep[gen_id] = frame_keep
+        suppressed += int(covered.sum().item())
+
+    if suppressed > 0:
+        print(
+            "[V2 EXP] Suppressed low-res stereo splats already covered by high-res anchors: "
+            f"{suppressed}/{total_generated} ({100.0 * suppressed / max(total_generated, 1):.2f}%)"
+        )
+    return keep
+
+
 def _apply_mask_to_splats(splats, mask_np):
     if splats is None or mask_np is None:
         return splats
@@ -213,6 +366,7 @@ def _voxel_prune_splats_dict(splats, voxel_size):
         scales = get_item("scales").detach().cpu()
         quats = get_item("quats").detach().cpu()
         opacities = get_item("opacities").detach().cpu().reshape(-1)
+        opacity_max = opacities.max().detach().clone() if opacities.numel() else torch.tensor(1.0)
         colors = get_item(color_key).detach().cpu()
         if colors.dim() == 3 and colors.shape[1] == 1:
             colors_for_prune = colors[:, 0, :]
@@ -228,6 +382,7 @@ def _voxel_prune_splats_dict(splats, voxel_size):
         means, scales, quats, colors_new, opacities = _voxel_prune_gaussians(
             means, scales, quats, colors_for_prune, opacities, weights, voxel_size=voxel_size
         )
+        opacities = opacities.clamp_max(opacity_max)
         pruned["means"].append(means)
         pruned["scales"].append(scales)
         pruned["quats"].append(quats)
@@ -879,7 +1034,13 @@ class VNCCS_WorldMirrorV2_3D:
 
         # ── 1. Preprocess: ComfyUI IMAGE [B,H,W,C] → tensor [1,S,3,H,W] ─────
         B = images.shape[0]
+        camera_poses, camera_intrinsics = _align_camera_priors_to_image_count(
+            images,
+            camera_poses,
+            camera_intrinsics,
+        )
         tensor_list = []
+        adjusted_intrinsics = camera_intrinsics.clone().float() if isinstance(camera_intrinsics, torch.Tensor) else None
 
         for i in range(B):
             img_np  = (images[i].cpu().numpy()[..., :3] * 255).astype(np.uint8)
@@ -887,26 +1048,31 @@ class VNCCS_WorldMirrorV2_3D:
 
             t, orig_w, orig_h, new_w, new_h = _resize_to_tensor(pil_img, target_size)
 
+            if adjusted_intrinsics is not None:
+                sx, sy = new_w / orig_w, new_h / orig_h
+                adjusted_intrinsics[i, 0, 0] *= sx
+                adjusted_intrinsics[i, 1, 1] *= sy
+                adjusted_intrinsics[i, 0, 2] *= sx
+                adjusted_intrinsics[i, 1, 2] *= sy
+
             # centre-crop height if it exceeds target_size
             if new_h > target_size:
                 crop = (new_h - target_size) // 2
                 t = t[:, crop:crop + target_size, :]
-                if camera_intrinsics is not None:
-                    camera_intrinsics = camera_intrinsics.clone()
-                    camera_intrinsics[i, 1, 2] -= crop
+                if adjusted_intrinsics is not None:
+                    adjusted_intrinsics[i, 1, 2] -= crop
 
-            # scale intrinsics to match resized resolution
-            if camera_intrinsics is not None:
-                camera_intrinsics = camera_intrinsics.clone()
-                sx, sy = new_w / orig_w, new_h / orig_h
-                camera_intrinsics[i, 0, 0] *= sx
-                camera_intrinsics[i, 1, 1] *= sy
-                camera_intrinsics[i, 0, 2] *= sx
-                camera_intrinsics[i, 1, 2] *= sy
+            # centre-crop width if a future resize strategy ever exceeds target_size
+            if new_w > target_size:
+                crop = (new_w - target_size) // 2
+                t = t[:, :, crop:crop + target_size]
+                if adjusted_intrinsics is not None:
+                    adjusted_intrinsics[i, 0, 2] -= crop
 
             tensor_list.append(t)
 
         imgs_tensor = torch.stack(tensor_list).unsqueeze(0).to(exec_dev)  # [1,S,3,H,W]
+        camera_intrinsics = adjusted_intrinsics
 
         # ── 2. Build views dict + cond_flags ──────────────────────────────────
         views      = {"img": imgs_tensor}
@@ -1509,12 +1675,28 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
             align_corners=False,
         )[:, 0]
 
-        poses = camera_poses.detach().cpu().float()
+        predicted_poses = raw.get("camera_poses")
+        if predicted_poses is None and len(output) > 3:
+            predicted_poses = output[3]
+        poses = _rescale_input_pose_translation_to_prediction(camera_poses, predicted_poses)
         intrs = highres_intrs.detach().cpu().float()
         pts, _, _ = depth_to_world_coords_points(depth_hi, poses, intrs)
-        means = pts.reshape(1, S * H * W, 3)
-        sh = ((highres_imgs.permute(0, 1, 3, 4, 2).reshape(1, S * H * W, 3) - 0.5) / 0.28209479177387814).float()
-        depth_flat = depth_hi.reshape(1, S * H * W)
+        pose_t = poses[:, :3, 3]
+        anchor_frames = pose_t.norm(dim=1) <= 1e-5
+        keep_mask = _suppress_generated_surfaces_seen_by_anchors(
+            pts,
+            depth_hi,
+            poses,
+            intrs,
+            anchor_frames,
+        )
+        keep_flat = keep_mask.reshape(-1)
+        pts_flat = pts.reshape(S * H * W, 3)[keep_flat]
+        rgb_flat = highres_imgs.permute(0, 1, 3, 4, 2).reshape(S * H * W, 3)[keep_flat]
+        depth_flat_values = depth_hi.reshape(S * H * W)[keep_flat]
+        means = pts_flat.unsqueeze(0)
+        sh = ((rgb_flat.unsqueeze(0) - 0.5) / 0.28209479177387814).float()
+        depth_flat = depth_flat_values.unsqueeze(0)
 
         def depth_adaptive_scales():
             d_min = depth_flat.min()
@@ -1540,7 +1722,7 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
                 float(splat_scale),
                 float(splat_scale) * float(depth_scale_max),
             )
-            return scales_hw.reshape(1, S * H * W, 1).expand_as(means).float()
+            return scales_hw.reshape(S * H * W, 1)[keep_flat].unsqueeze(0).expand_as(means).float()
 
         if scale_mode == "hybrid_adaptive":
             scales_depth, multiplier = depth_adaptive_scales()
@@ -1569,6 +1751,19 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
         opacities = torch.full((1, means.shape[1]), float(splat_opacity), dtype=torch.float32)
         quats = torch.zeros((1, means.shape[1], 4), dtype=torch.float32)
         quats[..., 0] = 1.0
+        weights = torch.ones((1, means.shape[1]), dtype=torch.float32)
+        if bool(anchor_frames.any()) and bool((~anchor_frames).any()):
+            anchor_weight = 64.0
+            frame_weights = torch.where(
+                anchor_frames,
+                torch.full_like(pose_t[:, 0], anchor_weight),
+                torch.ones_like(pose_t[:, 0]),
+            )
+            weights = frame_weights[:, None].expand(S, H * W).reshape(S * H * W)[keep_flat].unsqueeze(0).float()
+            print(
+                "[V2 EXP] High-res anchor splat priority enabled: "
+                f"anchors={int(anchor_frames.sum().item())}/{S}, weight={anchor_weight:g}"
+            )
 
         splats = {
             "means": means,
@@ -1576,6 +1771,7 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
             "quats": quats,
             "opacities": opacities,
             "sh": sh[:, :, None, :],
+            "weights": weights,
         }
         n_before = means.shape[1]
         if voxel_prune:
@@ -1639,6 +1835,12 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
         splat_upsample_cap_far_bias=1.75,
         **kwargs,
     ):
+        kwargs = dict(kwargs)
+        kwargs["camera_poses"], kwargs["camera_intrinsics"] = _align_camera_priors_to_image_count(
+            images,
+            kwargs.get("camera_poses"),
+            kwargs.get("camera_intrinsics"),
+        )
         output = super().run_inference(model, images, use_gsplat=use_gsplat, **kwargs)
         if splat_upsample_mode == "depth_backproject":
             output = self._build_upsampled_splats(

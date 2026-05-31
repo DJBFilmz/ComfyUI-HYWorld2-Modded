@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import html
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -280,14 +281,9 @@ class KFPCDControllerPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         image_embeds=None,
         callback_on_step_end_tensor_inputs=None,
     ):
-        if image is not None and image_embeds is not None:
+        if image is None:
             raise ValueError(
-                f"Cannot forward both `image`: {image} and `image_embeds`: {image_embeds}. Please make sure to"
-                " only forward one of the two."
-            )
-        if image is None and image_embeds is None:
-            raise ValueError(
-                "Provide either `image` or `prompt_embeds`. Cannot leave both `image` and `image_embeds` undefined."
+                "`image` is required for VAE conditioning. `image_embeds` may be provided to skip CLIP encoding."
             )
         if image is not None and not isinstance(image, torch.Tensor) and not isinstance(image, PIL.Image.Image):
             raise ValueError(f"`image` has to be of type `torch.Tensor` or `PIL.Image.Image` but is {type(image)}")
@@ -355,8 +351,30 @@ class KFPCDControllerPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         else:
             latents = latents.to(device=device, dtype=dtype)
 
+        cache_enabled = bool(getattr(self, "_vnccs_cache_latent_condition", False))
+        cache = getattr(self, "_vnccs_latent_condition_cache", None)
+        cache_key = None
+
         # 5.3 Prepare video_condition tensor
         image = image.unsqueeze(2)  # (b, c, 1, h, w)
+
+        if cache_enabled and cache is not None:
+            image_cpu = image.detach().to("cpu", dtype=torch.float16).contiguous()
+            cache_digest = hashlib.sha1(image_cpu.numpy().tobytes()).hexdigest()
+            cache_key = (
+                tuple(image_cpu.shape),
+                str(image_cpu.dtype),
+                batch_size,
+                height,
+                width,
+                num_frames,
+                latent_cond_mode,
+                str(self.vae.dtype),
+                cache_digest,
+            )
+            cached_condition = cache.get(cache_key)
+            if cached_condition is not None:
+                return latents, cached_condition.to(device=latents.device, dtype=latents.dtype)
 
         # 5.4 Prepare normalization parameters
         latents_mean = (
@@ -411,7 +429,10 @@ class KFPCDControllerPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         mask_lat_size[:, :, 0, :, :] = 1.0
 
         # 5.9 Concatenate mask and latent_condition
-        return latents, torch.concat([mask_lat_size, latent_condition], dim=1)
+        condition = torch.concat([mask_lat_size, latent_condition], dim=1)
+        if cache_key is not None:
+            cache[cache_key] = condition.detach().to("cpu")
+        return latents, condition
 
     @property
     def guidance_scale(self):
@@ -614,7 +635,8 @@ class KFPCDControllerPipeline(DiffusionPipeline, WanLoraLoaderMixin):
 
         # 5. Prepare latent variables
         num_channels_latents = self.vae.config.z_dim
-        image = self.video_processor.preprocess(image, height=height, width=width).to(device, dtype=torch.float32)
+        latent_dtype = self.vae.dtype
+        image = self.video_processor.preprocess(image, height=height, width=width).to(device, dtype=latent_dtype)
         latents, condition = self.prepare_latents(
             image,
             batch_size * num_videos_per_prompt,
@@ -622,7 +644,7 @@ class KFPCDControllerPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             height,
             width,
             num_frames,
-            torch.float32,
+            latent_dtype,
             device,
             generator,
             latents,

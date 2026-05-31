@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.4.0
+
+### Added
+
+- Added WorldStereoLight model loading with two selectable light INT4 checkpoints from `MIUProject/VNCCS_WorldStereoLight`.
+- Added automatic on-demand downloading for the selected WorldStereoLight checkpoint and metadata.
+- Added streaming single-transformer WorldStereo checkpoint loading, including experimental packed INT4 linear support.
+- Added bundled WorldStereo workflows for the base-model path and the new WorldStereoLight path.
+- Added SeedVR2 upscaling support for WorldStereo output frames.
+- Added additional WorldStereo camera trajectory presets and frame handling options.
+- Added VAE memory mode controls and conditioning cache support for lower-memory WorldStereo generation.
+- Added PyTorch3D installation/build improvements, including a bundled Windows CUDA 13.0 wheel.
+
+### Changed
+
+- Updated the package version to `1.4.0`.
+- Reworked the former `Load WorldStereo Single Model` node into `Load WorldStereoLight Model`.
+- Simplified the WorldStereoLight loader UI by removing manual model type, precision, and turbo LoRA controls; these are now inferred from checkpoint metadata.
+- Updated WorldStereo model loading to better support large local checkpoints, CPU/offload loading paths, and metadata-driven runtime setup.
+- Improved WorldStereo pipeline input preparation, image handling, conditioning-frame alignment, and reusable embedding caches.
+- Improved WorldStereo ControlNet conditioning token handling and latent-frame alignment.
+- Improved CUDA toolkit discovery and native extension build diagnostics in the gsplat/PyTorch3D helper script.
+- Updated workflows to use the new WorldStereo model-loading paths.
+
+### Fixed
+
+- Fixed WorldStereo mask conditioning alignment when mask downsampling is disabled.
+- Fixed ControlNet input alignment issues in WorldStereo models and pipelines.
+- Fixed first-frame/source-frame handling for WorldMirror sequence preparation from WorldStereo outputs.
+- Fixed several WorldStereo import, local-model, and optional dependency edge cases around heavy runtime components.
+
 ## 1.3.0
 
 ### Added
