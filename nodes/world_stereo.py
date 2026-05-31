@@ -1797,6 +1797,52 @@ def _free_pipeline_offload_hooks(pipeline, context: str):
         print(f"[WorldStereo] Offload hook cleanup skipped after {context} ({type(e).__name__}: {e})")
 
 
+def _configure_vae_memory_mode(pipeline, mode: str, width: int, height: int) -> str:
+    vae = getattr(pipeline, "vae", None)
+    if vae is None:
+        return "none"
+
+    if mode == "auto":
+        mode = "tiled+sliced" if int(width) * int(height) >= 768 * 480 else "off"
+
+    if mode == "off":
+        for method_name in ("disable_tiling", "disable_slicing"):
+            method = getattr(vae, method_name, None)
+            if callable(method):
+                try:
+                    method()
+                except Exception as e:
+                    print(f"[WorldStereo] VAE {method_name} skipped ({type(e).__name__}: {e})")
+        return "off"
+
+    enabled = []
+    if "tiled" in mode:
+        method = getattr(vae, "enable_tiling", None)
+        if callable(method):
+            try:
+                method()
+                enabled.append("tiled")
+            except Exception as e:
+                print(f"[WorldStereo] VAE enable_tiling skipped ({type(e).__name__}: {e})")
+        else:
+            print("[WorldStereo] VAE tiling not available in this diffusers AutoencoderKLWan.")
+
+    if "sliced" in mode:
+        method = getattr(vae, "enable_slicing", None)
+        if callable(method):
+            try:
+                method()
+                enabled.append("sliced")
+            except Exception as e:
+                print(f"[WorldStereo] VAE enable_slicing skipped ({type(e).__name__}: {e})")
+        else:
+            print("[WorldStereo] VAE slicing not available in this diffusers AutoencoderKLWan.")
+
+    actual = "+".join(enabled) if enabled else "off"
+    print(f"[WorldStereo] VAE memory mode: requested={mode}, active={actual}")
+    return actual
+
+
 def _encode_prompt_cache(
     pipeline,
     prompt: str,
@@ -1963,6 +2009,18 @@ class VNCCS_WorldStereoGenerate:
                     "default": True,
                     "tooltip": "Cache T5 prompt embeds, CLIP image embeds, and VAE latent conditioning across slices.",
                 }),
+                "latent_condition_mode": (["auto", "full_vae", "first_frame_only"], {
+                    "default": "auto",
+                    "tooltip": "auto uses first_frame_only at high resolutions to reduce VAE encode VRAM.",
+                }),
+                "render_vae_mode": (["auto", "full", "keyframes"], {
+                    "default": "auto",
+                    "tooltip": "auto encodes keyframe render conditioning at high resolutions to reduce VAE encode VRAM.",
+                }),
+                "vae_memory_mode": (["auto", "off", "tiled", "sliced", "tiled+sliced"], {
+                    "default": "auto",
+                    "tooltip": "Enable diffusers VAE tiling/slicing when available to reduce high-resolution VAE VRAM.",
+                }),
                 "crop_generated_edges": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Crop generated borders from every output frame and adjust intrinsics.",
@@ -1998,6 +2056,9 @@ class VNCCS_WorldStereoGenerate:
         seed=-1,
         negative_prompt="",
         cache_conditioning=True,
+        latent_condition_mode="auto",
+        render_vae_mode="auto",
+        vae_memory_mode="auto",
         crop_generated_edges=False,
         edge_crop_percent=8.0,
         base_camera_poses=None,
@@ -2016,6 +2077,16 @@ class VNCCS_WorldStereoGenerate:
         H     = trajectory["height"]
         N     = c2ws.shape[0]
         trajectory_preset = trajectory.get("preset", "")
+        high_res_pixels = int(W) * int(H)
+        if latent_condition_mode == "auto":
+            latent_condition_mode = "first_frame_only" if high_res_pixels >= 768 * 480 else "full_vae"
+        if render_vae_mode == "auto":
+            render_vae_mode = "keyframes" if high_res_pixels >= 768 * 480 else "full"
+        print(
+            f"[WorldStereo] VAE conditioning modes: latent_condition={latent_condition_mode}, "
+            f"render_vae={render_vae_mode}"
+        )
+        _configure_vae_memory_mode(pipeline, vae_memory_mode, W, H)
 
         if num_inference_steps == 0:
             num_inference_steps = 4 if has_turbo_lora or "dmd" in model_type else 20
@@ -2176,12 +2247,27 @@ class VNCCS_WorldStereoGenerate:
             with torch.autocast(autocast_device, dtype=_worldstereo_half_dtype()):
                 if device == "cuda":
                     pipeline_inputs = _move_pipeline_inputs(pipeline_inputs, device)
+                if render_vae_mode == "keyframes":
+                    render_video = pipeline_inputs.get("render_video")
+                    if isinstance(render_video, torch.Tensor) and render_video.shape[2] != (N // 4 + 1):
+                        pipeline_inputs["render_video"] = render_video[:, :, ::4].contiguous()
+                        render_mask = pipeline_inputs.get("render_mask")
+                        if isinstance(render_mask, torch.Tensor) and render_mask.shape[2] == render_video.shape[2]:
+                            pipeline_inputs["render_mask"] = render_mask[:, :, ::4].contiguous()
+                        camera_embedding = pipeline_inputs.get("camera_embedding")
+                        if isinstance(camera_embedding, torch.Tensor) and camera_embedding.shape[2] == render_video.shape[2]:
+                            pipeline_inputs["camera_embedding"] = camera_embedding[:, :, ::4].contiguous()
+                        print(
+                            "[WorldStereo] Render VAE conditioning sliced to keyframes: "
+                            f"{render_video.shape[2]} -> {pipeline_inputs['render_video'].shape[2]}"
+                        )
                 pipeline_kwargs = {
                     **pipeline_inputs,
                     "num_inference_steps": num_inference_steps,
                     "guidance_scale": guidance_scale,
                     "generator": generator,
                     "output_type": "pt",
+                    "latent_cond_mode": latent_condition_mode,
                 }
                 if cache_conditioning:
                     pipeline_kwargs.update({

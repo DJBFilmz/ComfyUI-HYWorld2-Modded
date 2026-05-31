@@ -217,15 +217,16 @@ class WorldStereoModel(WanTransformer3DModel):
                 add_inputs = torch.cat([render_mask, camera_embedding], dim=1)
             else:
                 add_inputs = render_mask
-            # If mask_downsample is disabled, mask/camera conditioning arrives
-            # at pixel-frame rate while render_latent is already at keyframe
-            # latent rate. Match the latent frame count before projection.
-            if self.controlnet_cfg.get("mask_downsample", 4) == 1:
-                F_latent = render_latent.shape[2]
-                F_pixel = add_inputs.shape[2]
-                if F_pixel != F_latent:
-                    add_inputs = add_inputs[:, :, ::4]
             add_inputs = self.controlnet.controlnet_mask_embedding(add_inputs)
+            if add_inputs.shape[1] != controlnet_inputs.shape[1]:
+                ratio = add_inputs.shape[1] / controlnet_inputs.shape[1]
+                if abs(ratio - round(ratio)) < 1e-6:
+                    add_inputs = add_inputs[:, ::int(round(ratio)), :]
+                else:
+                    raise RuntimeError(
+                        "ControlNet conditioning token mismatch: "
+                        f"controlnet={controlnet_inputs.shape}, add_inputs={add_inputs.shape}"
+                    )
             controlnet_inputs = controlnet_inputs + add_inputs
             ### process controlnet inputs over ###
         else:
@@ -550,14 +551,16 @@ class WorldStereoRefSModel(WanTransformer3DModel):
             else:
                 add_inputs = render_mask
 
-            # ── Patched to keyframe-slice mask & camera embeds if mask_downsample is 1 ──
-            if self.controlnet_cfg.get("mask_downsample", 4) == 1:
-                F_latent = render_latent.shape[2]
-                F_pixel = add_inputs.shape[2]
-                if F_pixel != F_latent:
-                    add_inputs = add_inputs[:, :, ::4]
-
             add_inputs = self.controlnet.controlnet_mask_embedding(add_inputs)
+            if add_inputs.shape[1] != controlnet_inputs.shape[1]:
+                ratio = add_inputs.shape[1] / controlnet_inputs.shape[1]
+                if abs(ratio - round(ratio)) < 1e-6:
+                    add_inputs = add_inputs[:, ::int(round(ratio)), :]
+                else:
+                    raise RuntimeError(
+                        "ControlNet conditioning token mismatch: "
+                        f"controlnet={controlnet_inputs.shape}, add_inputs={add_inputs.shape}"
+                    )
             controlnet_inputs = controlnet_inputs + add_inputs
             ### process controlnet inputs over ###
         else:
