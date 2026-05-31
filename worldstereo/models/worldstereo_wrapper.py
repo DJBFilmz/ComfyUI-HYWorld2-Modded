@@ -36,6 +36,8 @@ os.environ["DIFFUSERS_VERBOSITY"] = "error"
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
+from safetensors import safe_open
 from diffusers.models import AutoencoderKLWan
 from diffusers.schedulers import UniPCMultistepScheduler
 from omegaconf import OmegaConf
@@ -98,6 +100,45 @@ _DIFFUSERS_VAE_LOAD_KWARGS = {
     "low_cpu_mem_usage": False,
 }
 
+_HYWORLD2_SINGLE_FORMAT = "hyworld2_worldstereo_single_transformer_v1"
+
+
+class _Int4Linear(torch.nn.Module):
+    """Experimental packed int4 Linear. Dequantizes on each forward."""
+
+    def __init__(self, in_features: int, out_features: int, bias: bool, group_size: int, device=None):
+        super().__init__()
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.group_size = int(group_size)
+        padded_in = ((self.in_features + self.group_size - 1) // self.group_size) * self.group_size
+        self.register_buffer("weight_packed", torch.empty((self.out_features, padded_in // 2), dtype=torch.uint8, device=device))
+        self.register_buffer(
+            "weight_scale",
+            torch.empty((self.out_features, padded_in // self.group_size), dtype=torch.float16, device=device),
+        )
+        if bias:
+            self.bias = torch.nn.Parameter(torch.empty(self.out_features, device=device))
+        else:
+            self.register_parameter("bias", None)
+
+    def _dequantize_weight(self, dtype: torch.dtype, device) -> torch.Tensor:
+        packed = self.weight_packed.to(device=device)
+        unpacked = torch.empty((packed.shape[0], packed.shape[1] * 2), dtype=torch.uint8, device=device)
+        unpacked[:, 0::2] = packed & 0x0F
+        unpacked[:, 1::2] = packed >> 4
+        unpacked = unpacked[:, : self.in_features].to(torch.float32) - 8.0
+        scales = self.weight_scale.to(device=device, dtype=torch.float32)
+        scales = scales.repeat_interleave(self.group_size, dim=1)[:, : self.in_features]
+        return (unpacked * scales).to(dtype=dtype)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        weight = self._dequantize_weight(input.dtype, input.device)
+        bias = self.bias
+        if bias is not None:
+            bias = bias.to(device=input.device, dtype=input.dtype)
+        return F.linear(input, weight, bias)
+
 
 def _load_safetensors_cpu(path: str, *, use_comfy_loader: bool = False) -> dict[str, torch.Tensor]:
     if use_comfy_loader:
@@ -138,6 +179,146 @@ def _load_safetensors_cpu(path: str, *, use_comfy_loader: bool = False) -> dict[
         )
         with open(path, "rb") as f:
             return load_safetensors_bytes(f.read())
+
+
+def _read_safetensors_metadata(path: str) -> dict[str, str]:
+    with safe_open(path, framework="pt", device="cpu") as f:
+        return dict(f.metadata() or {})
+
+
+@contextmanager
+def _empty_weights_context():
+    """Create modules on meta tensors without requiring accelerate at import time."""
+    try:
+        from accelerate import init_empty_weights
+    except Exception:
+        with torch.device("meta"):
+            yield
+    else:
+        with init_empty_weights():
+            yield
+
+
+def _assign_tensor_to_module(module: torch.nn.Module, key: str, tensor: torch.Tensor) -> None:
+    module_path, _, tensor_name = key.rpartition(".")
+    parent = module.get_submodule(module_path) if module_path else module
+
+    if tensor_name in parent._parameters:
+        old_param = parent._parameters[tensor_name]
+        requires_grad = old_param.requires_grad if old_param is not None else False
+        parent._parameters[tensor_name] = torch.nn.Parameter(tensor, requires_grad=requires_grad)
+        return
+
+    if tensor_name in parent._buffers:
+        parent._buffers[tensor_name] = tensor
+        return
+
+    raise KeyError(f"{key!r} is not a parameter or buffer in {parent.__class__.__name__}")
+
+
+def _replace_submodule(module: torch.nn.Module, module_path: str, replacement: torch.nn.Module) -> None:
+    parent_path, _, child_name = module_path.rpartition(".")
+    parent = module.get_submodule(parent_path) if parent_path else module
+    setattr(parent, child_name, replacement)
+
+
+def _floating_load_dtype(tensor: torch.Tensor, target_dtype: torch.dtype) -> torch.dtype | None:
+    if not tensor.is_floating_point():
+        return None
+    if str(tensor.dtype).startswith("torch.float8"):
+        return None
+    return target_dtype
+
+
+def _stream_safetensors_to_module(
+    module: torch.nn.Module,
+    path: str,
+    *,
+    device,
+    dtype: torch.dtype,
+) -> tuple[list[str], list[str]]:
+    expected_keys = set(module.state_dict().keys())
+    with safe_open(path, framework="pt", device="cpu") as f:
+        checkpoint_keys = set(f.keys())
+        missing_keys = sorted(expected_keys - checkpoint_keys)
+        unexpected_keys = sorted(checkpoint_keys - expected_keys)
+        if missing_keys:
+            return missing_keys, unexpected_keys
+
+        load_keys = sorted(checkpoint_keys & expected_keys)
+        total = len(load_keys)
+        for index, key in enumerate(load_keys, start=1):
+            tensor = f.get_tensor(key)
+            target_dtype = _floating_load_dtype(tensor, dtype)
+            if target_dtype is None:
+                tensor = tensor.to(device=device)
+            else:
+                tensor = tensor.to(device=device, dtype=target_dtype)
+            _assign_tensor_to_module(module, key, tensor)
+            if index == 1 or index == total or index % 250 == 0:
+                rank0_log(f"Streamed single checkpoint tensors: {index}/{total}")
+
+    return missing_keys, unexpected_keys
+
+
+def _prepare_int4_linears(module: torch.nn.Module, path: str, *, device) -> int:
+    with safe_open(path, framework="pt", device="cpu") as f:
+        packed_keys = sorted(key for key in f.keys() if key.endswith(".weight_packed"))
+        group_size = int((f.metadata() or {}).get("int4_group_size", "128"))
+
+    replaced = 0
+    for packed_key in packed_keys:
+        module_name = packed_key[: -len(".weight_packed")]
+        original = module.get_submodule(module_name)
+        if not isinstance(original, torch.nn.Linear):
+            raise TypeError(f"int4 key {packed_key!r} targets {original.__class__.__name__}, not Linear")
+        replacement = _Int4Linear(
+            original.in_features,
+            original.out_features,
+            original.bias is not None,
+            group_size,
+            device=device,
+        )
+        if original.bias is not None:
+            replacement.bias.requires_grad = original.bias.requires_grad
+        _replace_submodule(module, module_name, replacement)
+        replaced += 1
+    return replaced
+
+
+def _stream_int4_safetensors_to_module(
+    module: torch.nn.Module,
+    path: str,
+    *,
+    device,
+    dtype: torch.dtype,
+) -> tuple[list[str], list[str]]:
+    expected_keys = set(module.state_dict().keys())
+    with safe_open(path, framework="pt", device="cpu") as f:
+        checkpoint_keys = set(f.keys())
+        shape_keys = {key for key in checkpoint_keys if key.endswith(".weight_shape")}
+        load_keys = sorted((checkpoint_keys - shape_keys) & expected_keys)
+        missing_keys = sorted(expected_keys - (checkpoint_keys - shape_keys))
+        unexpected_keys = sorted((checkpoint_keys - shape_keys) - expected_keys)
+        if missing_keys:
+            return missing_keys, unexpected_keys
+
+        total = len(load_keys)
+        for index, key in enumerate(load_keys, start=1):
+            tensor = f.get_tensor(key)
+            if key.endswith(".weight_packed"):
+                tensor = tensor.to(device=device)
+            else:
+                target_dtype = _floating_load_dtype(tensor, dtype)
+                if target_dtype is None:
+                    tensor = tensor.to(device=device)
+                else:
+                    tensor = tensor.to(device=device, dtype=target_dtype)
+            _assign_tensor_to_module(module, key, tensor)
+            if index == 1 or index == total or index % 250 == 0:
+                rank0_log(f"Streamed int4 single checkpoint tensors: {index}/{total}")
+
+    return missing_keys, unexpected_keys
 
 
 @contextmanager
@@ -550,14 +731,9 @@ class WorldStereo:
             },
         )
 
-        rank0_log(f"Building transformer from single checkpoint ({model_type})… dtype={half_dtype}")
-        with _disable_diffusers_fp32_keep_modules(WorldStereoModel, WorldStereoRefSModel):
-            transformer = model_cls(**init_kwargs)
-
-        rank0_log("Building ControlNet…")
-        transformer.build_controlnet(load_uni3c=False, freeze_backbone=cfg.freeze_backbone)
-
-        if sp_world_size > 1:
+        def _configure_sequence_parallel(transformer):
+            if sp_world_size <= 1:
+                return
             transformer.sp_size = sp_world_size
             for layer in transformer.controlnet.controlnet_blocks:
                 layer.self_attn.processor.sp_size = sp_world_size
@@ -566,6 +742,78 @@ class WorldStereo:
                     block.attn1.set_processor(WanAttnProcessorSP(sp_size=sp_world_size))
                 else:
                     block.attn1.processor.sp_size = sp_world_size
+
+        try:
+            metadata = _read_safetensors_metadata(weights_path)
+        except Exception as exc:
+            metadata = {}
+            rank0_log(f"Could not read single checkpoint metadata ({type(exc).__name__}: {exc}).", "WARNING")
+
+        if metadata.get("format") == _HYWORLD2_SINGLE_FORMAT:
+            transformer = None
+            try:
+                rank0_log(
+                    f"Building empty transformer for HYWorld2 streaming single checkpoint "
+                    f"({model_type})… dtype={half_dtype}, device={device}"
+                )
+                with _empty_weights_context(), _disable_diffusers_fp32_keep_modules(WorldStereoModel, WorldStereoRefSModel):
+                    transformer = model_cls(**init_kwargs)
+                    rank0_log("Building empty ControlNet…")
+                    transformer.build_controlnet(load_uni3c=False, freeze_backbone=cfg.freeze_backbone)
+
+                if metadata.get("precision") == "int4":
+                    replaced = _prepare_int4_linears(transformer, weights_path, device=device)
+                    rank0_log(f"Prepared experimental int4 Linear modules: {replaced}")
+
+                _configure_sequence_parallel(transformer)
+
+                if metadata.get("precision") == "int4":
+                    rank0_log(f"Streaming int4 single transformer safetensors from {weights_path}…")
+                    missing_keys, unexpected_keys = _stream_int4_safetensors_to_module(
+                        transformer,
+                        weights_path,
+                        device=device,
+                        dtype=half_dtype,
+                    )
+                else:
+                    rank0_log(f"Streaming single transformer safetensors from {weights_path}…")
+                    missing_keys, unexpected_keys = _stream_safetensors_to_module(
+                        transformer,
+                        weights_path,
+                        device=device,
+                        dtype=half_dtype,
+                    )
+                if missing_keys:
+                    raise RuntimeError(
+                        f"Streaming single checkpoint is missing {len(missing_keys)} tensor(s); "
+                        f"first missing key: {missing_keys[0]}"
+                    )
+                if unexpected_keys:
+                    rank0_log(f"Single checkpoint unexpected keys: {len(unexpected_keys)}", "WARNING")
+
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return transformer.eval()
+            except Exception as exc:
+                rank0_log(
+                    f"HYWorld2 streaming single loader failed ({type(exc).__name__}: {exc}); "
+                    "falling back to standard state_dict loading.",
+                    "WARNING",
+                )
+                del transformer
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        rank0_log(f"Building transformer from single checkpoint ({model_type})… dtype={half_dtype}")
+        with _disable_diffusers_fp32_keep_modules(WorldStereoModel, WorldStereoRefSModel):
+            transformer = model_cls(**init_kwargs)
+
+        rank0_log("Building ControlNet…")
+        transformer.build_controlnet(load_uni3c=False, freeze_backbone=cfg.freeze_backbone)
+
+        _configure_sequence_parallel(transformer)
 
         rank0_log(f"Loading single transformer safetensors from {weights_path}…")
         weights = _load_safetensors_cpu(weights_path, use_comfy_loader=True)

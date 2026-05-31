@@ -17,6 +17,7 @@ dependencies = [
     "omegaconf",
     "plyfile",
     "trimesh",
+    "gsplat",
     "einops",
     "jaxtyping",
     "typeguard",

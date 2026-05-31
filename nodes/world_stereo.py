@@ -379,10 +379,12 @@ def _fallback_get_points3d_and_colors(K, w2cs, depth, image, device, contract=8.
     image = image.to(torch_device).float()
     if depth.shape[1] == 3:
         depth = depth[:, 0:1]
-    if depth.max() == 0 or (~torch.isfinite(depth)).any():
-        raise RuntimeError("Invalid depth map for fallback point rendering.")
+    depth = torch.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
 
     valid_depth = depth[depth > 0]
+    if valid_depth.numel() == 0:
+        raise RuntimeError("Invalid depth map for fallback point rendering: no positive valid depth values.")
+
     mid_depth = torch.median(valid_depth.reshape(-1), dim=0)[0] * contract
     depth = depth.clone()
     far = depth > mid_depth
@@ -768,6 +770,16 @@ def _apply_worldstereo_turbo_lora(pipeline, lora_name: str, lora_strength: float
     return lora_path
 
 
+def _normalize_worldstereo_offload_mode(offload_mode: str, precision: str, prefix: str = "[WorldStereo]") -> str:
+    if precision == "fp8" and offload_mode == "sequential_cpu_offload":
+        print(
+            f"{prefix} fp8 quanto tensors are incompatible with accelerate sequential_cpu_offload; "
+            "using model_cpu_offload instead."
+        )
+        return "model_cpu_offload"
+    return offload_mode
+
+
 def _worldstereo_half_dtype() -> torch.dtype:
     if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
         return torch.bfloat16
@@ -782,17 +794,35 @@ def _move_module_to_half(module, dtype: torch.dtype):
     return module
 
 
-def _apply_worldstereo_precision(pipeline, precision: str):
+def _metadata_lora_matches(metadata_turbo_lora: str, metadata_lora_strength: str | None, lora_name: str, lora_strength: float) -> bool:
+    if not metadata_turbo_lora or metadata_turbo_lora == "none" or lora_name == "none":
+        return False
+    if metadata_turbo_lora != lora_name:
+        return False
+    try:
+        return abs(float(metadata_lora_strength or 1.0) - float(lora_strength)) < 1e-6
+    except (TypeError, ValueError):
+        return False
+
+
+def _apply_worldstereo_precision(pipeline, precision: str, *, skip_transformer: bool = False):
     """Apply non-fp32 precision to every heavy WorldStereo module."""
     half_dtype = _worldstereo_half_dtype()
     module_names = ("text_encoder", "image_encoder", "transformer", "vae")
+    if skip_transformer:
+        module_names = tuple(name for name in module_names if name != "transformer")
 
     for name in module_names:
         _move_module_to_half(getattr(pipeline, name, None), half_dtype)
 
     if precision == "bf16":
-        print(f"[WorldStereo] bf16/fp16 runtime dtype applied: {half_dtype}")
+        suffix = " (transformer preserved from checkpoint)" if skip_transformer else ""
+        print(f"[WorldStereo] bf16/fp16 runtime dtype applied: {half_dtype}{suffix}")
         return "bf16"
+
+    if precision == "int4" and skip_transformer:
+        print(f"[WorldStereo] bf16/fp16 runtime dtype applied to aux modules: {half_dtype} (int4 transformer preserved)")
+        return "int4"
 
     if precision != "fp8":
         raise ValueError(f"Unsupported precision: {precision!r}")
@@ -800,6 +830,9 @@ def _apply_worldstereo_precision(pipeline, precision: str):
     try:
         from optimum.quanto import freeze, qfloat8_e4m3fn, quantize
     except ImportError:
+        if skip_transformer:
+            print("[WorldStereo] optimum-quanto not installed; preserving checkpoint transformer precision")
+            return "fp8"
         print("[WorldStereo] optimum-quanto not installed; falling back to bf16/fp16 weights")
         return "bf16"
 
@@ -821,6 +854,8 @@ def _apply_worldstereo_precision(pipeline, precision: str):
         print(f"[WorldStereo] fp8 weight quantization applied: {', '.join(quantized)}")
     if skipped:
         print(f"[WorldStereo] fp8 unavailable for: {', '.join(skipped)}; kept at {half_dtype}")
+    if skip_transformer:
+        return "fp8"
     return "fp8" if quantized else "bf16"
 
 
@@ -852,6 +887,51 @@ def _tensor_state_dict_for_safetensors(module):
         if isinstance(value, torch.Tensor):
             state[key] = value.detach().cpu().contiguous()
     return state
+
+
+def _pack_int4_weight(weight: torch.Tensor, group_size: int = 128):
+    weight = weight.detach().cpu().to(torch.float32).contiguous()
+    if weight.ndim != 2:
+        raise ValueError(f"int4 packing expects 2D linear weights, got {tuple(weight.shape)}")
+
+    out_features, in_features = weight.shape
+    pad = (-in_features) % group_size
+    if pad:
+        weight = torch.nn.functional.pad(weight, (0, pad))
+    padded_in = weight.shape[1]
+
+    grouped = weight.view(out_features, padded_in // group_size, group_size)
+    scale = grouped.abs().amax(dim=2).clamp(min=1e-8) / 7.0
+    quant = torch.round(grouped / scale.unsqueeze(-1)).clamp(-8, 7).to(torch.int16) + 8
+    quant = quant.to(torch.uint8).view(out_features, padded_in)
+    packed = quant[:, 0::2] | (quant[:, 1::2] << 4)
+    shape = torch.tensor([out_features, in_features], dtype=torch.int64)
+    return packed.contiguous(), scale.to(torch.float16).contiguous(), shape
+
+
+def _int4_state_dict_for_safetensors(module, group_size: int = 128):
+    state = {}
+    linear_weight_keys = set()
+    packed_params = 0
+    packed_bytes = 0
+
+    for module_name, child in module.named_modules():
+        if isinstance(child, torch.nn.Linear):
+            key = f"{module_name}.weight" if module_name else "weight"
+            linear_weight_keys.add(key)
+            packed, scale, shape = _pack_int4_weight(child.weight, group_size=group_size)
+            state[f"{key}_packed"] = packed
+            state[f"{key}_scale"] = scale
+            state[f"{key}_shape"] = shape
+            packed_params += child.weight.numel()
+            packed_bytes += packed.numel() * packed.element_size() + scale.numel() * scale.element_size()
+
+    for key, value in module.state_dict().items():
+        if not isinstance(value, torch.Tensor) or key in linear_weight_keys:
+            continue
+        state[key] = value.detach().cpu().contiguous()
+
+    return state, packed_params, packed_bytes, len(linear_weight_keys)
 
 
 def _resolve_worldstereo_export_paths(export_path: str, model_type: str, precision: str, turbo_lora: str):
@@ -1301,6 +1381,7 @@ class VNCCS_LoadWorldStereoModel:
 
         turbo_lora_path = _apply_worldstereo_turbo_lora(pipeline, turbo_lora, lora_strength)
         precision = _apply_worldstereo_precision(pipeline, precision)
+        offload_mode = _normalize_worldstereo_offload_mode(offload_mode, precision)
 
         # ── Apply offloading ──────────────────────────────────────────────────
         if device == "cuda":
@@ -1366,9 +1447,9 @@ class VNCCS_LoadWorldStereoSingleModel:
                     "default": "auto",
                     "tooltip": "auto reads model_type from safetensors metadata, then falls back to worldstereo-camera.",
                 }),
-                "precision": (["fp8", "bf16"], {
-                    "default": "fp8",
-                    "tooltip": "fp8 quantizes supported modules after loading; bf16 keeps half precision.",
+                "precision": (["auto", "bf16", "fp8", "int4"], {
+                    "default": "auto",
+                    "tooltip": "auto honors exported checkpoint precision; int4 is only supported for int4 exported checkpoints.",
                 }),
                 "turbo_lora": (list(WORLDSTEREO_TURBO_LORAS.keys()), {
                     "default": "none",
@@ -1394,7 +1475,7 @@ class VNCCS_LoadWorldStereoSingleModel:
         self,
         single_model_path,
         model_type="auto",
-        precision="fp8",
+        precision="auto",
         turbo_lora="none",
         lora_strength=1.0,
         offload_mode="sequential_cpu_offload",
@@ -1413,19 +1494,46 @@ class VNCCS_LoadWorldStereoSingleModel:
 
         metadata = _read_safetensors_metadata(single_model_path)
         metadata_model_type = metadata.get("model_type")
+        metadata_precision = metadata.get("precision")
         if model_type == "auto":
             model_type = metadata_model_type or "worldstereo-camera"
+        if precision == "auto":
+            precision = metadata_precision or "bf16"
         if metadata_model_type and metadata_model_type != model_type:
             print(
                 f"[WorldStereo Single Warning] metadata model_type={metadata_model_type}, "
                 f"but node model_type={model_type}"
             )
+        if metadata_precision and metadata_precision != precision:
+            print(
+                f"[WorldStereo Single Warning] checkpoint precision={metadata_precision}, "
+                f"but node precision={precision}; extra conversion may be required."
+            )
         metadata_turbo_lora = metadata.get("turbo_lora", "none")
-        if metadata_turbo_lora and metadata_turbo_lora != "none" and turbo_lora != "none":
+        metadata_lora_strength = metadata.get("lora_strength")
+        checkpoint_has_requested_lora = _metadata_lora_matches(
+            metadata_turbo_lora,
+            metadata_lora_strength,
+            turbo_lora,
+            lora_strength,
+        )
+        if checkpoint_has_requested_lora:
+            print(
+                f"[WorldStereo Single] Checkpoint already has fused turbo_lora={metadata_turbo_lora} "
+                f"(strength={metadata_lora_strength}); skipping duplicate LoRA application."
+            )
+            turbo_lora_to_apply = "none"
+        else:
+            turbo_lora_to_apply = turbo_lora
+        if metadata_turbo_lora and metadata_turbo_lora != "none" and turbo_lora_to_apply != "none":
             print(
                 f"[WorldStereo Single Warning] checkpoint already reports fused turbo_lora={metadata_turbo_lora}; "
-                f"applying another LoRA={turbo_lora}"
+                f"applying another LoRA={turbo_lora_to_apply}"
             )
+        if metadata_precision == "int4" and turbo_lora_to_apply != "none":
+            raise ValueError("int4 single checkpoints cannot apply additional LoRA after packing. Fuse LoRA during export.")
+        if metadata_precision == "int4" and precision != "int4":
+            raise ValueError("int4 single checkpoints must be loaded with precision=auto or precision=int4.")
 
         transformer_dir, base_model_dir, moge_dir = _download_worldstereo_single_loader_components(model_type)
         transformer_dir = transformer_dir.replace("\\", "/")
@@ -1457,14 +1565,26 @@ class VNCCS_LoadWorldStereoSingleModel:
             )
         pipeline = worldstereo.pipeline
 
-        turbo_lora_path = _apply_worldstereo_turbo_lora(pipeline, turbo_lora, lora_strength)
-        precision = _apply_worldstereo_precision(pipeline, precision)
+        turbo_lora_path = _apply_worldstereo_turbo_lora(pipeline, turbo_lora_to_apply, lora_strength)
+        checkpoint_transformer_ready = (
+            metadata.get("format") == "hyworld2_worldstereo_single_transformer_v1"
+            and metadata_precision == precision
+            and turbo_lora_to_apply == "none"
+        )
+        precision = _apply_worldstereo_precision(
+            pipeline,
+            precision,
+            skip_transformer=checkpoint_transformer_ready,
+        )
+        offload_mode = _normalize_worldstereo_offload_mode(offload_mode, precision, prefix="[WorldStereo Single]")
 
         if device == "cuda":
             if offload_mode == "model_cpu_offload":
+                print("[WorldStereo Single] Enabling model_cpu_offload ...")
                 pipeline.enable_model_cpu_offload()
                 print("[WorldStereo Single] model_cpu_offload enabled")
             elif offload_mode == "sequential_cpu_offload":
+                print("[WorldStereo Single] Enabling sequential_cpu_offload ...")
                 pipeline.enable_sequential_cpu_offload()
                 print("[WorldStereo Single] sequential_cpu_offload enabled")
             elif offload_mode == "none":
@@ -1537,20 +1657,34 @@ def _prepare_pipeline_inputs(
     torch_device = torch.device(device)
     moge_model = moge_model.to(torch_device)
     infer_dtype = _worldstereo_half_dtype()
-    with torch.no_grad(), torch.autocast(device_type=torch_device.type, dtype=infer_dtype, enabled=torch_device.type in ("cuda", "cpu")):
+    with torch.no_grad(), torch.autocast(device_type=torch_device.type, dtype=infer_dtype, enabled=torch_device.type == "cuda"):
         depth_output = moge_model.infer(
-            img_tensor.unsqueeze(0).to(torch_device, dtype=infer_dtype)
+            img_tensor_01.to(torch_device)
         )
     # MoGe returns dict; extract depth as [1, 1, H, W] PyTorch tensor
     depth_raw = depth_output["depth"]
     if isinstance(depth_raw, torch.Tensor):
         depth_tensor = depth_raw.float()
-        if depth_tensor.dim() == 2:
-            depth_tensor = depth_tensor.unsqueeze(0).unsqueeze(0)
-        elif depth_tensor.dim() == 3:
-            depth_tensor = depth_tensor.unsqueeze(0)
     else:
-        depth_tensor = torch.from_numpy(depth_raw).float().unsqueeze(0).unsqueeze(0)
+        depth_tensor = torch.from_numpy(depth_raw).float()
+    if depth_tensor.dim() == 2:
+        depth_tensor = depth_tensor.unsqueeze(0).unsqueeze(0)
+    elif depth_tensor.dim() == 3:
+        depth_tensor = depth_tensor.unsqueeze(0)
+    if "mask" in depth_output:
+        mask_raw = depth_output["mask"]
+        if isinstance(mask_raw, torch.Tensor):
+            depth_mask = mask_raw.bool()
+        else:
+            depth_mask = torch.from_numpy(mask_raw).bool()
+        if depth_mask.dim() == 2:
+            depth_mask = depth_mask.unsqueeze(0).unsqueeze(0)
+        elif depth_mask.dim() == 3:
+            depth_mask = depth_mask.unsqueeze(0)
+        depth_mask = depth_mask.to(depth_tensor.device)
+        if depth_mask.shape[-2:] == depth_tensor.shape[-2:]:
+            depth_tensor = depth_tensor.masked_fill(~depth_mask, 0.0)
+    depth_tensor = torch.nan_to_num(depth_tensor, nan=0.0, posinf=0.0, neginf=0.0)
     
     moge_model.to("cpu")
     if torch.cuda.is_available():
@@ -2060,10 +2194,11 @@ class VNCCS_WorldStereoGenerate:
                         "prompt": prompt if prompt else "",
                         "negative_prompt": negative_prompt if negative_prompt else None,
                     })
-                with _pipeline_conditioning_cache(pipeline, cache_conditioning):
-                    if cache_conditioning:
-                        pipeline._vnccs_latent_condition_cache = latent_condition_cache
-                    output = pipeline(**pipeline_kwargs)
+                with _temporary_worldstereo_runtime_patches():
+                    with _pipeline_conditioning_cache(pipeline, cache_conditioning):
+                        if cache_conditioning:
+                            pipeline._vnccs_latent_condition_cache = latent_condition_cache
+                        output = pipeline(**pipeline_kwargs)
                 del pipeline_kwargs
                 del pipeline_inputs
 
@@ -2123,9 +2258,9 @@ class VNCCS_ExportWorldStereoSingleModel:
             },
             "optional": {
                 "model_type": (cls.MODEL_TYPES, {"default": "worldstereo-camera"}),
-                "precision": (["bf16", "fp8"], {
+                "precision": (["bf16", "fp8", "int4"], {
                     "default": "bf16",
-                    "tooltip": "bf16 is reload-safe. fp8 is experimental and requires a future fp8-aware single loader.",
+                    "tooltip": "int4 is experimental and packs Linear weights to 4-bit with bf16/fp16 fallbacks.",
                 }),
                 "turbo_lora": (list(WORLDSTEREO_TURBO_LORAS.keys()), {"default": "none"}),
                 "lora_strength": (
@@ -2188,20 +2323,36 @@ class VNCCS_ExportWorldStereoSingleModel:
                 f"[WorldStereo Export] Loading {model_type} for single-file export "
                 f"(precision={precision}, turbo_lora={turbo_lora}) ..."
             )
+            transformer_only = turbo_lora == "none"
+            if not transformer_only:
+                print("[WorldStereo Export] Turbo LoRA fusion requires full pipeline loading.")
             worldstereo = WorldStereo.from_pretrained(
                 os.path.dirname(transformer_dir),
                 subfolder=model_type,
                 device=device,
                 model_device=device,
-                transformer_only=True,
+                transformer_only=transformer_only,
             )
 
         pipeline = worldstereo.pipeline
         turbo_lora_path = _apply_worldstereo_turbo_lora(pipeline, turbo_lora, lora_strength)
-        actual_precision = _apply_worldstereo_transformer_export_precision(pipeline, precision)
+        export_precision = "bf16" if precision == "int4" else precision
+        actual_precision = _apply_worldstereo_transformer_export_precision(pipeline, export_precision)
 
         transformer = pipeline.transformer
-        state = _tensor_state_dict_for_safetensors(transformer)
+        int4_group_size = 128
+        if precision == "int4":
+            print(f"[WorldStereo Export] Packing Linear weights to int4 (group_size={int4_group_size}) ...")
+            state, int4_params, int4_bytes, int4_modules = _int4_state_dict_for_safetensors(
+                transformer,
+                group_size=int4_group_size,
+            )
+            actual_precision = "int4"
+        else:
+            state = _tensor_state_dict_for_safetensors(transformer)
+            int4_params = 0
+            int4_bytes = 0
+            int4_modules = 0
         total_params = sum(t.numel() for t in state.values())
         total_bytes = sum(t.numel() * t.element_size() for t in state.values())
         dtype_summary = {}
@@ -2212,6 +2363,13 @@ class VNCCS_ExportWorldStereoSingleModel:
             "format": "hyworld2_worldstereo_single_transformer_v1",
             "model_type": model_type,
             "precision": actual_precision,
+            "runtime_dtype": str(_worldstereo_half_dtype()),
+            "transformer_prepared": "true",
+            "recommended_loader_precision": "auto",
+            "int4_group_size": str(int4_group_size if precision == "int4" else 0),
+            "int4_linear_modules": str(int4_modules),
+            "int4_packed_params": str(int4_params),
+            "int4_packed_bytes": str(int4_bytes),
             "turbo_lora": turbo_lora,
             "lora_strength": str(float(lora_strength)),
             "turbo_lora_path": turbo_lora_path or "",

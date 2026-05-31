@@ -14,9 +14,40 @@ def on_rm_error(func, path, exc_info):
     else:
         raise
 
-def run_command(cmd, cwd=None, env=None, check=True):
+def _print_log_hint(log_path: Path):
+    print(f"[INFO] Full command log saved to: {log_path}")
+
+
+def run_command(cmd, cwd=None, env=None, check=True, log_path: Path | None = None):
     print(f"[RUN] {cmd}")
     sys.stdout.flush()
+    if log_path is not None:
+        log_path = Path(log_path)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("w", encoding="utf-8", errors="replace") as log_file:
+            process = subprocess.Popen(
+                cmd,
+                shell=True,
+                cwd=cwd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="replace",
+                bufsize=1,
+            )
+            assert process.stdout is not None
+            for line in process.stdout:
+                print(line, end="")
+                log_file.write(line)
+            return_code = process.wait()
+        _print_log_hint(log_path)
+        if return_code != 0:
+            print(f"[ERROR] Command failed with error code {return_code}")
+            print(f"[ERROR] Inspect the full log above, especially the first 'FAILED:' block: {log_path}")
+            if check:
+                sys.exit(1)
+        return return_code
     try:
         if check:
             subprocess.check_call(cmd, shell=True, cwd=cwd, env=env)
@@ -110,6 +141,14 @@ def apply_cuda_home_to_env(env: dict, cuda_home: Path | None):
     return env
 
 
+def add_python_scripts_to_env(env: dict):
+    env = env.copy()
+    scripts_dir = Path(sys.executable).resolve().parent / "Scripts"
+    if scripts_dir.exists():
+        env["PATH"] = str(scripts_dir) + os.pathsep + env.get("PATH", "")
+    return env
+
+
 def nvcc_version_from_env(env=None):
     try:
         output = subprocess.check_output(
@@ -159,14 +198,14 @@ def get_portable_msvc_activator(msvc_dir: Path):
     return vcvars[0] if vcvars else None
 
 
-def run_with_optional_msvc(command: str, *, cwd=None, env=None, use_portable_msvc=False, msvc_dir: Path | None = None, check=True):
+def run_with_optional_msvc(command: str, *, cwd=None, env=None, use_portable_msvc=False, msvc_dir: Path | None = None, check=True, log_path: Path | None = None):
     if use_portable_msvc:
         activator = get_portable_msvc_activator(msvc_dir)
         if activator is None:
             print("[ERROR] Compiler setup failed.")
             sys.exit(1)
         command = f'"{activator}" && {command}'
-    return run_command(command, cwd=cwd, env=env, check=check)
+    return run_command(command, cwd=cwd, env=env, check=check, log_path=log_path)
 
 
 GSPLAT_SMOKE_TEST = r'''
@@ -238,6 +277,66 @@ def verify_pytorch3d():
         return False
 
 
+def patch_pytorch3d_source_for_cuda13(source_dir: Path):
+    setup_path = source_dir / "setup.py"
+    ext_path = source_dir / "pytorch3d" / "csrc" / "ext.cpp"
+    if not setup_path.exists() or not ext_path.exists():
+        raise FileNotFoundError(f"Unexpected PyTorch3D source layout: {source_dir}")
+
+    setup_text = setup_path.read_text(encoding="utf-8")
+    if "PYTORCH3D_DISABLE_PULSAR" not in setup_text:
+        setup_text = setup_text.replace(
+            '    source_cuda = glob.glob(os.path.join(extensions_dir, "**", "*.cu"), recursive=True)\n',
+            '    source_cuda = glob.glob(os.path.join(extensions_dir, "**", "*.cu"), recursive=True)\n'
+            '    disable_pulsar = os.getenv("PYTORCH3D_DISABLE_PULSAR", "0") == "1"\n'
+            '    if disable_pulsar:\n'
+            '        print("HYWorld2: building PyTorch3D with Pulsar disabled for CUDA 13 compatibility.")\n'
+            '        is_pulsar = lambda s: "/pulsar/" in s.replace("\\\\", "/")\n'
+            '        sources = [s for s in sources if not is_pulsar(s)]\n'
+            '        source_cuda = [s for s in source_cuda if not is_pulsar(s)]\n',
+        )
+    if '("PYTORCH3D_DISABLE_PULSAR", None)' not in setup_text:
+        setup_text = setup_text.replace(
+            '        define_macros += [("WITH_CUDA", None)]\n',
+            '        define_macros += [("WITH_CUDA", None)]\n'
+            '        if disable_pulsar:\n'
+            '            define_macros += [("PYTORCH3D_DISABLE_PULSAR", None)]\n',
+        )
+    if "PYTORCH3D_DISABLE_PULSAR" not in setup_text:
+        raise RuntimeError("Could not patch PyTorch3D setup.py to disable Pulsar.")
+    setup_path.write_text(setup_text, encoding="utf-8")
+
+    ext_text = ext_path.read_text(encoding="utf-8")
+    if "PYTORCH3D_DISABLE_PULSAR" not in ext_text:
+        ext_text = ext_text.replace(
+            "#if !defined(USE_ROCM)",
+            "#if !defined(USE_ROCM) && !defined(PYTORCH3D_DISABLE_PULSAR)",
+        )
+        ext_path.write_text(ext_text, encoding="utf-8")
+
+
+def prepare_pytorch3d_source(script_dir: Path):
+    source_dir = Path(
+        os.environ.get(
+            "HYWORLD2_PYTORCH3D_BUILD_DIR",
+            str(Path(tempfile.gettempdir()) / "hyworld2_pytorch3d_build"),
+        )
+    )
+    if not (source_dir / ".git").exists():
+        if source_dir.exists():
+            shutil.rmtree(source_dir, onerror=on_rm_error)
+        print("[INFO] Cloning PyTorch3D source...")
+        run_command(f'git clone --depth 1 --branch stable https://github.com/facebookresearch/pytorch3d.git "{source_dir}"')
+    else:
+        print("[INFO] PyTorch3D source cache found; refreshing stable branch...")
+        run_command("git fetch --depth 1 origin stable", cwd=str(source_dir))
+        run_command("git checkout -B hyworld2-stable FETCH_HEAD", cwd=str(source_dir))
+
+    print(f"[INFO] PyTorch3D source/build directory: {source_dir}")
+    patch_pytorch3d_source_for_cuda13(source_dir)
+    return source_dir
+
+
 def install_pytorch3d(use_portable_msvc=False, msvc_dir: Path | None = None, cuda_home: Path | None = None):
     print("\n==================================================")
     print("   PyTorch3D Installer")
@@ -246,9 +345,17 @@ def install_pytorch3d(use_portable_msvc=False, msvc_dir: Path | None = None, cud
     if verify_pytorch3d():
         return
 
-    env = apply_cuda_home_to_env(os.environ.copy(), cuda_home)
+    env = add_python_scripts_to_env(apply_cuda_home_to_env(os.environ.copy(), cuda_home))
     env.setdefault("FORCE_CUDA", "1")
     env.setdefault("PYTORCH3D_NO_NINJA", "0")
+    env.setdefault("PYTORCH3D_DISABLE_PULSAR", "1")
+    env.setdefault("MAX_JOBS", "4")
+    script_dir = Path(__file__).parent.resolve()
+    torch_extensions_dir = script_dir / "torch_extensions"
+    torch_extensions_dir.mkdir(exist_ok=True)
+    env.setdefault("TORCH_EXTENSIONS_DIR", str(torch_extensions_dir))
+    if cuda_home is not None and (cuda_home / "include" / "cub").exists():
+        env.setdefault("CUB_HOME", str(cuda_home / "include"))
     existing_nvcc_flags = env.get("NVCC_FLAGS", "")
     if "-allow-unsupported-compiler" not in existing_nvcc_flags:
         env["NVCC_FLAGS"] = f"{existing_nvcc_flags} -allow-unsupported-compiler".strip()
@@ -269,16 +376,21 @@ def install_pytorch3d(use_portable_msvc=False, msvc_dir: Path | None = None, cud
         print("[INFO] Installing ninja build tool...")
         run_command(f"{sys.executable} -m pip install ninja")
 
+    source_dir = prepare_pytorch3d_source(script_dir)
+    log_path = script_dir / "logs" / "pytorch3d_build.log"
+    print(f"[INFO] PyTorch3D build log will be written to: {log_path}")
     cmd = (
         f'{sys.executable} -m pip install '
-        f'--no-build-isolation '
-        f'"git+https://github.com/facebookresearch/pytorch3d.git@stable"'
+        f'--no-build-isolation -v '
+        f'"{source_dir}"'
     )
     run_with_optional_msvc(
         cmd,
+        cwd=str(source_dir),
         env=env,
         use_portable_msvc=use_portable_msvc,
         msvc_dir=msvc_dir,
+        log_path=log_path,
     )
 
     verify_pytorch3d()
@@ -297,6 +409,15 @@ def build_gsplat():
         print("[ERROR] CUDA not found! gsplat requires a CUDA-enabled PyTorch.")
         sys.exit(1)
     print(f"[OK] PyTorch CUDA: {cuda_ver}")
+
+    print("\n[INFO] Checking existing gsplat installation before installing/building anything...")
+    existing_gsplat_usable = verify_install(require_smoke=True)
+    if existing_gsplat_usable:
+        print("[OK] Existing gsplat installation is usable.")
+        if verify_pytorch3d():
+            print("[OK] Existing pytorch3d installation is usable.")
+            return
+        print("[INFO] pytorch3d is missing; compiler setup will be prepared only for PyTorch3D.")
 
     script_dir = Path(__file__).parent.resolve()
     repo_root = script_dir.parent
@@ -337,6 +458,11 @@ def build_gsplat():
         except:
             print("[ERROR] Failed to download compiler. Please install Visual Studio Build Tools manually.")
             sys.exit(1)
+
+    if existing_gsplat_usable:
+        print("[INFO] Skipping gsplat install/build because the existing installation passed verification.")
+        install_pytorch3d(use_portable_msvc=use_portable_msvc, msvc_dir=msvc_dir, cuda_home=cuda_home)
+        return
 
     if install_pypi_gsplat(use_portable_msvc=use_portable_msvc, msvc_dir=msvc_dir):
         install_pytorch3d(use_portable_msvc=use_portable_msvc, msvc_dir=msvc_dir, cuda_home=cuda_home)

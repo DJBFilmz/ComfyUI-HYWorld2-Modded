@@ -120,9 +120,11 @@ class WorldStereoModel(WanTransformer3DModel):
                 self.in_channels, self.controlnet_cfg.conv_out_dim, kernel_size=self.patch_size, stride=self.patch_size
             )
             self.controlnet.controlnet_mask_embedding = MaskCamEmbed(self.controlnet_cfg)
-            # copy weight to controlnet patch embedding
-            self.controlnet.controlnet_patch_embedding.weight.data.copy_(self.patch_embedding.weight.data.clone())
-            self.controlnet.controlnet_patch_embedding.bias.data.copy_(self.patch_embedding.bias.data.clone())
+            # copy weight to controlnet patch embedding unless we are building
+            # an empty meta model for streaming checkpoint load.
+            if not self.patch_embedding.weight.is_meta:
+                self.controlnet.controlnet_patch_embedding.weight.data.copy_(self.patch_embedding.weight.data.clone())
+                self.controlnet.controlnet_patch_embedding.bias.data.copy_(self.patch_embedding.bias.data.clone())
         else:
             # Hardcoded for backward compatibility with open-source uni3c
             self.controlnet_patch_embedding = nn.Conv3d(
@@ -428,9 +430,11 @@ class WorldStereoRefSModel(WanTransformer3DModel):
                 self.in_channels, self.controlnet_cfg.conv_out_dim, kernel_size=self.patch_size, stride=self.patch_size
             )
             self.controlnet.controlnet_mask_embedding = MaskCamEmbed(self.controlnet_cfg)
-            # copy weight to controlnet patch embedding
-            self.controlnet.controlnet_patch_embedding.weight.data.copy_(self.patch_embedding.weight.data.clone())
-            self.controlnet.controlnet_patch_embedding.bias.data.copy_(self.patch_embedding.bias.data.clone())
+            # copy weight to controlnet patch embedding unless we are building
+            # an empty meta model for streaming checkpoint load.
+            if not self.patch_embedding.weight.is_meta:
+                self.controlnet.controlnet_patch_embedding.weight.data.copy_(self.patch_embedding.weight.data.clone())
+                self.controlnet.controlnet_patch_embedding.bias.data.copy_(self.patch_embedding.bias.data.clone())
 
         else:
             # Hardcoded for backward compatibility with open-source uni3c

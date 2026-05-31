@@ -13,6 +13,7 @@ huggingface_hub
 safetensors
 
 # 3D / PLY
+gsplat
 plyfile
 trimesh
 open3d>=0.18.0
