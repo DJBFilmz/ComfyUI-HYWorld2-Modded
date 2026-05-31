@@ -1637,10 +1637,12 @@ def _prepare_pipeline_inputs(
     try:
         from src.pointcloud import get_points3d_and_colors, point_rendering
         use_pytorch3d_renderer = True
-    except ImportError as e:
-        if "pytorch3d" not in str(e).lower():
+    except Exception as e:
+        import traceback
+        details = f"{type(e).__name__}: {e}\n{traceback.format_exc()}".lower()
+        if "pytorch3d" not in details and "max_uint" not in details:
             raise
-        print("[WorldStereo] PyTorch3D not available; using torch fallback point renderer.")
+        print(f"[WorldStereo] PyTorch3D renderer unavailable ({type(e).__name__}: {e}); using torch fallback point renderer.")
         get_points3d_and_colors = _fallback_get_points3d_and_colors
         point_rendering = _fallback_point_rendering
         use_pytorch3d_renderer = False

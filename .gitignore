@@ -120,3 +120,5 @@ scripts/gsplat_build/
 scripts/dist/
 scripts/portable_msvc/
 gsplat/*.whl
+!gsplat/gsplat-*.whl
+!gsplat/pytorch3d-*.whl

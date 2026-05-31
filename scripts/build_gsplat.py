@@ -269,17 +269,113 @@ def install_pypi_gsplat(use_portable_msvc=False, msvc_dir: Path | None = None):
 def verify_pytorch3d():
     try:
         import pytorch3d
+        from pytorch3d.renderer import PointsRasterizer, PointsRenderer, look_at_rotation
+        from pytorch3d.structures import Pointclouds
+        assert PointsRasterizer and PointsRenderer and look_at_rotation and Pointclouds
         version = getattr(pytorch3d, "__version__", "unknown")
-        print(f"[OK] pytorch3d {version} is importable.")
+        print(f"[OK] pytorch3d {version} renderer imports are usable.")
         return True
     except Exception as e:
         print(f"[INFO] pytorch3d is not importable yet: {e}")
         return False
 
 
+def _version_digits(version: str):
+    return "".join(ch for ch in version.split("+")[0] if ch.isdigit())
+
+
+def pytorch3d_wheel_label():
+    py_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    pt_tag = f"pt{_version_digits(torch.__version__)}"
+    cuda_ver = get_cuda_version() or "cpu"
+    cu_tag = "cpu" if cuda_ver == "cpu" else f"cu{''.join(cuda_ver.split('.')[:2])}"
+    return f"{pt_tag}.{cu_tag}.{py_tag}.nopulsar"
+
+
+def label_pytorch3d_wheel(wheel_path: Path, wheels_dir: Path):
+    label = pytorch3d_wheel_label()
+    stem = wheel_path.name[:-4]
+    if label in stem:
+        return wheel_path
+
+    parts = stem.rsplit("-", 3)
+    if len(parts) != 4:
+        return wheel_path
+    package_and_version, py_tag, abi_tag, platform_tag = parts
+    name_parts = package_and_version.split("-", 1)
+    if len(name_parts) != 2:
+        return wheel_path
+    package, version = name_parts
+    version = version.split("+", 1)[0]
+    labeled = wheels_dir / f"{package}-{version}+{label}-{py_tag}-{abi_tag}-{platform_tag}.whl"
+    if labeled.exists():
+        labeled.unlink()
+    wheel_path.replace(labeled)
+    print(f"[INFO] Labeled PyTorch3D wheel: {labeled.name}")
+    return labeled
+
+
+def clean_invalid_pytorch3d_wheels(wheels_dir: Path):
+    for wheel_path in wheels_dir.glob("pytorch3d-*+pt*-cu*-cp*-nopulsar-*.whl"):
+        print(f"[INFO] Removing invalid legacy PyTorch3D wheel filename: {wheel_path.name}")
+        try:
+            wheel_path.unlink()
+        except OSError as e:
+            print(f"[WARN] Could not remove invalid wheel {wheel_path}: {e}")
+
+
+def is_compatible_pytorch3d_wheel(wheel_path: Path):
+    name = wheel_path.name
+    label = pytorch3d_wheel_label()
+    py_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    if not name.startswith("pytorch3d-") or not name.endswith(".whl"):
+        return False
+    if f"+{label}-" not in name:
+        return False
+    if f"-{py_tag}-{py_tag}-" not in name:
+        return False
+    if "win_amd64" not in name and os.name == "nt":
+        return False
+    return True
+
+
+def find_local_pytorch3d_wheels(script_dir: Path):
+    repo_root = script_dir.parent
+    search_dirs = [
+        repo_root / "gsplat",
+        script_dir / "wheels",
+    ]
+    candidates = []
+    for directory in search_dirs:
+        if directory.exists():
+            candidates.extend(directory.glob("pytorch3d-*.whl"))
+    return sorted(candidates, key=os.path.getmtime, reverse=True)
+
+
+def install_local_pytorch3d_wheel(script_dir: Path, use_portable_msvc=False, msvc_dir: Path | None = None):
+    for wheel_path in find_local_pytorch3d_wheels(script_dir):
+        if not is_compatible_pytorch3d_wheel(wheel_path):
+            print(f"[INFO] Skipping incompatible PyTorch3D wheel: {wheel_path.name}")
+            continue
+        print(f"[INFO] Trying local PyTorch3D wheel: {wheel_path}")
+        cmd = f'{sys.executable} -m pip install --force-reinstall --no-deps "{wheel_path}"'
+        if run_with_optional_msvc(
+            cmd,
+            use_portable_msvc=use_portable_msvc,
+            msvc_dir=msvc_dir,
+            check=False,
+        ) == 0 and verify_pytorch3d():
+            print("[OK] Installed compatible local PyTorch3D wheel.")
+            return True
+        print(f"[WARN] Local PyTorch3D wheel did not verify: {wheel_path.name}")
+    return False
+
+
 def patch_pytorch3d_source_for_cuda13(source_dir: Path):
     setup_path = source_dir / "setup.py"
     ext_path = source_dir / "pytorch3d" / "csrc" / "ext.cpp"
+    points_init_path = source_dir / "pytorch3d" / "renderer" / "points" / "__init__.py"
+    renderer_init_path = source_dir / "pytorch3d" / "renderer" / "__init__.py"
     if not setup_path.exists() or not ext_path.exists():
         raise FileNotFoundError(f"Unexpected PyTorch3D source layout: {source_dir}")
 
@@ -314,6 +410,25 @@ def patch_pytorch3d_source_for_cuda13(source_dir: Path):
         )
         ext_path.write_text(ext_text, encoding="utf-8")
 
+    if not points_init_path.exists() or not renderer_init_path.exists():
+        raise FileNotFoundError(f"Unexpected PyTorch3D renderer layout: {source_dir}")
+
+    points_init = points_init_path.read_text(encoding="utf-8")
+    if "HYWorld2: Pulsar disabled" not in points_init:
+        points_init = points_init.replace(
+            "# Pulsar not enabled on amd.\nif not torch.version.hip:\n    from .pulsar.unified import PulsarPointsRenderer\n",
+            "# HYWorld2: Pulsar disabled for CUDA 13 compatibility.\n",
+        )
+        points_init_path.write_text(points_init, encoding="utf-8")
+
+    renderer_init = renderer_init_path.read_text(encoding="utf-8")
+    if "HYWorld2: Pulsar disabled" not in renderer_init:
+        renderer_init = renderer_init.replace(
+            "# Pulsar is not enabled on amd.\nif not torch.version.hip:\n    from .points import PulsarPointsRenderer\n",
+            "# HYWorld2: Pulsar disabled for CUDA 13 compatibility.\n",
+        )
+        renderer_init_path.write_text(renderer_init, encoding="utf-8")
+
 
 def prepare_pytorch3d_source(script_dir: Path):
     source_dir = Path(
@@ -345,12 +460,15 @@ def install_pytorch3d(use_portable_msvc=False, msvc_dir: Path | None = None, cud
     if verify_pytorch3d():
         return
 
+    script_dir = Path(__file__).parent.resolve()
+    if install_local_pytorch3d_wheel(script_dir, use_portable_msvc=use_portable_msvc, msvc_dir=msvc_dir):
+        return
+
     env = add_python_scripts_to_env(apply_cuda_home_to_env(os.environ.copy(), cuda_home))
     env.setdefault("FORCE_CUDA", "1")
     env.setdefault("PYTORCH3D_NO_NINJA", "0")
     env.setdefault("PYTORCH3D_DISABLE_PULSAR", "1")
     env.setdefault("MAX_JOBS", "4")
-    script_dir = Path(__file__).parent.resolve()
     torch_extensions_dir = script_dir / "torch_extensions"
     torch_extensions_dir.mkdir(exist_ok=True)
     env.setdefault("TORCH_EXTENSIONS_DIR", str(torch_extensions_dir))
@@ -377,20 +495,45 @@ def install_pytorch3d(use_portable_msvc=False, msvc_dir: Path | None = None, cud
         run_command(f"{sys.executable} -m pip install ninja")
 
     source_dir = prepare_pytorch3d_source(script_dir)
+    wheels_dir = script_dir / "wheels"
+    wheels_dir.mkdir(exist_ok=True)
+    clean_invalid_pytorch3d_wheels(wheels_dir)
     log_path = script_dir / "logs" / "pytorch3d_build.log"
     print(f"[INFO] PyTorch3D build log will be written to: {log_path}")
-    cmd = (
-        f'{sys.executable} -m pip install '
-        f'--no-build-isolation -v '
+    print(f"[INFO] PyTorch3D wheel will be saved to: {wheels_dir}")
+    wheel_cmd = (
+        f'{sys.executable} -m pip wheel '
+        f'--no-build-isolation -v --no-deps '
+        f'-w "{wheels_dir}" '
         f'"{source_dir}"'
     )
     run_with_optional_msvc(
-        cmd,
+        wheel_cmd,
         cwd=str(source_dir),
         env=env,
         use_portable_msvc=use_portable_msvc,
         msvc_dir=msvc_dir,
         log_path=log_path,
+    )
+
+    try:
+        wheel_path = sorted(wheels_dir.glob("pytorch3d-*.whl"), key=os.path.getmtime)[-1]
+    except IndexError:
+        print(f"[ERROR] PyTorch3D build finished but no wheel was found in {wheels_dir}")
+        sys.exit(1)
+    wheel_path = label_pytorch3d_wheel(wheel_path, wheels_dir)
+
+    print(f"[INFO] Installing cached PyTorch3D wheel: {wheel_path}")
+    install_cmd = (
+        f'{sys.executable} -m pip install '
+        f'--force-reinstall --no-deps '
+        f'"{wheel_path}"'
+    )
+    run_with_optional_msvc(
+        install_cmd,
+        env=env,
+        use_portable_msvc=use_portable_msvc,
+        msvc_dir=msvc_dir,
     )
 
     verify_pytorch3d()
