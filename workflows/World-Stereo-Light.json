@@ -1,0 +1,706 @@
+{
+  "id": "8999ccd6-bc86-47e4-9202-69becb6106ae",
+  "revision": 0,
+  "last_node_id": 27,
+  "last_link_id": 54,
+  "nodes": [
+    {
+      "id": 22,
+      "type": "VNCCS_WorldMirrorV2_3D",
+      "pos": [
+        2760,
+        6430
+      ],
+      "size": [
+        470,
+        490
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "WORLDMIRROR_MODEL",
+          "link": 41
+        },
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 45
+        },
+        {
+          "name": "camera_intrinsics",
+          "shape": 7,
+          "type": "TENSOR",
+          "link": 44
+        },
+        {
+          "name": "camera_poses",
+          "shape": 7,
+          "type": "TENSOR",
+          "link": 43
+        },
+        {
+          "name": "depth_prior",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ply_data",
+          "type": "PLY_DATA",
+          "links": [
+            47
+          ]
+        },
+        {
+          "name": "depth_maps",
+          "type": "IMAGE",
+          "links": null
+        },
+        {
+          "name": "normal_maps",
+          "type": "IMAGE",
+          "links": null
+        },
+        {
+          "name": "camera_poses",
+          "type": "TENSOR",
+          "links": [
+            48
+          ]
+        },
+        {
+          "name": "camera_intrinsics",
+          "type": "TENSOR",
+          "links": [
+            49
+          ]
+        },
+        {
+          "name": "raw_splats",
+          "type": "VNCCS_SPLAT",
+          "links": null
+        },
+        {
+          "name": "filter_mask",
+          "type": "IMAGE",
+          "links": null
+        },
+        {
+          "name": "gs_filter_mask",
+          "type": "IMAGE",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-hyworld2",
+        "ver": "0eb8ea056addabf3dffe7f4c76f40fa096fac572",
+        "Node name for S&R": "VNCCS_WorldMirrorV2_3D"
+      },
+      "widgets_values": [
+        1022,
+        "model_cpu_offload",
+        true,
+        true,
+        false,
+        0.003,
+        "depth_adaptive",
+        1,
+        3,
+        true,
+        0.0015,
+        12000000,
+        1.75
+      ]
+    },
+    {
+      "id": 26,
+      "type": "VNCCS_Equirect360ToViews",
+      "pos": [
+        1440,
+        6470
+      ],
+      "size": [
+        290,
+        220
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "panorama",
+          "type": "IMAGE",
+          "link": 50
+        }
+      ],
+      "outputs": [
+        {
+          "name": "views",
+          "type": "IMAGE",
+          "links": [
+            51
+          ]
+        },
+        {
+          "name": "intrinsics",
+          "type": "TENSOR",
+          "links": [
+            53
+          ]
+        },
+        {
+          "name": "camera_poses",
+          "type": "TENSOR",
+          "links": [
+            52
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-hyworld2",
+        "ver": "0eb8ea056addabf3dffe7f4c76f40fa096fac572",
+        "Node name for S&R": "VNCCS_Equirect360ToViews"
+      },
+      "widgets_values": [
+        90,
+        90,
+        "0, -30, 30",
+        1568,
+        true,
+        "bilinear"
+      ]
+    },
+    {
+      "id": 25,
+      "type": "LoadImage",
+      "pos": [
+        860,
+        6470
+      ],
+      "size": [
+        450,
+        330
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            50
+          ]
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "title": "Load Panorama",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.17.0",
+        "Node name for S&R": "LoadImage",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.8",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "panorama-2026-05-30T11_52_16.914Z.png",
+        "image"
+      ],
+      "color": "#2a363b",
+      "bgcolor": "#3f5159"
+    },
+    {
+      "id": 9,
+      "type": "VNCCS_CameraTrajectoryBuilder",
+      "pos": [
+        1780,
+        6610
+      ],
+      "size": [
+        400,
+        310
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "trajectory",
+          "type": "CAMERA_TRAJECTORY",
+          "links": [
+            38
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-hyworld2",
+        "ver": "0eb8ea056addabf3dffe7f4c76f40fa096fac572",
+        "Node name for S&R": "VNCCS_CameraTrajectoryBuilder"
+      },
+      "widgets_values": [
+        "forward_orbit",
+        5,
+        1,
+        0.05,
+        15,
+        1,
+        70,
+        512,
+        512,
+        "[]"
+      ]
+    },
+    {
+      "id": 27,
+      "type": "VNCCS_LoadWorldStereoLightModel",
+      "pos": [
+        1870,
+        6290
+      ],
+      "size": [
+        296.6861328125,
+        106
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "WORLDSTEREO_MODEL",
+          "links": [
+            54
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-hyworld2",
+        "ver": "0eb8ea056addabf3dffe7f4c76f40fa096fac572",
+        "Node name for S&R": "VNCCS_LoadWorldStereoLightModel"
+      },
+      "widgets_values": [
+        "Memory DMD Light INT4",
+        "sequential_cpu_offload",
+        "cuda"
+      ]
+    },
+    {
+      "id": 23,
+      "type": "VNCCS_SavePLY",
+      "pos": [
+        3240,
+        6270
+      ],
+      "size": [
+        270,
+        60
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ply_data",
+          "type": "PLY_DATA",
+          "link": 47
+        }
+      ],
+      "outputs": [
+        {
+          "name": "filepath",
+          "type": "STRING",
+          "links": [
+            42
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-hyworld2",
+        "ver": "0eb8ea056addabf3dffe7f4c76f40fa096fac572",
+        "Node name for S&R": "VNCCS_SavePLY"
+      },
+      "widgets_values": [
+        "output"
+      ]
+    },
+    {
+      "id": 21,
+      "type": "VNCCS_LoadWorldMirrorV2Model",
+      "pos": [
+        2780,
+        6270
+      ],
+      "size": [
+        310,
+        90
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "WORLDMIRROR_MODEL",
+          "links": [
+            41
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-hyworld2",
+        "ver": "0eb8ea056addabf3dffe7f4c76f40fa096fac572",
+        "Node name for S&R": "VNCCS_LoadWorldMirrorV2Model"
+      },
+      "widgets_values": [
+        "cuda",
+        "fp8"
+      ]
+    },
+    {
+      "id": 20,
+      "type": "VNCCS_WorldStereoGenerate",
+      "pos": [
+        2260,
+        6450
+      ],
+      "size": [
+        400,
+        600
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "WORLDSTEREO_MODEL",
+          "link": 54
+        },
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 51
+        },
+        {
+          "name": "trajectory",
+          "type": "CAMERA_TRAJECTORY",
+          "link": 38
+        },
+        {
+          "name": "base_camera_poses",
+          "shape": 7,
+          "type": "TENSOR",
+          "link": 52
+        },
+        {
+          "name": "base_camera_intrinsics",
+          "shape": 7,
+          "type": "TENSOR",
+          "link": 53
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video_frames",
+          "type": "IMAGE",
+          "links": [
+            45,
+            46
+          ]
+        },
+        {
+          "name": "camera_poses",
+          "type": "TENSOR",
+          "links": [
+            43
+          ]
+        },
+        {
+          "name": "camera_intrinsics",
+          "type": "TENSOR",
+          "links": [
+            44
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-hyworld2",
+        "ver": "0eb8ea056addabf3dffe7f4c76f40fa096fac572",
+        "Node name for S&R": "VNCCS_WorldStereoGenerate"
+      },
+      "widgets_values": [
+        "",
+        4,
+        1,
+        310762293,
+        "fixed",
+        "",
+        false,
+        "full_vae",
+        "full",
+        "full",
+        "tiled",
+        false,
+        "prepend_source_highres",
+        "bicubic",
+        42,
+        0,
+        0,
+        "zero_pitch_only",
+        8
+      ]
+    },
+    {
+      "id": 24,
+      "type": "VNCCS_BackgroundPreview",
+      "pos": [
+        3240,
+        6470
+      ],
+      "size": [
+        1290,
+        1110
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ply_path",
+          "shape": 7,
+          "type": "STRING",
+          "link": 42
+        },
+        {
+          "name": "camera_poses",
+          "shape": 7,
+          "type": "TENSOR",
+          "link": 48
+        },
+        {
+          "name": "camera_intrinsics",
+          "shape": 7,
+          "type": "TENSOR",
+          "link": 49
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video_path",
+          "type": "STRING",
+          "links": null
+        },
+        {
+          "name": "ply_path",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-hyworld2",
+        "ver": "0eb8ea056addabf3dffe7f4c76f40fa096fac572",
+        "Node name for S&R": "VNCCS_BackgroundPreview"
+      },
+      "widgets_values": [
+        ""
+      ]
+    },
+    {
+      "id": 6,
+      "type": "PreviewImage",
+      "pos": [
+        2760,
+        7030
+      ],
+      "size": [
+        420,
+        470
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 46
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.22.0",
+        "Node name for S&R": "PreviewImage"
+      },
+      "widgets_values": []
+    }
+  ],
+  "links": [
+    [
+      38,
+      9,
+      0,
+      20,
+      2,
+      "CAMERA_TRAJECTORY"
+    ],
+    [
+      41,
+      21,
+      0,
+      22,
+      0,
+      "WORLDMIRROR_MODEL"
+    ],
+    [
+      42,
+      23,
+      0,
+      24,
+      0,
+      "STRING"
+    ],
+    [
+      43,
+      20,
+      1,
+      22,
+      3,
+      "TENSOR"
+    ],
+    [
+      44,
+      20,
+      2,
+      22,
+      2,
+      "TENSOR"
+    ],
+    [
+      45,
+      20,
+      0,
+      22,
+      1,
+      "IMAGE"
+    ],
+    [
+      46,
+      20,
+      0,
+      6,
+      0,
+      "IMAGE"
+    ],
+    [
+      47,
+      22,
+      0,
+      23,
+      0,
+      "PLY_DATA"
+    ],
+    [
+      48,
+      22,
+      3,
+      24,
+      1,
+      "TENSOR"
+    ],
+    [
+      49,
+      22,
+      4,
+      24,
+      2,
+      "TENSOR"
+    ],
+    [
+      50,
+      25,
+      0,
+      26,
+      0,
+      "IMAGE"
+    ],
+    [
+      51,
+      26,
+      0,
+      20,
+      1,
+      "IMAGE"
+    ],
+    [
+      52,
+      26,
+      2,
+      20,
+      3,
+      "TENSOR"
+    ],
+    [
+      53,
+      26,
+      1,
+      20,
+      4,
+      "TENSOR"
+    ],
+    [
+      54,
+      27,
+      0,
+      20,
+      0,
+      "WORLDSTEREO_MODEL"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "WorldStereo",
+      "bounding": [
+        1430,
+        6200,
+        3110,
+        1460
+      ],
+      "color": "#3f789e",
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.6830134553650706,
+      "offset": [
+        -112.55277300553678,
+        -5946.831985098968
+      ]
+    },
+    "frontendVersion": "1.43.18",
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true
+  },
+  "version": 0.4
+}

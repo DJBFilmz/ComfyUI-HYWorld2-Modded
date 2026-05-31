@@ -236,13 +236,14 @@ def _stream_safetensors_to_module(
     *,
     device,
     dtype: torch.dtype,
+    require_all_keys: bool = True,
 ) -> tuple[list[str], list[str]]:
     expected_keys = set(module.state_dict().keys())
     with safe_open(path, framework="pt", device="cpu") as f:
         checkpoint_keys = set(f.keys())
         missing_keys = sorted(expected_keys - checkpoint_keys)
         unexpected_keys = sorted(checkpoint_keys - expected_keys)
-        if missing_keys:
+        if missing_keys and require_all_keys:
             return missing_keys, unexpected_keys
 
         load_keys = sorted(checkpoint_keys & expected_keys)
@@ -256,7 +257,7 @@ def _stream_safetensors_to_module(
                 tensor = tensor.to(device=device, dtype=target_dtype)
             _assign_tensor_to_module(module, key, tensor)
             if index == 1 or index == total or index % 250 == 0:
-                rank0_log(f"Streamed single checkpoint tensors: {index}/{total}")
+                rank0_log(f"Streamed safetensors tensors: {index}/{total}")
 
     return missing_keys, unexpected_keys
 
@@ -647,11 +648,6 @@ class WorldStereo:
                 else:
                     block.attn1.processor.sp_size = sp_world_size
 
-        rank0_log(f"Loading HF safetensors weights from {weights_path}…")
-        weights = _load_safetensors_cpu(weights_path)
-
-        result = transformer.load_state_dict(weights, strict=False)
-
         def _summarize_keys(keys: list[str], label: str) -> None:
             if not keys:
                 return
@@ -682,8 +678,17 @@ class WorldStereo:
             )
             rank0_log(f"These are frozen backbone weights initialized by the base video model ({cfg.base_model}).")
 
-        _summarize_keys(result.unexpected_keys, "Unexpected keys")
-        _summarize_keys(result.missing_keys, "Missing keys")
+        rank0_log(f"Streaming HF safetensors weights from {weights_path}…")
+        missing_keys, unexpected_keys = _stream_safetensors_to_module(
+            transformer,
+            weights_path,
+            device=device,
+            dtype=half_dtype,
+            require_all_keys=False,
+        )
+
+        _summarize_keys(unexpected_keys, "Unexpected keys")
+        _summarize_keys(missing_keys, "Missing keys")
 
         if fsdp:
             fsdp_kwargs = dict(

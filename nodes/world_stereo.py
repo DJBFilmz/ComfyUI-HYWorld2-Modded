@@ -1133,6 +1133,77 @@ def _read_safetensors_metadata(path: str) -> dict:
         return {}
 
 
+WORLDSTEREO_LIGHT_REPO_ID = "MIUProject/VNCCS_WorldStereoLight"
+WORLDSTEREO_LIGHT_MODELS = {
+    "Camera Light INT4": {
+        "filename": "vnccs-worldstereo-camera-light-int4.safetensors",
+        "metadata_filename": "vnccs-worldstereo-camera-light-int4.json",
+        "fallback_model_type": "worldstereo-camera",
+        "fallback_precision": "int4",
+    },
+    "Memory DMD Light INT4": {
+        "filename": "vnccs-worldstereo-memory-dmd-int4.safetensors",
+        "metadata_filename": "vnccs-worldstereo-memory-dmd-int4.json",
+        "fallback_model_type": "worldstereo-memory-dmd",
+        "fallback_precision": "int4",
+    },
+}
+
+
+def _read_json_metadata(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"[WorldStereoLight] Could not read json metadata ({type(e).__name__}: {e})")
+        return {}
+
+
+def _download_worldstereo_light_model(model_name: str, models_base: str | None = None) -> tuple[str, dict]:
+    from huggingface_hub import hf_hub_download
+    import shutil
+
+    if model_name not in WORLDSTEREO_LIGHT_MODELS:
+        raise ValueError(f"Unknown WorldStereoLight model: {model_name!r}")
+
+    spec = WORLDSTEREO_LIGHT_MODELS[model_name]
+    light_dir = os.path.join(models_base or _get_models_base(), "WorldStereoLight")
+    os.makedirs(light_dir, exist_ok=True)
+
+    safetensors_filename = f"models/{spec['filename']}"
+    json_filename = f"models/{spec['metadata_filename']}"
+    local_safetensors = os.path.join(light_dir, spec["filename"])
+    local_json = os.path.join(light_dir, spec["metadata_filename"])
+
+    if not os.path.exists(local_safetensors):
+        print(f"[WorldStereoLight] Downloading selected model: {model_name} ...")
+        cached_safetensors = hf_hub_download(
+            repo_id=WORLDSTEREO_LIGHT_REPO_ID,
+            filename=safetensors_filename,
+        )
+        shutil.copy2(cached_safetensors, local_safetensors)
+    else:
+        print(f"[WorldStereoLight] Model cached: {local_safetensors}")
+
+    if not os.path.exists(local_json):
+        print(f"[WorldStereoLight] Downloading metadata: {spec['metadata_filename']} ...")
+        cached_json = hf_hub_download(
+            repo_id=WORLDSTEREO_LIGHT_REPO_ID,
+            filename=json_filename,
+        )
+        shutil.copy2(cached_json, local_json)
+
+    metadata = _read_json_metadata(local_json)
+    metadata.update(_read_safetensors_metadata(local_safetensors))
+    metadata.setdefault("model_type", spec["fallback_model_type"])
+    metadata.setdefault("precision", spec["fallback_precision"])
+    metadata.setdefault("turbo_lora", "none")
+    metadata.setdefault("lora_strength", "1.0")
+
+    return local_safetensors, metadata
+
+
 def _download_hf_repo_missing(repo_id: str, local_dir: str, label: str, allow_patterns=None):
     from fnmatch import fnmatch
     from huggingface_hub import HfApi, hf_hub_download
@@ -1677,41 +1748,18 @@ class VNCCS_LoadWorldStereoModel:
         },)
 
 
-class VNCCS_LoadWorldStereoSingleModel:
-    """Load WorldStereo from a single fused transformer safetensors checkpoint."""
+class VNCCS_LoadWorldStereoLightModel:
+    """Download and load a selected WorldStereoLight single-transformer checkpoint."""
 
-    MODEL_TYPES = ["auto", "worldstereo-camera", "worldstereo-memory", "worldstereo-memory-dmd"]
+    MODELS = list(WORLDSTEREO_LIGHT_MODELS.keys())
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "single_model_path": (
-                    "STRING",
-                    {
-                        "default": r"C:\Dev\WorldStereo\worldstereo-camera-clean-bf16.safetensors",
-                        "multiline": False,
-                        "tooltip": "Path to exported single WorldStereo transformer .safetensors.",
-                    },
-                ),
+                "model": (cls.MODELS, {"default": cls.MODELS[0]}),
             },
             "optional": {
-                "model_type": (cls.MODEL_TYPES, {
-                    "default": "auto",
-                    "tooltip": "auto reads model_type from safetensors metadata, then falls back to worldstereo-camera.",
-                }),
-                "precision": (["auto", "bf16", "fp8", "int4"], {
-                    "default": "auto",
-                    "tooltip": "auto honors exported checkpoint precision; int4 is only supported for int4 exported checkpoints.",
-                }),
-                "turbo_lora": (list(WORLDSTEREO_TURBO_LORAS.keys()), {
-                    "default": "none",
-                    "tooltip": "Optional extra turbo LoRA. Leave none if the single checkpoint already has it fused.",
-                }),
-                "lora_strength": (
-                    "FLOAT",
-                    {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05},
-                ),
                 "offload_mode": (["sequential_cpu_offload", "model_cpu_offload", "none"], {
                     "default": "sequential_cpu_offload",
                 }),
@@ -1726,11 +1774,7 @@ class VNCCS_LoadWorldStereoSingleModel:
 
     def load_model(
         self,
-        single_model_path,
-        model_type="auto",
-        precision="auto",
-        turbo_lora="none",
-        lora_strength=1.0,
+        model,
         offload_mode="sequential_cpu_offload",
         device="cuda",
     ):
@@ -1739,54 +1783,23 @@ class VNCCS_LoadWorldStereoSingleModel:
         current_dir = os.path.dirname(os.path.dirname(__file__))
         _prepare_worldstereo_import_paths(current_dir)
 
-        single_model_path = os.path.abspath(os.path.expanduser(single_model_path.strip()))
-        if not os.path.exists(single_model_path):
-            raise FileNotFoundError(f"WorldStereo single model not found: {single_model_path}")
-        if not single_model_path.lower().endswith(".safetensors"):
-            raise ValueError("single_model_path must point to a .safetensors file.")
-
-        metadata = _read_safetensors_metadata(single_model_path)
+        single_model_path, metadata = _download_worldstereo_light_model(model)
         metadata_model_type = metadata.get("model_type")
         metadata_precision = metadata.get("precision")
-        if model_type == "auto":
-            model_type = metadata_model_type or "worldstereo-camera"
-        if precision == "auto":
-            precision = metadata_precision or "bf16"
-        if metadata_model_type and metadata_model_type != model_type:
-            print(
-                f"[WorldStereo Single Warning] metadata model_type={metadata_model_type}, "
-                f"but node model_type={model_type}"
-            )
-        if metadata_precision and metadata_precision != precision:
-            print(
-                f"[WorldStereo Single Warning] checkpoint precision={metadata_precision}, "
-                f"but node precision={precision}; extra conversion may be required."
-            )
+        model_type = metadata_model_type or WORLDSTEREO_LIGHT_MODELS[model]["fallback_model_type"]
+        precision = metadata_precision or WORLDSTEREO_LIGHT_MODELS[model]["fallback_precision"]
+        if model_type not in ("worldstereo-camera", "worldstereo-memory", "worldstereo-memory-dmd"):
+            raise ValueError(f"Unsupported WorldStereoLight model_type from metadata: {model_type!r}")
+        if precision != "int4":
+            raise ValueError(f"WorldStereoLight checkpoints are expected to be int4, got precision={precision!r}")
+
         metadata_turbo_lora = metadata.get("turbo_lora", "none")
         metadata_lora_strength = metadata.get("lora_strength")
-        checkpoint_has_requested_lora = _metadata_lora_matches(
-            metadata_turbo_lora,
-            metadata_lora_strength,
-            turbo_lora,
-            lora_strength,
-        )
-        if checkpoint_has_requested_lora:
+        if metadata_turbo_lora and metadata_turbo_lora != "none":
             print(
-                f"[WorldStereo Single] Checkpoint already has fused turbo_lora={metadata_turbo_lora} "
-                f"(strength={metadata_lora_strength}); skipping duplicate LoRA application."
+                f"[WorldStereoLight] Checkpoint has fused turbo_lora={metadata_turbo_lora} "
+                f"(strength={metadata_lora_strength or '1.0'})."
             )
-            turbo_lora_to_apply = "none"
-        else:
-            turbo_lora_to_apply = turbo_lora
-        if metadata_turbo_lora and metadata_turbo_lora != "none" and turbo_lora_to_apply != "none":
-            print(
-                f"[WorldStereo Single Warning] checkpoint already reports fused turbo_lora={metadata_turbo_lora}; "
-                f"applying another LoRA={turbo_lora_to_apply}"
-            )
-        if metadata_precision == "int4" and turbo_lora_to_apply != "none":
-            raise ValueError("int4 single checkpoints cannot apply additional LoRA after packing. Fuse LoRA during export.")
-        if metadata_precision == "int4" and precision != "int4":
-            raise ValueError("int4 single checkpoints must be loaded with precision=auto or precision=int4.")
 
         transformer_dir, base_model_dir, moge_dir = _download_worldstereo_single_loader_components(model_type)
         transformer_dir = transformer_dir.replace("\\", "/")
@@ -1804,8 +1817,8 @@ class VNCCS_LoadWorldStereoSingleModel:
                     from moge.model import MoGeModel
 
             print(
-                f"[WorldStereo Single] Loading pipeline "
-                f"(model_type={model_type}, precision={precision}, checkpoint={single_model_path}) ..."
+                f"[WorldStereoLight] Loading pipeline "
+                f"(selected={model}, model_type={model_type}, precision={precision}) ..."
             )
             parent_dir = os.path.dirname(transformer_dir)
             model_device = "cpu" if device == "cuda" and offload_mode != "none" else device
@@ -1818,32 +1831,30 @@ class VNCCS_LoadWorldStereoSingleModel:
             )
         pipeline = worldstereo.pipeline
 
-        turbo_lora_path = _apply_worldstereo_turbo_lora(pipeline, turbo_lora_to_apply, lora_strength)
         checkpoint_transformer_ready = (
             metadata.get("format") == "hyworld2_worldstereo_single_transformer_v1"
             and metadata_precision == precision
-            and turbo_lora_to_apply == "none"
         )
         precision = _apply_worldstereo_precision(
             pipeline,
             precision,
             skip_transformer=checkpoint_transformer_ready,
         )
-        offload_mode = _normalize_worldstereo_offload_mode(offload_mode, precision, prefix="[WorldStereo Single]")
+        offload_mode = _normalize_worldstereo_offload_mode(offload_mode, precision, prefix="[WorldStereoLight]")
 
         if device == "cuda":
             if offload_mode == "model_cpu_offload":
-                print("[WorldStereo Single] Enabling model_cpu_offload ...")
+                print("[WorldStereoLight] Enabling model_cpu_offload ...")
                 pipeline.enable_model_cpu_offload()
-                print("[WorldStereo Single] model_cpu_offload enabled")
+                print("[WorldStereoLight] model_cpu_offload enabled")
             elif offload_mode == "sequential_cpu_offload":
-                print("[WorldStereo Single] Enabling sequential_cpu_offload ...")
+                print("[WorldStereoLight] Enabling sequential_cpu_offload ...")
                 pipeline.enable_sequential_cpu_offload()
-                print("[WorldStereo Single] sequential_cpu_offload enabled")
+                print("[WorldStereoLight] sequential_cpu_offload enabled")
             elif offload_mode == "none":
-                print("[WorldStereo Single Warning] CPU offload disabled; this is likely too large for normal VRAM.")
+                print("[WorldStereoLight Warning] CPU offload disabled; this is likely too large for normal VRAM.")
 
-        print("[WorldStereo Single] Loading MoGe depth estimator ...")
+        print("[WorldStereoLight] Loading MoGe depth estimator ...")
         actual_moge_path = os.path.join(moge_dir, "model.pt")
         if not os.path.exists(actual_moge_path):
             actual_moge_path = moge_dir
@@ -1851,10 +1862,10 @@ class VNCCS_LoadWorldStereoSingleModel:
         try:
             moge_model.to(dtype=_worldstereo_half_dtype())
         except Exception as e:
-            print(f"[WorldStereo Single] MoGe half precision cast skipped ({type(e).__name__}: {e})")
-        print("[WorldStereo Single] MoGe loaded (CPU)")
+            print(f"[WorldStereoLight] MoGe half precision cast skipped ({type(e).__name__}: {e})")
+        print("[WorldStereoLight] MoGe loaded (CPU)")
 
-        print("[WorldStereo Single] Pipeline ready")
+        print("[WorldStereoLight] Pipeline ready")
         return ({
             "worldstereo": worldstereo,
             "pipeline": pipeline,
@@ -1863,12 +1874,13 @@ class VNCCS_LoadWorldStereoSingleModel:
             "model_type": model_type,
             "precision": precision,
             "offload_mode": offload_mode,
-            "turbo_lora": turbo_lora,
-            "lora_strength": float(lora_strength),
-            "turbo_lora_path": turbo_lora_path,
+            "turbo_lora": metadata_turbo_lora,
+            "lora_strength": float(metadata_lora_strength or 1.0),
+            "turbo_lora_path": None,
             "single_model_path": single_model_path,
             "single_model_metadata": metadata,
-            "loader_type": "single_transformer",
+            "loader_type": "worldstereo_light",
+            "selected_model": model,
         },)
 
 
@@ -3128,7 +3140,7 @@ class VNCCS_InstallHYWorld2Dependencies:
 NODE_CLASS_MAPPINGS = {
     "VNCCS_InstallHYWorld2Dependencies": VNCCS_InstallHYWorld2Dependencies,
     "VNCCS_LoadWorldStereoModel":    VNCCS_LoadWorldStereoModel,
-    "VNCCS_LoadWorldStereoSingleModel": VNCCS_LoadWorldStereoSingleModel,
+    "VNCCS_LoadWorldStereoLightModel": VNCCS_LoadWorldStereoLightModel,
     "VNCCS_CameraTrajectoryBuilder": VNCCS_CameraTrajectoryBuilder,
     "VNCCS_WorldStereoGenerate":     VNCCS_WorldStereoGenerate,
     "VNCCS_ExportWorldStereoSingleModel": VNCCS_ExportWorldStereoSingleModel,
@@ -3137,7 +3149,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "VNCCS_InstallHYWorld2Dependencies": "Install HYWorld2 Dependencies",
     "VNCCS_LoadWorldStereoModel":    "Load WorldStereo Model",
-    "VNCCS_LoadWorldStereoSingleModel": "Load WorldStereo Single Model",
+    "VNCCS_LoadWorldStereoLightModel": "Load WorldStereoLight Model",
     "VNCCS_CameraTrajectoryBuilder": "Camera Trajectory Builder",
     "VNCCS_WorldStereoGenerate":     "WorldStereo Generate",
     "VNCCS_ExportWorldStereoSingleModel": "Export WorldStereo Single Model",
