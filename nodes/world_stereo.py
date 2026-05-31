@@ -366,6 +366,89 @@ def _c2w_to_w2c(c2ws: torch.Tensor) -> torch.Tensor:
     return torch.linalg.inv(c2ws)
 
 
+def _fallback_points_padding(points: torch.Tensor) -> torch.Tensor:
+    return torch.cat([points, torch.ones_like(points[..., :1])], dim=-1)
+
+
+def _fallback_get_points3d_and_colors(K, w2cs, depth, image, device, contract=8.0):
+    _, _, h, w = image.shape
+    torch_device = torch.device(device)
+    K = K.to(torch_device).float()
+    w2cs = w2cs.to(torch_device).float()
+    depth = depth.to(torch_device).float()
+    image = image.to(torch_device).float()
+    if depth.shape[1] == 3:
+        depth = depth[:, 0:1]
+    if depth.max() == 0 or (~torch.isfinite(depth)).any():
+        raise RuntimeError("Invalid depth map for fallback point rendering.")
+
+    valid_depth = depth[depth > 0]
+    mid_depth = torch.median(valid_depth.reshape(-1), dim=0)[0] * contract
+    depth = depth.clone()
+    far = depth > mid_depth
+    depth[far] = (2 * mid_depth) - (mid_depth ** 2 / (depth[far] + 1e-6))
+
+    ys, xs = torch.meshgrid(
+        torch.arange(h, device=torch_device, dtype=torch.float32) + 0.5,
+        torch.arange(w, device=torch_device, dtype=torch.float32) + 0.5,
+        indexing="ij",
+    )
+    pix = torch.stack([xs.reshape(-1), ys.reshape(-1), torch.ones(h * w, device=torch_device)], dim=1)
+    point_depth = depth[0, 0].reshape(-1, 1)
+    cam_points = (torch.linalg.inv(K[0]) @ pix.T).T * point_depth
+    c2w = torch.linalg.inv(w2cs[0])
+    points3d = (c2w @ _fallback_points_padding(cam_points).T).T[:, :3]
+    colors = image[0].permute(1, 2, 0).reshape(-1, 3)
+    valid = point_depth.reshape(-1) > 0
+    return points3d[valid], colors[valid]
+
+
+def _fallback_point_rendering(K, w2cs, points, colors, device, h, w):
+    torch_device = torch.device(device)
+    K = K.to(torch_device).float()
+    w2cs = w2cs.to(torch_device).float()
+    points = points.to(torch_device).float()
+    colors = colors.to(torch_device).float()
+    nframe = w2cs.shape[0]
+    points_h = _fallback_points_padding(points)
+    render_rgbs = torch.zeros((nframe, 3, h, w), device=torch_device, dtype=torch.float32)
+    render_masks = torch.ones((nframe, 1, h, w), device=torch_device, dtype=torch.float32)
+    flat_size = h * w
+
+    for frame_idx in range(nframe):
+        cam = (w2cs[frame_idx] @ points_h.T).T[:, :3]
+        z = cam[:, 2]
+        valid = z > 1e-6
+        if not valid.any():
+            continue
+        cam = cam[valid]
+        z = z[valid]
+        frame_colors = colors[valid]
+        fx, fy = K[frame_idx, 0, 0], K[frame_idx, 1, 1]
+        cx, cy = K[frame_idx, 0, 2], K[frame_idx, 1, 2]
+        xs = torch.round((cam[:, 0] * fx / z) + cx).long()
+        ys = torch.round((cam[:, 1] * fy / z) + cy).long()
+        inside = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+        if not inside.any():
+            continue
+        xs, ys, z, frame_colors = xs[inside], ys[inside], z[inside], frame_colors[inside]
+        flat_idx = ys * w + xs
+        if hasattr(torch.Tensor, "scatter_reduce_"):
+            zbuf = torch.full((flat_size,), float("inf"), device=torch_device, dtype=torch.float32)
+            zbuf.scatter_reduce_(0, flat_idx, z, reduce="amin", include_self=True)
+            visible = z <= (zbuf[flat_idx] + 1e-5)
+        else:
+            order = torch.argsort(z, descending=True)
+            flat_idx, frame_colors = flat_idx[order], frame_colors[order]
+            visible = torch.ones_like(flat_idx, dtype=torch.bool)
+        flat_img = render_rgbs[frame_idx].permute(1, 2, 0).reshape(flat_size, 3)
+        flat_mask = render_masks[frame_idx, 0].reshape(flat_size)
+        flat_img[flat_idx[visible]] = frame_colors[visible]
+        flat_mask[flat_idx[visible]] = 0.0
+
+    return render_rgbs, render_masks
+
+
 def _opencv_look_at_c2w(cam_pos: np.ndarray, target: np.ndarray) -> np.ndarray:
     z_axis = target - cam_pos
     z_axis = z_axis / max(np.linalg.norm(z_axis), 1e-8)
@@ -605,6 +688,30 @@ def _call_lora_method(method_name: str, calls):
     raise AttributeError(method_name)
 
 
+def _patch_worldstereo_lora_adapter_scaling():
+    try:
+        from diffusers.loaders import peft as diffusers_peft
+        mapping = getattr(diffusers_peft, "_SET_ADAPTER_SCALE_FN_MAPPING", None)
+    except Exception as e:
+        print(f"[WorldStereo] LoRA adapter scale patch skipped ({type(e).__name__}: {e})")
+        return
+
+    if not isinstance(mapping, dict):
+        return
+
+    wan_scale_fn = mapping.get("WanTransformer3DModel")
+    if wan_scale_fn is None:
+        return
+
+    patched = []
+    for class_name in ("WorldStereoModel", "WorldStereoRefSModel"):
+        if class_name not in mapping:
+            mapping[class_name] = wan_scale_fn
+            patched.append(class_name)
+    if patched:
+        print(f"[WorldStereo] LoRA adapter scaling patched for: {', '.join(patched)}")
+
+
 def _apply_worldstereo_turbo_lora(pipeline, lora_name: str, lora_strength: float):
     lora_path, spec = _download_worldstereo_turbo_lora(lora_name)
     if spec is None:
@@ -617,6 +724,7 @@ def _apply_worldstereo_turbo_lora(pipeline, lora_name: str, lora_strength: float
     # LoRA injection needs regular module weights; run it before fp8 quant/freeze.
     for name in ("text_encoder", "image_encoder", "transformer", "vae"):
         _move_module_to_half(getattr(pipeline, name, None), half_dtype)
+    _patch_worldstereo_lora_adapter_scaling()
 
     try:
         _call_lora_method(
@@ -758,6 +866,16 @@ def _resolve_worldstereo_export_paths(export_path: str, model_type: str, precisi
     return output_file, metadata_file
 
 
+def _read_safetensors_metadata(path: str) -> dict:
+    try:
+        from safetensors import safe_open
+        with safe_open(path, framework="pt", device="cpu") as fh:
+            return dict(fh.metadata() or {})
+    except Exception as e:
+        print(f"[WorldStereo] Could not read safetensors metadata ({type(e).__name__}: {e})")
+        return {}
+
+
 def _download_hf_repo_missing(repo_id: str, local_dir: str, label: str, allow_patterns=None):
     from fnmatch import fnmatch
     from huggingface_hub import HfApi, hf_hub_download
@@ -826,6 +944,66 @@ def _download_hf_repo_missing(repo_id: str, local_dir: str, label: str, allow_pa
         )
 
     print(f"[WorldStereo] {label} cached: {local_dir}")
+
+
+def _download_worldstereo_single_loader_components(model_type: str, include_moge: bool = True) -> tuple:
+    """Download only files needed around a single transformer checkpoint."""
+    from huggingface_hub import hf_hub_download, snapshot_download
+
+    base = _get_models_base()
+
+    transformer_dir = os.path.join(base, "WorldStereo", model_type)
+    config_path = os.path.join(transformer_dir, "config.json")
+    if not os.path.exists(config_path):
+        print(f"[WorldStereo] Downloading WorldStereo config ({model_type}) ...")
+        hf_hub_download(
+            repo_id="hanshanxue/WorldStereo",
+            filename=f"{model_type}/config.json",
+            local_dir=os.path.join(base, "WorldStereo"),
+        )
+    else:
+        print(f"[WorldStereo] WorldStereo config cached: {config_path}")
+
+    base_model_dir = os.path.join(base, "Wan2.1-I2V-14B-480P")
+    _download_hf_repo_missing(
+        repo_id="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+        local_dir=base_model_dir,
+        label="Wan2.1-I2V-14B-480P aux files",
+        allow_patterns=[
+            "model_index.json",
+            "scheduler/**",
+            "tokenizer/**",
+            "text_encoder/**",
+            "image_encoder/**",
+            "image_processor/**",
+            "vae/**",
+            "transformer/config.json",
+        ],
+    )
+
+    moge_dir = os.path.join(base, "MoGe")
+    if include_moge:
+        moge_config = os.path.join(moge_dir, "config.json")
+        if not os.path.exists(moge_config):
+            print(f"[WorldStereo] Downloading MoGe depth estimator ...")
+            snapshot_download(
+                repo_id="Ruicheng/moge-2-vitl-normal",
+                local_dir=moge_dir,
+            )
+            print(f"[WorldStereo] MoGe cached: {moge_dir}")
+        else:
+            print(f"[WorldStereo] MoGe cached: {moge_dir}")
+
+    if os.path.exists(config_path):
+        with open(config_path, "r", encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        if cfg.get("base_model") != base_model_dir:
+            cfg["base_model"] = base_model_dir
+            with open(config_path, "w", encoding="utf-8") as fh:
+                json.dump(cfg, fh, indent=4)
+            print(f"[WorldStereo] config.json patched -> base_model={base_model_dir}")
+
+    return transformer_dir, base_model_dir, moge_dir
 
 
 def _download_worldstereo_components(model_type: str, include_moge: bool = True) -> tuple:
@@ -1164,6 +1342,163 @@ class VNCCS_LoadWorldStereoModel:
             "turbo_lora_path": turbo_lora_path,
         },)
 
+
+class VNCCS_LoadWorldStereoSingleModel:
+    """Load WorldStereo from a single fused transformer safetensors checkpoint."""
+
+    MODEL_TYPES = ["auto", "worldstereo-camera", "worldstereo-memory", "worldstereo-memory-dmd"]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "single_model_path": (
+                    "STRING",
+                    {
+                        "default": r"C:\Dev\WorldStereo\worldstereo-camera-clean-bf16.safetensors",
+                        "multiline": False,
+                        "tooltip": "Path to exported single WorldStereo transformer .safetensors.",
+                    },
+                ),
+            },
+            "optional": {
+                "model_type": (cls.MODEL_TYPES, {
+                    "default": "auto",
+                    "tooltip": "auto reads model_type from safetensors metadata, then falls back to worldstereo-camera.",
+                }),
+                "precision": (["fp8", "bf16"], {
+                    "default": "fp8",
+                    "tooltip": "fp8 quantizes supported modules after loading; bf16 keeps half precision.",
+                }),
+                "turbo_lora": (list(WORLDSTEREO_TURBO_LORAS.keys()), {
+                    "default": "none",
+                    "tooltip": "Optional extra turbo LoRA. Leave none if the single checkpoint already has it fused.",
+                }),
+                "lora_strength": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05},
+                ),
+                "offload_mode": (["sequential_cpu_offload", "model_cpu_offload", "none"], {
+                    "default": "sequential_cpu_offload",
+                }),
+                "device": (["cuda", "cpu"], {"default": "cuda"}),
+            },
+        }
+
+    RETURN_TYPES = ("WORLDSTEREO_MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "load_model"
+    CATEGORY = "VNCCS/Video"
+
+    def load_model(
+        self,
+        single_model_path,
+        model_type="auto",
+        precision="fp8",
+        turbo_lora="none",
+        lora_strength=1.0,
+        offload_mode="sequential_cpu_offload",
+        device="cuda",
+    ):
+        import os
+
+        current_dir = os.path.dirname(os.path.dirname(__file__))
+        _prepare_worldstereo_import_paths(current_dir)
+
+        single_model_path = os.path.abspath(os.path.expanduser(single_model_path.strip()))
+        if not os.path.exists(single_model_path):
+            raise FileNotFoundError(f"WorldStereo single model not found: {single_model_path}")
+        if not single_model_path.lower().endswith(".safetensors"):
+            raise ValueError("single_model_path must point to a .safetensors file.")
+
+        metadata = _read_safetensors_metadata(single_model_path)
+        metadata_model_type = metadata.get("model_type")
+        if model_type == "auto":
+            model_type = metadata_model_type or "worldstereo-camera"
+        if metadata_model_type and metadata_model_type != model_type:
+            print(
+                f"[WorldStereo Single Warning] metadata model_type={metadata_model_type}, "
+                f"but node model_type={model_type}"
+            )
+        metadata_turbo_lora = metadata.get("turbo_lora", "none")
+        if metadata_turbo_lora and metadata_turbo_lora != "none" and turbo_lora != "none":
+            print(
+                f"[WorldStereo Single Warning] checkpoint already reports fused turbo_lora={metadata_turbo_lora}; "
+                f"applying another LoRA={turbo_lora}"
+            )
+
+        transformer_dir, base_model_dir, moge_dir = _download_worldstereo_single_loader_components(model_type)
+        transformer_dir = transformer_dir.replace("\\", "/")
+        base_model_dir = base_model_dir.replace("\\", "/")
+        moge_dir = moge_dir.replace("\\", "/")
+
+        with _temporary_worldstereo_runtime_patches(patch_diffusers=True):
+            WorldStereo = _import_worldstereo_class(current_dir)
+            try:
+                from moge.model.v2 import MoGeModel
+            except ImportError:
+                try:
+                    from moge.model.v1 import MoGeModel
+                except ImportError:
+                    from moge.model import MoGeModel
+
+            print(
+                f"[WorldStereo Single] Loading pipeline "
+                f"(model_type={model_type}, precision={precision}, checkpoint={single_model_path}) ..."
+            )
+            parent_dir = os.path.dirname(transformer_dir)
+            model_device = "cpu" if device == "cuda" and offload_mode != "none" else device
+            worldstereo = WorldStereo.from_single_transformer(
+                parent_dir,
+                single_model_path,
+                subfolder=model_type,
+                device=device,
+                model_device=model_device,
+            )
+        pipeline = worldstereo.pipeline
+
+        turbo_lora_path = _apply_worldstereo_turbo_lora(pipeline, turbo_lora, lora_strength)
+        precision = _apply_worldstereo_precision(pipeline, precision)
+
+        if device == "cuda":
+            if offload_mode == "model_cpu_offload":
+                pipeline.enable_model_cpu_offload()
+                print("[WorldStereo Single] model_cpu_offload enabled")
+            elif offload_mode == "sequential_cpu_offload":
+                pipeline.enable_sequential_cpu_offload()
+                print("[WorldStereo Single] sequential_cpu_offload enabled")
+            elif offload_mode == "none":
+                print("[WorldStereo Single Warning] CPU offload disabled; this is likely too large for normal VRAM.")
+
+        print("[WorldStereo Single] Loading MoGe depth estimator ...")
+        actual_moge_path = os.path.join(moge_dir, "model.pt")
+        if not os.path.exists(actual_moge_path):
+            actual_moge_path = moge_dir
+        moge_model = MoGeModel.from_pretrained(actual_moge_path).eval()
+        try:
+            moge_model.to(dtype=_worldstereo_half_dtype())
+        except Exception as e:
+            print(f"[WorldStereo Single] MoGe half precision cast skipped ({type(e).__name__}: {e})")
+        print("[WorldStereo Single] MoGe loaded (CPU)")
+
+        print("[WorldStereo Single] Pipeline ready")
+        return ({
+            "worldstereo": worldstereo,
+            "pipeline": pipeline,
+            "moge": moge_model,
+            "device": device,
+            "model_type": model_type,
+            "precision": precision,
+            "offload_mode": offload_mode,
+            "turbo_lora": turbo_lora,
+            "lora_strength": float(lora_strength),
+            "turbo_lora_path": turbo_lora_path,
+            "single_model_path": single_model_path,
+            "single_model_metadata": metadata,
+            "loader_type": "single_transformer",
+        },)
+
+
 def _prepare_pipeline_inputs(
     image_pil,
     c2ws: torch.Tensor,
@@ -1178,8 +1513,17 @@ def _prepare_pipeline_inputs(
     Replicates WorldStereo's load_single_view_data() for arbitrary inputs.
     """
     import torchvision.transforms as T
-    from src.pointcloud import get_points3d_and_colors, point_rendering
     from models.camera import get_camera_embedding
+    try:
+        from src.pointcloud import get_points3d_and_colors, point_rendering
+        use_pytorch3d_renderer = True
+    except ImportError as e:
+        if "pytorch3d" not in str(e).lower():
+            raise
+        print("[WorldStereo] PyTorch3D not available; using torch fallback point renderer.")
+        get_points3d_and_colors = _fallback_get_points3d_and_colors
+        point_rendering = _fallback_point_rendering
+        use_pytorch3d_renderer = False
 
     N = c2ws.shape[0]
 
@@ -1227,6 +1571,8 @@ def _prepare_pipeline_inputs(
         image=img_tensor_01,
         device=device,
     )
+    if points3d is None or colors is None:
+        raise RuntimeError("Point cloud construction failed.")
 
     # 5. Render point cloud from all N target views
     render_result = point_rendering(
@@ -1238,6 +1584,8 @@ def _prepare_pipeline_inputs(
         h=height,
         w=width,
     )
+    if not use_pytorch3d_renderer:
+        print("[WorldStereo] Fallback point rendering complete.")
     # point_rendering returns (render_rgbs, render_masks) OR (render_rgbs, render_masks, render_depth)
     if isinstance(render_result, (tuple, list)):
         render_rgbs_raw, render_masks_raw = render_result[0], render_result[1]
@@ -1903,19 +2251,151 @@ class VNCCS_ExportWorldStereoSingleModel:
         return (info,)
 
 
+def _run_dependency_command(cmd, cwd=PROJECT_ROOT, env=None, label="command"):
+    import subprocess
+
+    print(f"[HYWorld2 Installer] Running {label}: {' '.join(cmd)}")
+    process_env = os.environ.copy()
+    process_env.setdefault("PYTHONUTF8", "1")
+    process_env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+    if env:
+        process_env.update(env)
+
+    process = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        env=process_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    lines = []
+    assert process.stdout is not None
+    for line in process.stdout:
+        line = line.rstrip()
+        print(f"[HYWorld2 Installer] {line}")
+        lines.append(line)
+        if len(lines) > 400:
+            lines = lines[-400:]
+    return_code = process.wait()
+    if return_code != 0:
+        tail = "\n".join(lines[-80:])
+        raise RuntimeError(
+            f"{label} failed with exit code {return_code}.\n"
+            f"Last installer output:\n{tail}"
+        )
+    return "\n".join(lines[-120:])
+
+
+def _write_filtered_requirements(source_path: str) -> str:
+    import tempfile
+
+    skip_packages = {"torch", "torchvision", "torchaudio"}
+    filtered_lines = []
+    with open(source_path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            stripped = line.strip()
+            package_name = stripped.split(";", 1)[0].split("[", 1)[0]
+            package_name = package_name.replace("==", ">=").replace("~=", ">=").replace("<=", ">=").replace(">", ">=").split(">=", 1)[0]
+            if package_name.lower() in skip_packages:
+                filtered_lines.append(f"# skipped by HYWorld2 installer: {line}")
+            else:
+                filtered_lines.append(line)
+
+    tmp = tempfile.NamedTemporaryFile("w", suffix="_hyworld2_requirements.txt", delete=False, encoding="utf-8")
+    try:
+        tmp.writelines(filtered_lines)
+        return tmp.name
+    finally:
+        tmp.close()
+
+
+class VNCCS_InstallHYWorld2Dependencies:
+    """One-shot dependency installer for HYWorld2 experimental dependencies."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "install": (["RUN_DEPENDENCY_INSTALL"], {
+                    "default": "RUN_DEPENDENCY_INSTALL",
+                    "tooltip": "Queue this node to install HYWorld2 dependencies, gsplat, and PyTorch3D.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("install_log",)
+    FUNCTION = "install_dependencies"
+    CATEGORY = "VNCCS/Install"
+    OUTPUT_NODE = True
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        import time
+        return time.time()
+
+    def install_dependencies(self, install="RUN_DEPENDENCY_INSTALL"):
+        import sys
+
+        requirements_path = os.path.join(PROJECT_ROOT, "requirements.txt")
+        build_script = os.path.join(PROJECT_ROOT, "scripts", "build_gsplat.py")
+
+        if not os.path.exists(requirements_path):
+            raise FileNotFoundError(f"requirements.txt not found: {requirements_path}")
+        if not os.path.exists(build_script):
+            raise FileNotFoundError(f"build_gsplat.py not found: {build_script}")
+
+        print("[HYWorld2 Installer] Starting dependency installation.")
+        filtered_requirements = _write_filtered_requirements(requirements_path)
+        try:
+            requirements_log = _run_dependency_command(
+                [sys.executable, "-m", "pip", "install", "-r", filtered_requirements],
+                cwd=PROJECT_ROOT,
+                label="pip install filtered requirements.txt",
+            )
+        finally:
+            try:
+                os.remove(filtered_requirements)
+            except OSError:
+                pass
+        gsplat_log = _run_dependency_command(
+            [sys.executable, build_script],
+            cwd=PROJECT_ROOT,
+            label="build_gsplat.py (gsplat + PyTorch3D)",
+        )
+
+        summary = (
+            "HYWorld2 dependency installation completed.\n\n"
+            "Last requirements output:\n"
+            f"{requirements_log}\n\n"
+            "Last gsplat/PyTorch3D output:\n"
+            f"{gsplat_log}"
+        )
+        print("[HYWorld2 Installer] Dependency installation completed.")
+        return (summary,)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ComfyUI registration
 # ─────────────────────────────────────────────────────────────────────────────
 
 NODE_CLASS_MAPPINGS = {
+    "VNCCS_InstallHYWorld2Dependencies": VNCCS_InstallHYWorld2Dependencies,
     "VNCCS_LoadWorldStereoModel":    VNCCS_LoadWorldStereoModel,
+    "VNCCS_LoadWorldStereoSingleModel": VNCCS_LoadWorldStereoSingleModel,
     "VNCCS_CameraTrajectoryBuilder": VNCCS_CameraTrajectoryBuilder,
     "VNCCS_WorldStereoGenerate":     VNCCS_WorldStereoGenerate,
     "VNCCS_ExportWorldStereoSingleModel": VNCCS_ExportWorldStereoSingleModel,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "VNCCS_InstallHYWorld2Dependencies": "Install HYWorld2 Dependencies",
     "VNCCS_LoadWorldStereoModel":    "Load WorldStereo Model",
+    "VNCCS_LoadWorldStereoSingleModel": "Load WorldStereo Single Model",
     "VNCCS_CameraTrajectoryBuilder": "Camera Trajectory Builder",
     "VNCCS_WorldStereoGenerate":     "WorldStereo Generate",
     "VNCCS_ExportWorldStereoSingleModel": "Export WorldStereo Single Model",

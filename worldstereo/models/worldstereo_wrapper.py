@@ -24,6 +24,7 @@ supported values:
 from __future__ import annotations
 
 import gc
+import inspect
 import json
 import os
 import types
@@ -92,13 +93,44 @@ _DIFFUSERS_TRANSFORMER_LOAD_KWARGS = {
     "low_cpu_mem_usage": False,
 }
 
+_DIFFUSERS_VAE_LOAD_KWARGS = {
+    "disable_mmap": True,
+    "low_cpu_mem_usage": False,
+}
 
-def _load_safetensors_cpu(path: str) -> dict[str, torch.Tensor]:
+
+def _load_safetensors_cpu(path: str, *, use_comfy_loader: bool = False) -> dict[str, torch.Tensor]:
+    if use_comfy_loader:
+        try:
+            import comfy.utils
+            rank0_log("Loading safetensors with ComfyUI load_torch_file.")
+            return comfy.utils.load_torch_file(path, safe_load=True, device=torch.device("cpu"))
+        except MemoryError:
+            raise
+        except Exception as exc:
+            rank0_log(
+                f"ComfyUI load_torch_file failed ({type(exc).__name__}: {exc}); "
+                "falling back to safetensors.torch.load_file.",
+                "WARNING",
+            )
+
     try:
         return load_safetensors(path, device="cpu")
+    except MemoryError as exc:
+        raise MemoryError(
+            f"Not enough RAM to load safetensors checkpoint: {path}. "
+            "For huge single checkpoints, use a recent ComfyUI build with comfy_aimdo/model_mmap enabled."
+        ) from exc
     except OSError as exc:
         if "1455" not in str(exc) and "paging file" not in str(exc).lower() and "подкач" not in str(exc).lower():
             raise
+        file_size_gb = os.path.getsize(path) / (1024 ** 3)
+        if file_size_gb > 8:
+            raise OSError(
+                f"Safetensors mmap failed for a huge checkpoint ({file_size_gb:.2f} GB): {path}. "
+                "Refusing bytes fallback because it would duplicate the full file in RAM. "
+                "Use a recent ComfyUI build with comfy_aimdo/model_mmap enabled."
+            ) from exc
         rank0_log(
             "Safetensors mmap failed with Windows pagefile error; retrying without mmap. "
             "This is slower and requires free system RAM.",
@@ -126,6 +158,18 @@ def _disable_diffusers_fp32_keep_modules(*classes):
                     delattr(cls, "_keep_in_fp32_modules")
                 except AttributeError:
                     pass
+
+
+def _constructor_kwargs_from_config(model_cls, config: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
+    signature = inspect.signature(model_cls.__init__)
+    valid = {
+        name
+        for name, param in signature.parameters.items()
+        if name != "self" and param.kind in (param.POSITIONAL_OR_KEYWORD, param.KEYWORD_ONLY)
+    }
+    kwargs = {key: value for key, value in config.items() if key in valid}
+    kwargs.update(extra)
+    return kwargs
 
 # torch.compile / inductor verbose output
 logging.getLogger("torch._dynamo").setLevel(logging.WARNING)
@@ -262,6 +306,81 @@ class WorldStereo:
         )
 
         rank0_log(f"WorldStereo ({model_type}) ready.")
+        return cls(pipeline=pipeline, cfg=cfg)
+
+    @classmethod
+    def from_single_transformer(
+        cls,
+        repo_id: str,
+        single_model_path: str,
+        *,
+        subfolder: str = "",
+        local_files_only: bool = False,
+        sp_world_size: int = 1,
+        fsdp: bool = False,
+        device_mesh=None,
+        device: torch.device | None = None,
+        model_device: torch.device | str | None = None,
+    ) -> "WorldStereo":
+        """Build a full pipeline from one fused WorldStereo transformer safetensors file."""
+        if fsdp:
+            raise NotImplementedError("from_single_transformer does not support FSDP yet.")
+
+        if not os.path.exists(single_model_path):
+            raise FileNotFoundError(f"Single transformer checkpoint not found: {single_model_path}")
+
+        if os.path.isdir(repo_id):
+            json_cfg_path = os.path.join(repo_id, subfolder, "config.json")
+        else:
+            from huggingface_hub import hf_hub_download
+            json_cfg_path = hf_hub_download(
+                repo_id=repo_id,
+                filename="config.json",
+                subfolder=subfolder if subfolder else None,
+                local_files_only=local_files_only,
+            )
+        if not os.path.exists(json_cfg_path):
+            raise FileNotFoundError(f"config.json not found under {json_cfg_path!r}")
+
+        cfg = OmegaConf.create(cls._load_hf_config(json_cfg_path))
+        model_type = subfolder
+        if model_type not in SUPPORTED_MODEL_TYPES:
+            raise ValueError(
+                f"Unsupported model_type {model_type!r}. "
+                f"Expected one of {SUPPORTED_MODEL_TYPES}."
+            )
+
+        model_device = model_device if model_device is not None else device
+        transformer = cls._load_single_transformer(
+            cfg,
+            model_type,
+            single_model_path,
+            sp_world_size=sp_world_size,
+            device=model_device,
+        )
+
+        text_encoder, image_clip, vae = cls._load_aux(
+            cfg, device=model_device, device_mesh=device_mesh, fsdp=False, local_files_only=local_files_only
+        )
+        image_processor = CLIPImageProcessor.from_pretrained(
+            cfg.base_model, do_rescale=False, subfolder="image_processor", local_files_only=local_files_only
+        )
+        tokenizer = AutoTokenizer.from_pretrained(cfg.base_model, subfolder="tokenizer", local_files_only=local_files_only)
+
+        pipeline = cls._build_pipeline(
+            model_type,
+            cfg,
+            transformer=transformer,
+            text_encoder=text_encoder,
+            image_clip=image_clip,
+            image_processor=image_processor,
+            tokenizer=tokenizer,
+            vae=vae,
+            device=device,
+            local_files_only=local_files_only,
+        )
+
+        rank0_log(f"WorldStereo single transformer ({model_type}) ready.")
         return cls(pipeline=pipeline, cfg=cfg)
 
     # ------------------------------------------------------------------
@@ -404,6 +523,67 @@ class WorldStereo:
         return transformer.eval()
 
     @staticmethod
+    def _load_single_transformer(
+        cfg,
+        model_type: str,
+        weights_path: str,
+        *,
+        sp_world_size: int,
+        device,
+    ):
+        half_dtype = _get_half_dtype()
+        transformer_config_path = os.path.join(cfg.base_model, "transformer", "config.json")
+        if not os.path.exists(transformer_config_path):
+            raise FileNotFoundError(
+                f"Base transformer config is required for single checkpoint loading: {transformer_config_path}"
+            )
+        with open(transformer_config_path, "r", encoding="utf-8") as f:
+            transformer_config = json.load(f)
+
+        model_cls = WorldStereoModel if model_type == "worldstereo-camera" else WorldStereoRefSModel
+        init_kwargs = _constructor_kwargs_from_config(
+            model_cls,
+            transformer_config,
+            {
+                "controlnet_cfg": cfg.controlnet_cfg,
+                "base_model": cfg.base_model,
+            },
+        )
+
+        rank0_log(f"Building transformer from single checkpoint ({model_type})… dtype={half_dtype}")
+        with _disable_diffusers_fp32_keep_modules(WorldStereoModel, WorldStereoRefSModel):
+            transformer = model_cls(**init_kwargs)
+
+        rank0_log("Building ControlNet…")
+        transformer.build_controlnet(load_uni3c=False, freeze_backbone=cfg.freeze_backbone)
+
+        if sp_world_size > 1:
+            transformer.sp_size = sp_world_size
+            for layer in transformer.controlnet.controlnet_blocks:
+                layer.self_attn.processor.sp_size = sp_world_size
+            for block in transformer.blocks:
+                if model_type == "worldstereo-camera":
+                    block.attn1.set_processor(WanAttnProcessorSP(sp_size=sp_world_size))
+                else:
+                    block.attn1.processor.sp_size = sp_world_size
+
+        rank0_log(f"Loading single transformer safetensors from {weights_path}…")
+        weights = _load_safetensors_cpu(weights_path, use_comfy_loader=True)
+        result = transformer.load_state_dict(weights, strict=False)
+        if result.missing_keys:
+            rank0_log(f"Single checkpoint missing keys: {len(result.missing_keys)}", "WARNING")
+        if result.unexpected_keys:
+            rank0_log(f"Single checkpoint unexpected keys: {len(result.unexpected_keys)}", "WARNING")
+        del weights
+
+        transformer = transformer.to(dtype=half_dtype)
+        transformer = transformer.to(device=device)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return transformer.eval()
+
+    @staticmethod
     def _load_aux(cfg, *, device, device_mesh, fsdp: bool, local_files_only: bool = False):
         import transformers as _tr
         from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
@@ -454,13 +634,14 @@ class WorldStereo:
         # ---- VAE ----
         vae_dtype = half_dtype
         rank0_log(f"Loading 3D-VAE… dtype={vae_dtype}")
-        vae = AutoencoderKLWan.from_pretrained(
-            cfg.base_model,
-            subfolder="vae",
-            torch_dtype=vae_dtype,
-            local_files_only=local_files_only,
-            **_DIFFUSERS_LOW_MEMORY_LOAD_KWARGS,
-        ).eval()
+        with _disable_diffusers_fp32_keep_modules(AutoencoderKLWan):
+            vae = AutoencoderKLWan.from_pretrained(
+                cfg.base_model,
+                subfolder="vae",
+                torch_dtype=vae_dtype,
+                local_files_only=local_files_only,
+                **_DIFFUSERS_VAE_LOAD_KWARGS,
+            ).eval()
 
         if fsdp:
             fsdp_kwargs = dict(

@@ -4,6 +4,7 @@ import sys
 import shutil
 import torch
 import stat
+import tempfile
 from pathlib import Path
 
 def on_rm_error(func, path, exc_info):
@@ -31,6 +32,101 @@ def run_command(cmd, cwd=None, env=None, check=True):
 def get_cuda_version():
     return torch.version.cuda
 
+
+def _cuda_version_tag(cuda_ver: str):
+    parts = (cuda_ver or "").split(".")
+    if len(parts) < 2:
+        return None
+    return f"v{parts[0]}.{parts[1]}"
+
+
+def _cuda_env_var_name(cuda_ver: str):
+    parts = (cuda_ver or "").split(".")
+    if len(parts) < 2:
+        return None
+    return f"CUDA_PATH_V{parts[0]}_{parts[1]}"
+
+
+def _nvcc_version_for_home(cuda_home: Path):
+    nvcc = cuda_home / "bin" / "nvcc.exe"
+    if not nvcc.exists():
+        nvcc = cuda_home / "bin" / "nvcc"
+    if not nvcc.exists():
+        return None
+    try:
+        output = subprocess.check_output(
+            f'"{nvcc}" --version',
+            shell=True,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+        )
+    except Exception:
+        return None
+    import re
+    match = re.search(r"release\s+(\d+\.\d+)", output)
+    return match.group(1) if match else None
+
+
+def find_matching_cuda_home(cuda_ver: str, script_dir: Path):
+    wanted = _cuda_version_tag(cuda_ver)
+    if not wanted:
+        return None
+    wanted_version = wanted[1:]
+
+    candidates = []
+    exact_env = _cuda_env_var_name(cuda_ver)
+    if exact_env and os.environ.get(exact_env):
+        candidates.append(Path(os.environ[exact_env]))
+
+    candidates.extend([
+        script_dir / "portable_cuda" / wanted,
+        script_dir / "cuda" / wanted,
+        Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA") / wanted,
+    ])
+
+    # Generic env vars are only acceptable if their nvcc version is exactly the
+    # one PyTorch was built against. Never use "latest" just because it is first.
+    for env_key in ("CUDA_HOME", "CUDA_PATH"):
+        value = os.environ.get(env_key)
+        if value:
+            candidates.append(Path(value))
+
+    for candidate in candidates:
+        if _nvcc_version_for_home(candidate) == wanted_version:
+            return candidate.resolve()
+
+    return None
+
+
+def apply_cuda_home_to_env(env: dict, cuda_home: Path | None):
+    if cuda_home is None:
+        return env
+    env = env.copy()
+    env["CUDA_HOME"] = str(cuda_home)
+    env["CUDA_PATH"] = str(cuda_home)
+    bin_dir = str(cuda_home / "bin")
+    env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def nvcc_version_from_env(env=None):
+    try:
+        output = subprocess.check_output(
+            "nvcc --version",
+            shell=True,
+            stderr=subprocess.STDOUT,
+            env=env,
+            text=True,
+            errors="replace",
+        )
+    except Exception:
+        return None, None
+    import re
+    match = re.search(r"release\s+(\d+\.\d+)", output)
+    return (match.group(1) if match else None), output
+
+
 def check_compiler():
     nvcc_ok = False
     cl_ok = False
@@ -49,6 +145,145 @@ def check_compiler():
 
     return nvcc_ok, cl_ok
 
+
+def get_portable_msvc_activator(msvc_dir: Path):
+    msvc_installed = msvc_dir / "MSVC"
+    vcvars = list(msvc_installed.rglob("vcvars64.bat"))
+
+    if not vcvars and (msvc_dir / "MSVC-Portable.bat").exists():
+        print("[INFO] Initializing Portable MSVC...")
+        subprocess.check_call(f'"{msvc_dir}/MSVC-Portable.bat"', shell=True, cwd=str(msvc_dir),
+                              stdin=subprocess.DEVNULL)
+        vcvars = list(msvc_installed.rglob("vcvars64.bat"))
+
+    return vcvars[0] if vcvars else None
+
+
+def run_with_optional_msvc(command: str, *, cwd=None, env=None, use_portable_msvc=False, msvc_dir: Path | None = None, check=True):
+    if use_portable_msvc:
+        activator = get_portable_msvc_activator(msvc_dir)
+        if activator is None:
+            print("[ERROR] Compiler setup failed.")
+            sys.exit(1)
+        command = f'"{activator}" && {command}'
+    return run_command(command, cwd=cwd, env=env, check=check)
+
+
+GSPLAT_SMOKE_TEST = r'''
+import torch
+from gsplat.rendering import rasterization
+
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA is not available")
+
+device = torch.device("cuda")
+means = torch.tensor([[0.0, 0.0, 2.0]], device=device)
+quats = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=device)
+scales = torch.tensor([[0.05, 0.05, 0.05]], device=device)
+opacities = torch.tensor([1.0], device=device)
+colors = torch.tensor([[1.0, 0.0, 0.0]], device=device)
+viewmats = torch.eye(4, device=device).unsqueeze(0)
+Ks = torch.tensor([[[32.0, 0.0, 16.0], [0.0, 32.0, 16.0], [0.0, 0.0, 1.0]]], device=device)
+
+rasterization(
+    means=means,
+    quats=quats,
+    scales=scales,
+    opacities=opacities,
+    colors=colors,
+    viewmats=viewmats,
+    Ks=Ks,
+    width=32,
+    height=32,
+    packed=False,
+)
+print("[OK] gsplat CUDA rasterization smoke test passed.")
+'''
+
+
+def gsplat_smoke_test(use_portable_msvc=False, msvc_dir: Path | None = None):
+    with tempfile.NamedTemporaryFile("w", suffix="_gsplat_smoke.py", delete=False, encoding="utf-8") as fh:
+        fh.write(GSPLAT_SMOKE_TEST)
+        smoke_path = fh.name
+    try:
+        cmd = f'"{sys.executable}" "{smoke_path}"'
+        return run_with_optional_msvc(
+            cmd,
+            use_portable_msvc=use_portable_msvc,
+            msvc_dir=msvc_dir,
+            check=False,
+        ) == 0
+    finally:
+        try:
+            os.remove(smoke_path)
+        except OSError:
+            pass
+
+
+def install_pypi_gsplat(use_portable_msvc=False, msvc_dir: Path | None = None):
+    print("\n[INFO] Trying official PyPI gsplat package (JIT builds CUDA on first run)...")
+    if run_command(f"{sys.executable} -m pip install gsplat", check=False) != 0:
+        return False
+    return verify_install(use_portable_msvc=use_portable_msvc, msvc_dir=msvc_dir, require_smoke=True)
+
+
+def verify_pytorch3d():
+    try:
+        import pytorch3d
+        version = getattr(pytorch3d, "__version__", "unknown")
+        print(f"[OK] pytorch3d {version} is importable.")
+        return True
+    except Exception as e:
+        print(f"[INFO] pytorch3d is not importable yet: {e}")
+        return False
+
+
+def install_pytorch3d(use_portable_msvc=False, msvc_dir: Path | None = None, cuda_home: Path | None = None):
+    print("\n==================================================")
+    print("   PyTorch3D Installer")
+    print("==================================================")
+
+    if verify_pytorch3d():
+        return
+
+    env = apply_cuda_home_to_env(os.environ.copy(), cuda_home)
+    env.setdefault("FORCE_CUDA", "1")
+    env.setdefault("PYTORCH3D_NO_NINJA", "0")
+    existing_nvcc_flags = env.get("NVCC_FLAGS", "")
+    if "-allow-unsupported-compiler" not in existing_nvcc_flags:
+        env["NVCC_FLAGS"] = f"{existing_nvcc_flags} -allow-unsupported-compiler".strip()
+
+    torch_cuda = get_cuda_version()
+    nvcc_version, nvcc_output = nvcc_version_from_env(env=env)
+    print(f"[INFO] PyTorch CUDA: {torch_cuda}; nvcc: {nvcc_version or 'not found'}")
+    if torch_cuda and nvcc_version and not torch_cuda.startswith(nvcc_version):
+        print("[WARN] Skipping PyTorch3D build because nvcc does not match PyTorch CUDA.")
+        print("[WARN] Install a CUDA Toolkit matching PyTorch CUDA or place it under scripts/portable_cuda/vX.Y.")
+        if nvcc_output:
+            print(nvcc_output)
+        return
+
+    try:
+        import ninja
+    except:
+        print("[INFO] Installing ninja build tool...")
+        run_command(f"{sys.executable} -m pip install ninja")
+
+    cmd = (
+        f'{sys.executable} -m pip install '
+        f'--no-build-isolation '
+        f'"git+https://github.com/facebookresearch/pytorch3d.git@stable"'
+    )
+    run_with_optional_msvc(
+        cmd,
+        env=env,
+        use_portable_msvc=use_portable_msvc,
+        msvc_dir=msvc_dir,
+    )
+
+    verify_pytorch3d()
+
+
 def build_gsplat():
     print("\n==================================================")
     print("   Safe gsplat Installer (Surgical Mode)")
@@ -65,16 +300,22 @@ def build_gsplat():
 
     script_dir = Path(__file__).parent.resolve()
     repo_root = script_dir.parent
-    for whl in sorted((repo_root / "gsplat").glob("gsplat*.whl"), key=os.path.getmtime, reverse=True):
-        print(f"[INFO] Found local wheel: {whl.name}")
-        if run_command(f"{sys.executable} -m pip install {whl} --force-reinstall --no-deps", check=False) == 0:
-            verify_install()
-            return
-
-    nvcc_ok, cl_ok = check_compiler()
     msvc_dir = script_dir / "portable_msvc"
     use_portable_msvc = False
+    cuda_home = find_matching_cuda_home(cuda_ver, script_dir)
+    if cuda_home is not None:
+        print(f"[INFO] Using CUDA toolkit matching PyTorch: {cuda_home}")
+        os.environ.update(apply_cuda_home_to_env(os.environ.copy(), cuda_home))
+    else:
+        exact_env = _cuda_env_var_name(cuda_ver)
+        wanted = _cuda_version_tag(cuda_ver)
+        print(f"[ERROR] No CUDA toolkit matching PyTorch CUDA {cuda_ver} was found.")
+        if exact_env:
+            print(f"[ERROR] Expected env var like {exact_env}=C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\{wanted}")
+        print(f"[ERROR] Refusing to use CUDA_HOME/CUDA_PATH/latest nvcc because it may not match PyTorch.")
+        sys.exit(1)
 
+    nvcc_ok, cl_ok = check_compiler()
     if not cl_ok:
         if (msvc_dir / "MSVC").exists() or (msvc_dir / "MSVC-Portable.bat").exists():
             use_portable_msvc = True
@@ -97,6 +338,17 @@ def build_gsplat():
             print("[ERROR] Failed to download compiler. Please install Visual Studio Build Tools manually.")
             sys.exit(1)
 
+    if install_pypi_gsplat(use_portable_msvc=use_portable_msvc, msvc_dir=msvc_dir):
+        install_pytorch3d(use_portable_msvc=use_portable_msvc, msvc_dir=msvc_dir, cuda_home=cuda_home)
+        return
+
+    for whl in sorted((repo_root / "gsplat").glob("gsplat*.whl"), key=os.path.getmtime, reverse=True):
+        print(f"[INFO] Found local wheel: {whl.name}")
+        if run_command(f"{sys.executable} -m pip install {whl} --force-reinstall --no-deps", check=False) == 0:
+            if verify_install(use_portable_msvc=use_portable_msvc, msvc_dir=msvc_dir, require_smoke=True):
+                install_pytorch3d(use_portable_msvc=use_portable_msvc, msvc_dir=msvc_dir, cuda_home=cuda_home)
+                return
+
     # Check for pre-built wheel
     print("\n[INFO] Checking for pre-built wheel...")
     cu_tag = f"cu{cuda_ver.replace('.', '')}"
@@ -114,8 +366,9 @@ def build_gsplat():
         cmd = f"{sys.executable} -m pip install gsplat --index-url {index_url} --no-deps"
         if run_command(cmd, check=False) == 0:
             print("[OK] Installed from official wheel!")
-            verify_install()
-            return
+            if verify_install(use_portable_msvc=use_portable_msvc, msvc_dir=msvc_dir, require_smoke=True):
+                install_pytorch3d(use_portable_msvc=use_portable_msvc, msvc_dir=msvc_dir, cuda_home=cuda_home)
+                return
 
     print("[INFO] No pre-built wheel found. Proceeding to build from source...")
 
@@ -142,24 +395,11 @@ def build_gsplat():
     wheel_cmd = f"{sys.executable} -m pip wheel . -w {dist_dir} --verbose --no-build-isolation"
 
     if use_portable_msvc:
-        msvc_installed = msvc_dir / "MSVC"
-        vcvars = list(msvc_installed.rglob("vcvars64.bat"))
-
-        activator = None
-        if vcvars:
-            activator = vcvars[0]
-        else:
-            print("[INFO] Initializing Portable MSVC...")
-            subprocess.check_call(f'"{msvc_dir}/MSVC-Portable.bat"', shell=True, cwd=str(msvc_dir),
-                                  stdin=subprocess.DEVNULL)
-            vcvars = list(msvc_installed.rglob("vcvars64.bat"))
-            if vcvars: activator = vcvars[0]
-
-        if activator:
-            full_cmd = f'"{activator}" && {wheel_cmd}'
-        else:
+        activator = get_portable_msvc_activator(msvc_dir)
+        if activator is None:
             print("[ERROR] Compiler setup failed.")
             sys.exit(1)
+        full_cmd = f'"{activator}" && {wheel_cmd}'
     else:
         full_cmd = wheel_cmd
 
@@ -179,14 +419,20 @@ def build_gsplat():
     print("\n==================================================")
     print("[OK] SUCCESS")
     print("==================================================")
-    verify_install()
+    if verify_install(use_portable_msvc=use_portable_msvc, msvc_dir=msvc_dir, require_smoke=True):
+        install_pytorch3d(use_portable_msvc=use_portable_msvc, msvc_dir=msvc_dir, cuda_home=cuda_home)
 
-def verify_install():
+def verify_install(use_portable_msvc=False, msvc_dir: Path | None = None, require_smoke=False):
     try:
         import gsplat
         print(f"[OK] gsplat {gsplat.__version__} is importable.")
+        if require_smoke and not gsplat_smoke_test(use_portable_msvc=use_portable_msvc, msvc_dir=msvc_dir):
+            print("[WARN] gsplat imports, but CUDA rasterization smoke test failed.")
+            return False
+        return True
     except Exception as e:
         print(f"[WARN] Installed but import failed: {e}")
+        return False
 
 if __name__ == "__main__":
     build_gsplat()
