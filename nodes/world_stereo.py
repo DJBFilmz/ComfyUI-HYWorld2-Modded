@@ -1627,6 +1627,7 @@ def _prepare_pipeline_inputs(
     device: str,
     width: int,
     height: int,
+    conditioning_frame_indices: torch.Tensor | None = None,
 ) -> dict:
     """
     Build render_video, render_mask, camera_embedding from a single image + trajectory.
@@ -1648,6 +1649,18 @@ def _prepare_pipeline_inputs(
         use_pytorch3d_renderer = False
 
     N = c2ws.shape[0]
+    if conditioning_frame_indices is None:
+        cond_indices = torch.arange(N, dtype=torch.long, device=c2ws.device)
+    else:
+        cond_indices = conditioning_frame_indices.to(device=c2ws.device, dtype=torch.long)
+        if cond_indices.numel() == 0:
+            cond_indices = torch.arange(N, dtype=torch.long, device=c2ws.device)
+        cond_indices = cond_indices.clamp(0, N - 1)
+    cond_c2ws = c2ws.index_select(0, cond_indices)
+    cond_intrs = intrs.index_select(0, cond_indices)
+    cond_N = cond_c2ws.shape[0]
+    if cond_N != N:
+        print(f"[WorldStereo] Conditioning frames prepared directly: {N} -> {cond_N}")
 
     # 1. Image tensor in [-1, 1] for pipeline
     img_tensor = T.ToTensor()(image_pil) * 2.0 - 1.0   # [3, H, W], range [-1, 1]
@@ -1693,8 +1706,8 @@ def _prepare_pipeline_inputs(
         torch.cuda.empty_cache()
 
     # 3. W2C matrices as PyTorch Tensors
-    w2cs_t = _c2w_to_w2c(c2ws).float()   # [N, 4, 4]
-    intrs_t = intrs.float()              # [N, 3, 3]
+    w2cs_t = _c2w_to_w2c(cond_c2ws).float()   # [cond_N, 4, 4]
+    intrs_t = cond_intrs.float()              # [cond_N, 3, 3]
     ref_w2c = w2cs_t[0:1]                # [1, 4, 4] reference view
     ref_K   = intrs_t[0:1]               # [1, 3, 3] reference view (preserves batch dim)
 
@@ -1710,7 +1723,7 @@ def _prepare_pipeline_inputs(
     if points3d is None or colors is None:
         raise RuntimeError("Point cloud construction failed.")
 
-    # 5. Render point cloud from all N target views
+    # 5. Render point cloud from selected conditioning target views
     render_result = point_rendering(
         K=intrs_t,
         w2cs=w2cs_t,
@@ -1759,9 +1772,9 @@ def _prepare_pipeline_inputs(
 
     # 6. Camera embedding [1, 6, N, H, W]
     camera_emb = get_camera_embedding(
-        intrinsic=intrs.to(torch_device),  # [N, 3, 3]
-        extrinsic=c2ws.to(torch_device),   # [N, 4, 4] C2W (is_w2c=False)
-        f=N, h=height, w=width,
+        intrinsic=cond_intrs.to(torch_device),  # [cond_N, 3, 3]
+        extrinsic=cond_c2ws.to(torch_device),   # [cond_N, 4, 4] C2W (is_w2c=False)
+        f=cond_N, h=height, w=width,
         normalize=True,
         is_w2c=False,
     ).to(dtype=conditioning_dtype)
@@ -2017,6 +2030,10 @@ class VNCCS_WorldStereoGenerate:
                     "default": "auto",
                     "tooltip": "auto encodes keyframe render conditioning at high resolutions to reduce VAE encode VRAM.",
                 }),
+                "conditioning_frame_mode": (["auto", "full", "keyframes"], {
+                    "default": "auto",
+                    "tooltip": "auto renders only keyframe conditioning when render_vae_mode uses keyframes.",
+                }),
                 "vae_memory_mode": (["auto", "off", "tiled", "sliced", "tiled+sliced"], {
                     "default": "auto",
                     "tooltip": "Enable diffusers VAE tiling/slicing when available to reduce high-resolution VAE VRAM.",
@@ -2058,6 +2075,7 @@ class VNCCS_WorldStereoGenerate:
         cache_conditioning=True,
         latent_condition_mode="auto",
         render_vae_mode="auto",
+        conditioning_frame_mode="auto",
         vae_memory_mode="auto",
         crop_generated_edges=False,
         edge_crop_percent=8.0,
@@ -2082,9 +2100,11 @@ class VNCCS_WorldStereoGenerate:
             latent_condition_mode = "first_frame_only" if high_res_pixels >= 768 * 480 else "full_vae"
         if render_vae_mode == "auto":
             render_vae_mode = "keyframes" if high_res_pixels >= 768 * 480 else "full"
+        if conditioning_frame_mode == "auto":
+            conditioning_frame_mode = "keyframes" if render_vae_mode == "keyframes" else "full"
         print(
             f"[WorldStereo] VAE conditioning modes: latent_condition={latent_condition_mode}, "
-            f"render_vae={render_vae_mode}"
+            f"render_vae={render_vae_mode}, conditioning_frames={conditioning_frame_mode}"
         )
         _configure_vae_memory_mode(pipeline, vae_memory_mode, W, H)
 
@@ -2203,6 +2223,14 @@ class VNCCS_WorldStereoGenerate:
             # Expand base intrinsics across all frames: [N, 3, 3]
             base_K_dev = base_K.to(intrs.device, dtype=intrs.dtype)
             intrs_abs = base_K_dev.unsqueeze(0).expand(N, -1, -1).clone()
+            conditioning_frame_indices = None
+            if conditioning_frame_mode == "keyframes":
+                conditioning_frame_indices = torch.arange(0, N, 4, dtype=torch.long, device=c2ws_abs.device)
+                if conditioning_frame_indices[-1].item() != N - 1:
+                    conditioning_frame_indices = torch.cat([
+                        conditioning_frame_indices,
+                        torch.tensor([N - 1], dtype=torch.long, device=c2ws_abs.device),
+                    ])
 
             # ── Preprocess Pipeline Inputs for the Slice ──
             print(f"[WorldStereo] Slice {b + 1} processing: depth estimation + point rendering...")
@@ -2215,6 +2243,7 @@ class VNCCS_WorldStereoGenerate:
                     device=device,
                     width=W,
                     height=H,
+                    conditioning_frame_indices=conditioning_frame_indices,
                 )
             if device == "cuda":
                 try:

@@ -880,6 +880,7 @@ class VNCCS_WorldMirrorV2_3D:
         # ── 1. Preprocess: ComfyUI IMAGE [B,H,W,C] → tensor [1,S,3,H,W] ─────
         B = images.shape[0]
         tensor_list = []
+        adjusted_intrinsics = camera_intrinsics.clone().float() if isinstance(camera_intrinsics, torch.Tensor) else None
 
         for i in range(B):
             img_np  = (images[i].cpu().numpy()[..., :3] * 255).astype(np.uint8)
@@ -887,26 +888,31 @@ class VNCCS_WorldMirrorV2_3D:
 
             t, orig_w, orig_h, new_w, new_h = _resize_to_tensor(pil_img, target_size)
 
+            if adjusted_intrinsics is not None:
+                sx, sy = new_w / orig_w, new_h / orig_h
+                adjusted_intrinsics[i, 0, 0] *= sx
+                adjusted_intrinsics[i, 1, 1] *= sy
+                adjusted_intrinsics[i, 0, 2] *= sx
+                adjusted_intrinsics[i, 1, 2] *= sy
+
             # centre-crop height if it exceeds target_size
             if new_h > target_size:
                 crop = (new_h - target_size) // 2
                 t = t[:, crop:crop + target_size, :]
-                if camera_intrinsics is not None:
-                    camera_intrinsics = camera_intrinsics.clone()
-                    camera_intrinsics[i, 1, 2] -= crop
+                if adjusted_intrinsics is not None:
+                    adjusted_intrinsics[i, 1, 2] -= crop
 
-            # scale intrinsics to match resized resolution
-            if camera_intrinsics is not None:
-                camera_intrinsics = camera_intrinsics.clone()
-                sx, sy = new_w / orig_w, new_h / orig_h
-                camera_intrinsics[i, 0, 0] *= sx
-                camera_intrinsics[i, 1, 1] *= sy
-                camera_intrinsics[i, 0, 2] *= sx
-                camera_intrinsics[i, 1, 2] *= sy
+            # centre-crop width if a future resize strategy ever exceeds target_size
+            if new_w > target_size:
+                crop = (new_w - target_size) // 2
+                t = t[:, :, crop:crop + target_size]
+                if adjusted_intrinsics is not None:
+                    adjusted_intrinsics[i, 0, 2] -= crop
 
             tensor_list.append(t)
 
         imgs_tensor = torch.stack(tensor_list).unsqueeze(0).to(exec_dev)  # [1,S,3,H,W]
+        camera_intrinsics = adjusted_intrinsics
 
         # ── 2. Build views dict + cond_flags ──────────────────────────────────
         views      = {"img": imgs_tensor}
