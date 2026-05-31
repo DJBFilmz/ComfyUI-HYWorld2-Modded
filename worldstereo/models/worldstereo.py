@@ -217,6 +217,14 @@ class WorldStereoModel(WanTransformer3DModel):
                 add_inputs = torch.cat([render_mask, camera_embedding], dim=1)
             else:
                 add_inputs = render_mask
+            # If mask_downsample is disabled, mask/camera conditioning arrives
+            # at pixel-frame rate while render_latent is already at keyframe
+            # latent rate. Match the latent frame count before projection.
+            if self.controlnet_cfg.get("mask_downsample", 4) == 1:
+                F_latent = render_latent.shape[2]
+                F_pixel = add_inputs.shape[2]
+                if F_pixel != F_latent:
+                    add_inputs = add_inputs[:, :, ::4]
             add_inputs = self.controlnet.controlnet_mask_embedding(add_inputs)
             controlnet_inputs = controlnet_inputs + add_inputs
             ### process controlnet inputs over ###
