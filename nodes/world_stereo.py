@@ -109,6 +109,129 @@ def _prepare_worldstereo_import_paths(base_dir: str = PROJECT_ROOT) -> str:
 
 _prepare_worldstereo_import_paths()
 
+def _node_output_first(output):
+    result = getattr(output, "result", output)
+    if isinstance(result, (tuple, list)):
+        if not result:
+            raise RuntimeError("SeedVR2 node returned an empty result.")
+        return result[0]
+    return result
+
+
+def _load_seedvr2_node_classes():
+    class_names = ("SeedVR2LoadDiTModel", "SeedVR2LoadVAEModel", "SeedVR2VideoUpscaler")
+
+    try:
+        import nodes as comfy_nodes
+        mappings = getattr(comfy_nodes, "NODE_CLASS_MAPPINGS", {}) or {}
+        classes = tuple(mappings.get(name) for name in class_names)
+        if all(cls is not None for cls in classes):
+            return classes
+    except Exception:
+        pass
+
+    loaded = {}
+    for module in list(sys.modules.values()):
+        if module is None:
+            continue
+        for name in class_names:
+            if name not in loaded and hasattr(module, name):
+                loaded[name] = getattr(module, name)
+        if all(name in loaded for name in class_names):
+            return tuple(loaded[name] for name in class_names)
+
+    raise RuntimeError(
+        "SeedVR2 classes are not registered in the running ComfyUI process. "
+        "Install/enable SeedVR2 Video Upscaler and restart ComfyUI so these node classes are loaded: "
+        + ", ".join(class_names)
+    )
+
+
+def _seedvr2_upscale_frames(
+    frames: torch.Tensor,
+    out_width: int,
+    out_height: int,
+    *,
+    seed: int = 42,
+    resolution: int = 0,
+    max_resolution: int = 0,
+    dit_model: str = "seedvr2_ema_3b-Q4_K_M.gguf",
+    vae_model: str = "ema_vae_fp16.safetensors",
+    device: str = "cuda:0",
+    offload_device: str = "cpu",
+    batch_size: int = 1,
+    color_correction: str = "lab",
+):
+    if frames.shape[0] == 0:
+        return frames
+    if frames.shape[1] == out_height and frames.shape[2] == out_width:
+        return frames.contiguous()
+
+    SeedVR2LoadDiTModel, SeedVR2LoadVAEModel, SeedVR2VideoUpscaler = _load_seedvr2_node_classes()
+    target_short_edge = int(resolution) if int(resolution) > 0 else min(int(out_width), int(out_height))
+    target_max_edge = int(max_resolution) if int(max_resolution) > 0 else max(int(out_width), int(out_height))
+
+    print(
+        "[WorldStereo] SeedVR2 upscaling generated frames: "
+        f"{frames.shape[2]}x{frames.shape[1]} -> {out_width}x{out_height}, frames={frames.shape[0]}"
+    )
+    try:
+        dit = _node_output_first(SeedVR2LoadDiTModel.execute(
+            model=dit_model,
+            device=device,
+            blocks_to_swap=0,
+            swap_io_components=False,
+            offload_device=offload_device,
+            cache_model=True,
+            attention_mode="sdpa",
+            torch_compile_args=None,
+        ))
+        vae = _node_output_first(SeedVR2LoadVAEModel.execute(
+            model=vae_model,
+            device=device,
+            encode_tiled=True,
+            encode_tile_size=1024,
+            encode_tile_overlap=128,
+            decode_tiled=True,
+            decode_tile_size=1024,
+            decode_tile_overlap=128,
+            tile_debug="false",
+            offload_device=offload_device,
+            cache_model=False,
+            torch_compile_args=None,
+        ))
+    except Exception:
+        raise
+
+    if isinstance(dit, dict):
+        dit = dict(dit)
+        dit["node_id"] = f"worldstereo_seedvr2_dit_{dit_model}"
+    if isinstance(vae, dict):
+        vae = dict(vae)
+        vae["node_id"] = f"worldstereo_seedvr2_vae_{vae_model}"
+
+    output = SeedVR2VideoUpscaler.execute(
+        image=frames.detach().cpu().float().clamp(0.0, 1.0).contiguous(),
+        dit=dit,
+        vae=vae,
+        seed=int(seed),
+        resolution=target_short_edge,
+        max_resolution=target_max_edge,
+        batch_size=max(1, int(batch_size)),
+        uniform_batch_size=False,
+        temporal_overlap=0,
+        prepend_frames=0,
+        color_correction=color_correction,
+        input_noise_scale=0.0,
+        latent_noise_scale=0.0,
+        offload_device=offload_device,
+        enable_debug=False,
+    )
+    upscaled = _node_output_first(output)
+    if not isinstance(upscaled, torch.Tensor):
+        raise RuntimeError(f"SeedVR2 returned {type(upscaled).__name__}, expected torch.Tensor.")
+    return upscaled.float().cpu().clamp(0.0, 1.0).contiguous()
+
 
 def _fallback_camera_backward_forward(c2w, distance):
     c2w[:3, 3:4] = (c2w @ np.array([0, 0, distance, 1.0], dtype=np.float32).reshape(4, 1))[:3]
@@ -570,6 +693,55 @@ def _build_trajectory(
             )
             c2ws_np.append(_opencv_look_at_c2w(cam_pos, target))
 
+    elif preset == "forward_orbit":
+        c2ws_np = []
+        orbit_radius = max(float(speed), 1e-4)
+        forward_distance = float(radius)
+        angles = np.linspace(0.0, 2.0 * math.pi, num_frames, endpoint=False, dtype=np.float32)
+        denom = max(1, num_frames - 1)
+        for frame_idx, angle in enumerate(angles):
+            t = float(frame_idx) / float(denom)
+            forward_z = forward_distance * t
+            cam_pos = np.array(
+                [
+                    orbit_radius * math.cos(float(angle)),
+                    orbit_radius * math.sin(float(angle)),
+                    forward_z,
+                ],
+                dtype=np.float32,
+            )
+            target = np.array([0.0, 0.0, forward_z + median_depth], dtype=np.float32)
+            c2ws_np.append(_opencv_look_at_c2w(cam_pos, target))
+
+    elif preset == "forward_lookaround":
+        c2ws_np = []
+        forward_distance = float(radius)
+        denom = max(1, num_frames - 1)
+        forward_phase = 0.40
+        left_phase = 0.25
+        for frame_idx in range(num_frames):
+            t = float(frame_idx) / float(denom)
+            if t <= forward_phase:
+                forward_z = forward_distance * (t / forward_phase)
+                yaw = 0.0
+            else:
+                forward_z = forward_distance
+                turn_t = (t - forward_phase) / max(1e-6, 1.0 - forward_phase)
+                if turn_t <= left_phase / (1.0 - forward_phase):
+                    local_t = turn_t / max(1e-6, left_phase / (1.0 - forward_phase))
+                    yaw = -0.5 * math.pi * local_t
+                else:
+                    local_t = (turn_t - left_phase / (1.0 - forward_phase)) / max(
+                        1e-6,
+                        1.0 - left_phase / (1.0 - forward_phase),
+                    )
+                    yaw = -0.5 * math.pi + math.pi * local_t
+
+            cam_pos = np.array([0.0, 0.0, forward_z], dtype=np.float32)
+            look_dir = np.array([math.sin(yaw), 0.0, math.cos(yaw)], dtype=np.float32)
+            target = cam_pos + look_dir * float(median_depth)
+            c2ws_np.append(_opencv_look_at_c2w(cam_pos, target))
+
     elif preset == "left_right":
         if not CAMERA_UTILS_AVAILABLE:
             raise RuntimeError(
@@ -654,14 +826,14 @@ WORLDSTEREO_TURBO_LORAS = {
 }
 
 
-def _download_worldstereo_turbo_lora(lora_name: str):
+def _download_worldstereo_turbo_lora(lora_name: str, models_base: str | None = None):
     spec = WORLDSTEREO_TURBO_LORAS.get(lora_name)
     if spec is None:
         return None, None
 
     from huggingface_hub import hf_hub_download
 
-    lora_dir = os.path.join(_get_models_base(), "loras", "wan")
+    lora_dir = os.path.join(models_base or _get_models_base(), "loras", "wan")
     os.makedirs(lora_dir, exist_ok=True)
     lora_path = os.path.join(lora_dir, spec["filename"])
 
@@ -714,8 +886,8 @@ def _patch_worldstereo_lora_adapter_scaling():
         print(f"[WorldStereo] LoRA adapter scaling patched for: {', '.join(patched)}")
 
 
-def _apply_worldstereo_turbo_lora(pipeline, lora_name: str, lora_strength: float):
-    lora_path, spec = _download_worldstereo_turbo_lora(lora_name)
+def _apply_worldstereo_turbo_lora(pipeline, lora_name: str, lora_strength: float, models_base: str | None = None):
+    lora_path, spec = _download_worldstereo_turbo_lora(lora_name, models_base=models_base)
     if spec is None:
         return None
 
@@ -946,6 +1118,11 @@ def _resolve_worldstereo_export_paths(export_path: str, model_type: str, precisi
     return output_file, metadata_file
 
 
+def _worldstereo_export_cache_dir(output_file: str) -> str:
+    output_dir = os.path.dirname(os.path.abspath(output_file)) or os.getcwd()
+    return os.path.join(output_dir, "_worldstereo_export_cache")
+
+
 def _read_safetensors_metadata(path: str) -> dict:
     try:
         from safetensors import safe_open
@@ -1026,11 +1203,15 @@ def _download_hf_repo_missing(repo_id: str, local_dir: str, label: str, allow_pa
     print(f"[WorldStereo] {label} cached: {local_dir}")
 
 
-def _download_worldstereo_single_loader_components(model_type: str, include_moge: bool = True) -> tuple:
+def _download_worldstereo_single_loader_components(
+    model_type: str,
+    include_moge: bool = True,
+    models_base: str | None = None,
+) -> tuple:
     """Download only files needed around a single transformer checkpoint."""
     from huggingface_hub import hf_hub_download, snapshot_download
 
-    base = _get_models_base()
+    base = models_base or _get_models_base()
 
     transformer_dir = os.path.join(base, "WorldStereo", model_type)
     config_path = os.path.join(transformer_dir, "config.json")
@@ -1086,20 +1267,28 @@ def _download_worldstereo_single_loader_components(model_type: str, include_moge
     return transformer_dir, base_model_dir, moge_dir
 
 
-def _download_worldstereo_components(model_type: str, include_moge: bool = True) -> tuple:
+def _download_worldstereo_components(
+    model_type: str,
+    include_moge: bool = True,
+    models_base: str | None = None,
+    worldstereo_models_base: str | None = None,
+    aux_models_base: str | None = None,
+) -> tuple:
     """
     Download all required model components. Returns (transformer_dir, base_model_dir, moge_dir).
     """
     from huggingface_hub import snapshot_download
 
-    base = _get_models_base()
+    base = models_base or _get_models_base()
+    worldstereo_base = worldstereo_models_base or base
+    aux_base = aux_models_base or base
 
     # 1. WorldStereo transformer weights
-    transformer_dir = os.path.join(base, "WorldStereo", model_type)
+    transformer_dir = os.path.join(worldstereo_base, "WorldStereo", model_type)
     transformer_weights = os.path.join(transformer_dir, "model.safetensors")
     if not os.path.exists(transformer_weights):
         print(f"[WorldStereo] Downloading transformer ({model_type}) ...")
-        tmp_dir = os.path.join(base, "WorldStereo", "_tmp")
+        tmp_dir = os.path.join(worldstereo_base, "WorldStereo", "_tmp")
         snapshot_download(
             repo_id="hanshanxue/WorldStereo",  
             allow_patterns=[f"{model_type}/**"],
@@ -1117,15 +1306,25 @@ def _download_worldstereo_components(model_type: str, include_moge: bool = True)
         print(f"[WorldStereo] Transformer cached: {transformer_dir}")
 
     # 2. Wan2.1 base model (VAE, T5, CLIP)
-    base_model_dir = os.path.join(base, "Wan2.1-I2V-14B-480P")
+    base_model_dir = os.path.join(aux_base, "Wan2.1-I2V-14B-480P")
     _download_hf_repo_missing(
         repo_id="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
         local_dir=base_model_dir,
         label="Wan2.1-I2V-14B-480P base model",
+        allow_patterns=[
+            "model_index.json",
+            "scheduler/**",
+            "tokenizer/**",
+            "text_encoder/**",
+            "image_encoder/**",
+            "image_processor/**",
+            "vae/**",
+            "transformer/**",
+        ],
     )
 
     # 3. MoGe depth estimator
-    moge_dir = os.path.join(base, "MoGe")
+    moge_dir = os.path.join(aux_base, "MoGe")
     if include_moge:
         moge_config = os.path.join(moge_dir, "config.json")
         if not os.path.exists(moge_config):
@@ -1157,14 +1356,36 @@ def _download_worldstereo_components(model_type: str, include_moge: bool = True)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class VNCCS_CameraTrajectoryBuilder:
-    PRESETS = ["circular", "stereo_orbit", "forward", "zoom_in", "zoom_out", "left_right", "up_down", "aerial", "custom"]
+    PRESETS = ["circular", "stereo_orbit", "forward_orbit", "forward_lookaround", "forward", "zoom_in", "zoom_out", "left_right", "up_down", "aerial", "custom"]
+    PRESET_TOOLTIP = (
+        "Trajectory preset:\n"
+        "circular: classic orbit around the scene; radius controls orbit size, median_depth controls look-at distance.\n"
+        "stereo_orbit: compact parallax orbit for stereo/detail capture; speed controls parallax radius.\n"
+        "forward_orbit: moves forward while orbiting/parallaxing; radius controls forward distance, speed controls parallax radius.\n"
+        "forward_lookaround: moves forward, then looks 90 deg left and sweeps to 90 deg right; radius controls forward distance.\n"
+        "forward: straight forward camera move; speed controls per-frame movement.\n"
+        "zoom_in: forward zoom over the whole path; radius controls total distance.\n"
+        "zoom_out: backward zoom over the whole path; radius controls total distance.\n"
+        "left_right: lateral slide from left to right; radius controls span.\n"
+        "up_down: vertical slide from up to down; radius controls span.\n"
+        "aerial: tilt/orbit upward camera motion; elevation_deg controls angle.\n"
+        "custom: use custom_json list of 4x4 C2W camera matrices."
+    )
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "optional": {
-                "preset": (cls.PRESETS, {"default": "stereo_orbit"}),
-                "num_frames": ("INT", {"default": 25, "min": 4, "max": 81}),
+                "preset": (cls.PRESETS, {
+                    "default": "stereo_orbit",
+                    "tooltip": cls.PRESET_TOOLTIP,
+                }),
+                "num_frames": ("INT", {
+                    "default": 5,
+                    "min": 1,
+                    "max": 21,
+                    "tooltip": "Final WorldStereo frames. Dense conditioning frames are calculated internally.",
+                }),
                 "radius": (
                     "FLOAT",
                     {
@@ -1172,17 +1393,17 @@ class VNCCS_CameraTrajectoryBuilder:
                         "min": 0.1,
                         "max": 10.0,
                         "step": 0.1,
-                        "tooltip": "Orbit radius, travel distance, or lateral/up-down span depending on preset.",
+                        "tooltip": "Orbit radius, travel distance, or lateral/up-down span depending on preset. For forward_orbit/forward_lookaround this is the forward distance.",
                     },
                 ),
                 "speed": (
                     "FLOAT",
                     {
-                        "default": 0.05,
+                        "default": 0.08,
                         "min": 0.001,
                         "max": 1.0,
                         "step": 0.001,
-                        "tooltip": "Per-frame translation for forward preset or parallax radius for stereo_orbit.",
+                        "tooltip": "Per-frame translation for forward preset or parallax radius for stereo_orbit/forward_orbit.",
                     },
                 ),
                 "elevation_deg": (
@@ -1207,15 +1428,33 @@ class VNCCS_CameraTrajectoryBuilder:
                 ),
                 "fov_deg": (
                     "FLOAT",
-                    {"default": 70.0, "min": 10.0, "max": 150.0, "step": 1.0},
+                    {
+                        "default": 70.0,
+                        "min": 10.0,
+                        "max": 150.0,
+                        "step": 1.0,
+                        "tooltip": "Camera field of view in degrees for all generated trajectory frames.",
+                    },
                 ),
                 "image_width": (
                     "INT",
-                    {"default": 768, "min": 64, "max": 2048, "step": 64},
+                    {
+                        "default": 768,
+                        "min": 64,
+                        "max": 2048,
+                        "step": 64,
+                        "tooltip": "Generation/conditioning width used to build camera intrinsics.",
+                    },
                 ),
                 "image_height": (
                     "INT",
-                    {"default": 480, "min": 64, "max": 2048, "step": 64},
+                    {
+                        "default": 480,
+                        "min": 64,
+                        "max": 2048,
+                        "step": 64,
+                        "tooltip": "Generation/conditioning height used to build camera intrinsics.",
+                    },
                 ),
                 "custom_json": (
                     "STRING",
@@ -1236,9 +1475,9 @@ class VNCCS_CameraTrajectoryBuilder:
     def build(
         self,
         preset="circular",
-        num_frames=25,
+        num_frames=5,
         radius=1.0,
-        speed=0.05,
+        speed=0.08,
         elevation_deg=15.0,
         median_depth=1.0,
         fov_deg=70.0,
@@ -1246,9 +1485,20 @@ class VNCCS_CameraTrajectoryBuilder:
         image_height=480,
         custom_json="[]",
     ):
+        raw_num_frames = max(1, int(num_frames))
+        if raw_num_frames > 21:
+            requested_output_frames = max(1, (raw_num_frames - 1) // 4 + 1)
+            print(
+                "[Trajectory] legacy num_frames detected; interpreting "
+                f"{raw_num_frames} conditioning frames as {requested_output_frames} final frames."
+            )
+        else:
+            requested_output_frames = raw_num_frames
+        conditioning_frames = requested_output_frames if preset == "custom" else (requested_output_frames - 1) * 4 + 1
+
         c2ws, intrs = _build_trajectory(
             preset,
-            num_frames,
+            conditioning_frames,
             radius,
             speed,
             elevation_deg,
@@ -1264,9 +1514,12 @@ class VNCCS_CameraTrajectoryBuilder:
             "width": image_width,
             "height": image_height,
             "preset": preset,
+            "requested_output_frames": requested_output_frames,
+            "conditioning_frames": int(c2ws.shape[0]),
         }
         print(
-            f"[Trajectory] preset={preset}, frames={c2ws.shape[0]}, "
+            f"[Trajectory] preset={preset}, final_frames={requested_output_frames}, "
+            f"conditioning_frames={c2ws.shape[0]}, "
             f"size={image_width}x{image_height}"
         )
         return (trajectory,)
@@ -1939,17 +2192,43 @@ def _crop_generated_edges(frames: torch.Tensor, intrs: torch.Tensor, crop_percen
     return cropped.contiguous(), adjusted_intrs
 
 
-def _resize_frames_and_intrinsics(frames: torch.Tensor, intrs: torch.Tensor, out_width: int, out_height: int):
+def _resize_frames_and_intrinsics(
+    frames: torch.Tensor,
+    intrs: torch.Tensor,
+    out_width: int,
+    out_height: int,
+    upscale_mode: str = "bicubic",
+    seedvr2_options: dict | None = None,
+):
     if frames.shape[1] == out_height and frames.shape[2] == out_width:
         return frames.contiguous(), intrs
 
     in_height, in_width = frames.shape[1], frames.shape[2]
-    resized = torch.nn.functional.interpolate(
-        frames.permute(0, 3, 1, 2),
-        size=(out_height, out_width),
-        mode="bicubic",
-        align_corners=False,
-    ).permute(0, 2, 3, 1).clamp(0.0, 1.0)
+    if upscale_mode == "seedvr2":
+        resized = _seedvr2_upscale_frames(
+            frames,
+            out_width,
+            out_height,
+            **(seedvr2_options or {}),
+        )
+        if resized.shape[1] != out_height or resized.shape[2] != out_width:
+            print(
+                "[WorldStereo] SeedVR2 output size differs from source target; "
+                f"final bicubic fit {resized.shape[2]}x{resized.shape[1]} -> {out_width}x{out_height}"
+            )
+            resized = torch.nn.functional.interpolate(
+                resized.permute(0, 3, 1, 2),
+                size=(out_height, out_width),
+                mode="bicubic",
+                align_corners=False,
+            ).permute(0, 2, 3, 1).clamp(0.0, 1.0)
+    else:
+        resized = torch.nn.functional.interpolate(
+            frames.permute(0, 3, 1, 2),
+            size=(out_height, out_width),
+            mode="bicubic",
+            align_corners=False,
+        ).permute(0, 2, 3, 1).clamp(0.0, 1.0)
 
     adjusted_intrs = intrs.clone()
     adjusted_intrs[:, 0, :] *= float(out_width) / float(in_width)
@@ -1965,7 +2244,11 @@ def _worldstereo_keyframe_indices(num_frames: int, device=None) -> torch.Tensor:
     return torch.unique_consecutive(indices.clamp(0, int(num_frames) - 1))
 
 
-def _worldstereo_output_frame_indices(num_condition_frames: int, num_output_frames: int, device=None) -> torch.Tensor:
+def _worldstereo_output_frame_indices(
+    num_condition_frames: int,
+    num_output_frames: int,
+    device=None,
+) -> torch.Tensor:
     if num_output_frames <= 0:
         return torch.empty(0, dtype=torch.long, device=device)
     if num_output_frames == num_condition_frames:
@@ -1981,6 +2264,13 @@ def _worldstereo_output_frame_indices(num_condition_frames: int, num_output_fram
         int(num_output_frames),
         device=device,
     ).round().long().clamp(0, int(num_condition_frames) - 1)
+
+
+def _worldstereo_pose_pitch_deg(pose: torch.Tensor) -> float:
+    R = pose[:3, :3].detach().cpu().float()
+    forward = R @ torch.tensor([0.0, 0.0, 1.0])
+    pitch = torch.asin(torch.clamp(-forward[1] / forward.norm().clamp_min(1e-8), -1.0, 1.0))
+    return float(pitch.item() * 180.0 / math.pi)
 
 
 def _drop_duplicate_first_frame(
@@ -2095,6 +2385,34 @@ class VNCCS_WorldStereoGenerate:
                     "default": "stereo_only",
                     "tooltip": "prepend_source_highres outputs the original high-res source view first, followed by generated frames resized to that source size.",
                 }),
+                "generated_upscale_mode": (["bicubic", "seedvr2"], {
+                    "default": "bicubic",
+                    "tooltip": "Upscaler used when prepend_source_highres needs generated video frames resized to the source image resolution.",
+                }),
+                "seedvr2_seed": ("INT", {
+                    "default": 42,
+                    "min": 0,
+                    "max": 2**32 - 1,
+                    "tooltip": "SeedVR2 seed used only when generated_upscale_mode=seedvr2.",
+                }),
+                "seedvr2_resolution": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 16384,
+                    "step": 2,
+                    "tooltip": "0 = use the source image short edge for SeedVR2 resolution.",
+                }),
+                "seedvr2_max_resolution": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 16384,
+                    "step": 2,
+                    "tooltip": "0 = use the source image long edge as SeedVR2 max_resolution.",
+                }),
+                "video_view_filter": (["all_views", "zero_pitch_only"], {
+                    "default": "all_views",
+                    "tooltip": "zero_pitch_only runs WorldStereo video only for near-horizontal panorama views; other views pass through as high-res anchors.",
+                }),
                 "edge_crop_percent": (
                     "FLOAT",
                     {
@@ -2132,6 +2450,11 @@ class VNCCS_WorldStereoGenerate:
         vae_memory_mode="auto",
         crop_generated_edges=False,
         worldmirror_sequence_mode="stereo_only",
+        generated_upscale_mode="bicubic",
+        seedvr2_seed=42,
+        seedvr2_resolution=0,
+        seedvr2_max_resolution=0,
+        video_view_filter="all_views",
         edge_crop_percent=8.0,
         base_camera_poses=None,
         base_camera_intrinsics=None,
@@ -2170,11 +2493,11 @@ class VNCCS_WorldStereoGenerate:
                 f"forcing guidance_scale {guidance_scale} -> 1.0"
             )
             guidance_scale = 1.0
-        if trajectory_preset == "stereo_orbit" and not crop_generated_edges:
+        if trajectory_preset in ("stereo_orbit", "forward_orbit") and not crop_generated_edges:
             crop_generated_edges = True
             edge_crop_percent = max(float(edge_crop_percent), 6.0)
             print(
-                "[WorldStereo] stereo_orbit trajectory detected; "
+                f"[WorldStereo] {trajectory_preset} trajectory detected; "
                 f"auto edge crop enabled ({edge_crop_percent:.1f}%)"
             )
 
@@ -2271,12 +2594,6 @@ class VNCCS_WorldStereoGenerate:
                 # Fallback to standard intrinsics from the trajectory
                 base_K = intrs[0]
 
-            # Compose absolute trajectory camera-to-world (c2w) matrices: T_abs = T_base * T_trajectory
-            base_pose_dev = base_pose.to(c2ws.device, dtype=c2ws.dtype)
-            # Use explicit batch expansion and bmm to avoid batch broadcasting issues in PyTorch
-            base_pose_expanded = base_pose_dev.unsqueeze(0).expand(N, -1, -1)  # [N, 4, 4]
-            c2ws_abs = torch.bmm(base_pose_expanded, c2ws)                     # [N, 4, 4]
-
             base_K_raw = base_K.to(intrs.device, dtype=intrs.dtype)
             base_K_dev = base_K_raw.clone()
             base_K_source = base_K_raw.clone()
@@ -2287,11 +2604,37 @@ class VNCCS_WorldStereoGenerate:
                 else:
                     base_K_source[0, :] *= float(source_w) / float(W)
                     base_K_source[1, :] *= float(source_h) / float(H)
+
+            base_pitch = _worldstereo_pose_pitch_deg(base_pose)
+            should_video = video_view_filter != "zero_pitch_only" or abs(base_pitch) <= 1.0
+            if not should_video:
+                if worldmirror_sequence_mode != "prepend_source_highres":
+                    print(
+                        "[WorldStereo] video_view_filter=zero_pitch_only requires "
+                        "worldmirror_sequence_mode=prepend_source_highres for skipped views; passing source anchor."
+                    )
+                print(
+                    "[WorldStereo] Skipping stereo video for non-zero pitch view: "
+                    f"slice={b + 1}/{B}, pitch={base_pitch:.2f}°"
+                )
+                all_video_frames.append(source_frame.unsqueeze(0).contiguous())
+                all_camera_poses.append(base_pose.cpu().float().unsqueeze(0))
+                all_camera_intrinsics.append(base_K_source.cpu().float().unsqueeze(0))
+                continue
+
+            # Compose absolute trajectory camera-to-world (c2w) matrices: T_abs = T_base * T_trajectory
+            base_pose_dev = base_pose.to(c2ws.device, dtype=c2ws.dtype)
+            # Use explicit batch expansion and bmm to avoid batch broadcasting issues in PyTorch
+            base_pose_expanded = base_pose_dev.unsqueeze(0).expand(N, -1, -1)  # [N, 4, 4]
+            c2ws_abs = torch.bmm(base_pose_expanded, c2ws)                     # [N, 4, 4]
             # Expand generation-resolution intrinsics across all frames: [N, 3, 3]
             intrs_abs = base_K_dev.unsqueeze(0).expand(N, -1, -1).clone()
             conditioning_frame_indices = None
             if conditioning_frame_mode == "keyframes":
-                conditioning_frame_indices = _worldstereo_keyframe_indices(N, device=c2ws_abs.device)
+                conditioning_frame_indices = _worldstereo_keyframe_indices(
+                    N,
+                    device=c2ws_abs.device,
+                )
 
             # ── Preprocess Pipeline Inputs for the Slice ──
             print(f"[WorldStereo] Slice {b + 1} processing: depth estimation + point rendering...")
@@ -2339,7 +2682,10 @@ class VNCCS_WorldStereoGenerate:
                     pipeline_inputs = _move_pipeline_inputs(pipeline_inputs, device)
                 if render_vae_mode == "keyframes":
                     render_video = pipeline_inputs.get("render_video")
-                    keyframe_indices = _worldstereo_keyframe_indices(N, device=render_video.device) if isinstance(render_video, torch.Tensor) else None
+                    keyframe_indices = _worldstereo_keyframe_indices(
+                        N,
+                        device=render_video.device,
+                    ) if isinstance(render_video, torch.Tensor) else None
                     if isinstance(render_video, torch.Tensor) and render_video.shape[2] != keyframe_indices.numel():
                         pipeline_inputs["render_video"] = render_video.index_select(2, keyframe_indices).contiguous()
                         render_mask = pipeline_inputs.get("render_mask")
@@ -2360,6 +2706,8 @@ class VNCCS_WorldStereoGenerate:
                     "output_type": "pt",
                     "latent_cond_mode": latent_condition_mode,
                 }
+                if "dmd" in model_type:
+                    pipeline_kwargs["mode"] = "test"
                 if cache_conditioning:
                     pipeline_kwargs.update({
                         "prompt": None,
@@ -2425,6 +2773,12 @@ class VNCCS_WorldStereoGenerate:
                     slice_intrs,
                     source_w,
                     source_h,
+                    upscale_mode=generated_upscale_mode,
+                    seedvr2_options={
+                        "seed": seedvr2_seed,
+                        "resolution": seedvr2_resolution,
+                        "max_resolution": seedvr2_max_resolution,
+                    } if generated_upscale_mode == "seedvr2" else None,
                 )
                 anchor_frame = source_frame.unsqueeze(0).to(slice_video_frames.dtype)
                 anchor_pose = base_pose.cpu().float().unsqueeze(0)
@@ -2532,7 +2886,16 @@ class VNCCS_ExportWorldStereoSingleModel:
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
 
-        transformer_dir, base_model_dir, _ = _download_worldstereo_components(model_type, include_moge=False)
+        export_models_base = _worldstereo_export_cache_dir(output_file)
+        os.makedirs(export_models_base, exist_ok=True)
+        print(f"[WorldStereo Export] Using export-local model cache: {export_models_base}")
+
+        transformer_dir, base_model_dir, _ = _download_worldstereo_components(
+            model_type,
+            include_moge=False,
+            worldstereo_models_base=export_models_base,
+            aux_models_base=_get_models_base(),
+        )
         transformer_dir = transformer_dir.replace("\\", "/")
 
         current_dir = os.path.dirname(os.path.dirname(__file__))
@@ -2554,7 +2917,12 @@ class VNCCS_ExportWorldStereoSingleModel:
             )
 
         pipeline = worldstereo.pipeline
-        turbo_lora_path = _apply_worldstereo_turbo_lora(pipeline, turbo_lora, lora_strength)
+        turbo_lora_path = _apply_worldstereo_turbo_lora(
+            pipeline,
+            turbo_lora,
+            lora_strength,
+            models_base=export_models_base,
+        )
         export_precision = "bf16" if precision == "int4" else precision
         actual_precision = _apply_worldstereo_transformer_export_precision(pipeline, export_precision)
 
@@ -2591,14 +2959,11 @@ class VNCCS_ExportWorldStereoSingleModel:
             "int4_packed_bytes": str(int4_bytes),
             "turbo_lora": turbo_lora,
             "lora_strength": str(float(lora_strength)),
-            "turbo_lora_path": turbo_lora_path or "",
-            "base_model_dir": base_model_dir,
-            "worldstereo_transformer_dir": transformer_dir,
             "num_tensors": str(len(state)),
             "num_params": str(total_params),
             "tensor_bytes": str(total_bytes),
             "dtype_summary": json.dumps(dtype_summary, sort_keys=True),
-            "note": "Contains WorldStereo transformer only: base WAN transformer plus WorldStereo weights. T5/CLIP/VAE are not included.",
+            "note": "Portable single WorldStereo transformer. T5/CLIP/VAE/MoGe are resolved by the loader and are not included.",
         }
 
         print(f"[WorldStereo Export] Saving single transformer checkpoint: {output_file}")

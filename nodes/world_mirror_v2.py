@@ -254,6 +254,68 @@ def _rescale_input_pose_translation_to_prediction(input_poses, predicted_poses, 
     return out
 
 
+def _suppress_generated_surfaces_seen_by_anchors(
+    pts,
+    depth_hi,
+    poses,
+    intrs,
+    anchor_frames,
+    abs_tol=0.035,
+    rel_tol=0.035,
+):
+    if pts.dim() != 4 or depth_hi.dim() != 3 or poses.shape[0] != pts.shape[0]:
+        return torch.ones(depth_hi.shape, dtype=torch.bool)
+
+    S, H, W, _ = pts.shape
+    if anchor_frames.shape[0] != S or not bool(anchor_frames.any()) or not bool((~anchor_frames).any()):
+        return torch.ones((S, H, W), dtype=torch.bool)
+
+    keep = torch.ones((S, H, W), dtype=torch.bool)
+    anchor_ids = torch.where(anchor_frames)[0]
+    generated_ids = torch.where(~anchor_frames)[0]
+    total_generated = int(generated_ids.numel() * H * W)
+    suppressed = 0
+
+    for gen_id_t in generated_ids:
+        gen_id = int(gen_id_t.item())
+        points = pts[gen_id].reshape(-1, 3).float()
+        covered = torch.zeros(points.shape[0], dtype=torch.bool)
+
+        for anchor_id_t in anchor_ids:
+            anchor_id = int(anchor_id_t.item())
+            R = poses[anchor_id, :3, :3].float()
+            t = poses[anchor_id, :3, 3].float()
+            cam = (points - t) @ R
+            z = cam[:, 2]
+            valid = z > 1e-6
+            if not bool(valid.any()):
+                continue
+
+            K = intrs[anchor_id].float()
+            u = torch.round(cam[:, 0] * K[0, 0] / z.clamp_min(1e-6) + K[0, 2]).long()
+            v = torch.round(cam[:, 1] * K[1, 1] / z.clamp_min(1e-6) + K[1, 2]).long()
+            valid = valid & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+            if not bool(valid.any()):
+                continue
+
+            valid_ids = torch.where(valid)[0]
+            anchor_depth = depth_hi[anchor_id, v[valid_ids], u[valid_ids]].float()
+            tol = float(abs_tol) + float(rel_tol) * anchor_depth.abs()
+            same_or_in_front = z[valid_ids] <= anchor_depth + tol
+            covered[valid_ids[same_or_in_front]] = True
+
+        frame_keep = ~covered.reshape(H, W)
+        keep[gen_id] = frame_keep
+        suppressed += int(covered.sum().item())
+
+    if suppressed > 0:
+        print(
+            "[V2 EXP] Suppressed low-res stereo splats already covered by high-res anchors: "
+            f"{suppressed}/{total_generated} ({100.0 * suppressed / max(total_generated, 1):.2f}%)"
+        )
+    return keep
+
+
 def _apply_mask_to_splats(splats, mask_np):
     if splats is None or mask_np is None:
         return splats
@@ -304,6 +366,7 @@ def _voxel_prune_splats_dict(splats, voxel_size):
         scales = get_item("scales").detach().cpu()
         quats = get_item("quats").detach().cpu()
         opacities = get_item("opacities").detach().cpu().reshape(-1)
+        opacity_max = opacities.max().detach().clone() if opacities.numel() else torch.tensor(1.0)
         colors = get_item(color_key).detach().cpu()
         if colors.dim() == 3 and colors.shape[1] == 1:
             colors_for_prune = colors[:, 0, :]
@@ -319,6 +382,7 @@ def _voxel_prune_splats_dict(splats, voxel_size):
         means, scales, quats, colors_new, opacities = _voxel_prune_gaussians(
             means, scales, quats, colors_for_prune, opacities, weights, voxel_size=voxel_size
         )
+        opacities = opacities.clamp_max(opacity_max)
         pruned["means"].append(means)
         pruned["scales"].append(scales)
         pruned["quats"].append(quats)
@@ -1617,9 +1681,22 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
         poses = _rescale_input_pose_translation_to_prediction(camera_poses, predicted_poses)
         intrs = highres_intrs.detach().cpu().float()
         pts, _, _ = depth_to_world_coords_points(depth_hi, poses, intrs)
-        means = pts.reshape(1, S * H * W, 3)
-        sh = ((highres_imgs.permute(0, 1, 3, 4, 2).reshape(1, S * H * W, 3) - 0.5) / 0.28209479177387814).float()
-        depth_flat = depth_hi.reshape(1, S * H * W)
+        pose_t = poses[:, :3, 3]
+        anchor_frames = pose_t.norm(dim=1) <= 1e-5
+        keep_mask = _suppress_generated_surfaces_seen_by_anchors(
+            pts,
+            depth_hi,
+            poses,
+            intrs,
+            anchor_frames,
+        )
+        keep_flat = keep_mask.reshape(-1)
+        pts_flat = pts.reshape(S * H * W, 3)[keep_flat]
+        rgb_flat = highres_imgs.permute(0, 1, 3, 4, 2).reshape(S * H * W, 3)[keep_flat]
+        depth_flat_values = depth_hi.reshape(S * H * W)[keep_flat]
+        means = pts_flat.unsqueeze(0)
+        sh = ((rgb_flat.unsqueeze(0) - 0.5) / 0.28209479177387814).float()
+        depth_flat = depth_flat_values.unsqueeze(0)
 
         def depth_adaptive_scales():
             d_min = depth_flat.min()
@@ -1645,7 +1722,7 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
                 float(splat_scale),
                 float(splat_scale) * float(depth_scale_max),
             )
-            return scales_hw.reshape(1, S * H * W, 1).expand_as(means).float()
+            return scales_hw.reshape(S * H * W, 1)[keep_flat].unsqueeze(0).expand_as(means).float()
 
         if scale_mode == "hybrid_adaptive":
             scales_depth, multiplier = depth_adaptive_scales()
@@ -1674,6 +1751,19 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
         opacities = torch.full((1, means.shape[1]), float(splat_opacity), dtype=torch.float32)
         quats = torch.zeros((1, means.shape[1], 4), dtype=torch.float32)
         quats[..., 0] = 1.0
+        weights = torch.ones((1, means.shape[1]), dtype=torch.float32)
+        if bool(anchor_frames.any()) and bool((~anchor_frames).any()):
+            anchor_weight = 64.0
+            frame_weights = torch.where(
+                anchor_frames,
+                torch.full_like(pose_t[:, 0], anchor_weight),
+                torch.ones_like(pose_t[:, 0]),
+            )
+            weights = frame_weights[:, None].expand(S, H * W).reshape(S * H * W)[keep_flat].unsqueeze(0).float()
+            print(
+                "[V2 EXP] High-res anchor splat priority enabled: "
+                f"anchors={int(anchor_frames.sum().item())}/{S}, weight={anchor_weight:g}"
+            )
 
         splats = {
             "means": means,
@@ -1681,6 +1771,7 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
             "quats": quats,
             "opacities": opacities,
             "sh": sh[:, :, None, :],
+            "weights": weights,
         }
         n_before = means.shape[1]
         if voxel_prune:

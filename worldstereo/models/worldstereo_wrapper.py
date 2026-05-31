@@ -375,6 +375,12 @@ def _get_half_dtype() -> torch.dtype:
         return torch.bfloat16
 
 
+def _get_dist_rank_or_zero() -> int:
+    if not dist.is_available() or not dist.is_initialized():
+        return 0
+    return dist.get_rank()
+
+
 class WorldStereo:
     """Diffusers-style wrapper that owns every sub-model and its pipeline."""
 
@@ -959,7 +965,7 @@ class WorldStereo:
                 shift=cfg.gen_shift,
                 use_timestep_transform=True,
                 dmd_steps=cfg.dmd_steps,
-                rank=dist.get_rank(),
+                rank=_get_dist_rank_or_zero(),
             )
             return RefKFDMDGeneratorPipeline(
                 **common,
