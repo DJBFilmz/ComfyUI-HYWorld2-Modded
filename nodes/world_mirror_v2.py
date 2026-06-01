@@ -1471,6 +1471,10 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
             "default": 1.75, "min": 0.0, "max": 8.0, "step": 0.05,
             "tooltip": "Preserve proportionally more far-depth splats when applying splat_upsample_max_points."
         })
+        optional["splat_upsample_calibrate_pose_scale"] = ("BOOLEAN", {
+            "default": False,
+            "tooltip": "Rescale input camera translations using WorldMirror-predicted cameras. Keep off when external cameras are authoritative."
+        })
         return inputs
 
     def _splat_value_to_points(self, value):
@@ -1635,6 +1639,7 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
         voxel_size,
         max_points,
         cap_far_bias,
+        calibrate_pose_scale=False,
     ):
         if not V2_UTILS_AVAILABLE:
             print("⚠️ [V2 EXP] splat upsample skipped: V2 utilities unavailable.")
@@ -1675,10 +1680,17 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
             align_corners=False,
         )[:, 0]
 
-        predicted_poses = raw.get("camera_poses")
-        if predicted_poses is None and len(output) > 3:
-            predicted_poses = output[3]
-        poses = _rescale_input_pose_translation_to_prediction(camera_poses, predicted_poses)
+        if calibrate_pose_scale:
+            predicted_poses = raw.get("camera_poses")
+            if predicted_poses is None and len(output) > 3:
+                predicted_poses = output[3]
+            poses = _rescale_input_pose_translation_to_prediction(camera_poses, predicted_poses)
+        else:
+            poses = _extract_pose_tensor(camera_poses)
+            if poses is None:
+                print("⚠️ [V2 EXP] splat upsample skipped: invalid input camera_poses.")
+                return output
+            print("[V2 EXP] Using input camera translations without predicted scale calibration.")
         intrs = highres_intrs.detach().cpu().float()
         pts, _, _ = depth_to_world_coords_points(depth_hi, poses, intrs)
         pose_t = poses[:, :3, 3]
@@ -1833,6 +1845,7 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
         splat_upsample_voxel_size=0.0015,
         splat_upsample_max_points=9_000_000,
         splat_upsample_cap_far_bias=1.75,
+        splat_upsample_calibrate_pose_scale=False,
         **kwargs,
     ):
         kwargs = dict(kwargs)
@@ -1859,6 +1872,7 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
                 splat_upsample_voxel_size,
                 splat_upsample_max_points,
                 splat_upsample_cap_far_bias,
+                splat_upsample_calibrate_pose_scale,
             )
         return output
 
