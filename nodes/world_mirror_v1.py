@@ -134,6 +134,22 @@ def build_camera_pose_matrix(pitch_deg, yaw_deg, roll_deg=0.0, pose_convention="
     pose[:3, :3] = R
     return pose
 
+
+def _camera_debug_angles_from_pose(pose):
+    pose = np.asarray(pose, dtype=np.float32)
+    forward = pose[:3, 2]
+    norm = max(float(np.linalg.norm(forward)), 1e-8)
+    yaw = math.degrees(math.atan2(float(forward[0]), float(forward[2])))
+    pitch = math.degrees(math.asin(max(-1.0, min(1.0, -float(forward[1]) / norm))))
+    up = pose[:3, 1]
+    roll = math.degrees(math.atan2(float(up[0]), max(float(abs(up[1])), 1e-8)))
+    return yaw, pitch, roll
+
+
+def _fmt_vec3_np(vec):
+    return f"({float(vec[0]): .4f},{float(vec[1]): .4f},{float(vec[2]): .4f})"
+
+
 def equirect_to_perspective(
     equirect_img, 
     fov_deg, 
@@ -914,6 +930,10 @@ class VNCCS_Equirect360ToViews:
                     "default": "bilinear",
                     "tooltip": "Perspective extraction resampling. bilinear is safer for 3D reconstruction; bicubic is sharper but can create colored edge ringing."
                 }),
+                "debug_log": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Print per-view camera/intrinsics diagnostics for panorama slices."
+                }),
             }
         }
     
@@ -925,7 +945,7 @@ class VNCCS_Equirect360ToViews:
     def extract_views(self, panorama, quality="Standard (518)", fov=90, yaw_step=45, pitches="0,-60,60", output_size=518,
                       dynamic_fov=True, yaw_offset=0.0, pose_convention="opencv_c2w",
                       pose_yaw_offset=0.0, pose_pitch_offset=0.0, pose_roll_offset=0.0,
-                      intrinsics_focal_scale=1.0, sampling_mode="bilinear"):
+                      intrinsics_focal_scale=1.0, sampling_mode="bilinear", debug_log=False):
 
         pitch_list = [int(p.strip()) for p in pitches.split(",")]
         
@@ -944,16 +964,24 @@ class VNCCS_Equirect360ToViews:
             f"PoseOffset=({pose_yaw_offset}, {pose_pitch_offset}, {pose_roll_offset}), "
             f"FocalScale={intrinsics_focal_scale}, Sampling={sampling_mode}"
         )
+        if debug_log:
+            print(
+                "[Equirect360ToViews][DEBUG][BEGIN] "
+                f"panorama_shape={tuple(panorama.shape)}, pitches={pitch_list}, "
+                f"yaw_angles={yaw_angles}, output_size={output_size}"
+            )
 
         intrinsics_list = []
         poses_list = []
+        center_ray_mismatches = 0
 
         for yaw in yaw_angles:
             for pitch in pitch_list:
+                effective_yaw = (yaw + yaw_offset) % 360
                 view, focal = equirect_to_perspective(
                     pil_img,
                     fov_deg=fov,
-                    yaw_deg=(yaw + yaw_offset) % 360, # Apply Offset and Wrap
+                    yaw_deg=effective_yaw, # Apply Offset and Wrap
                     pitch_deg=pitch,
                     output_size=(output_size, output_size),
                     dynamic_fov=dynamic_fov,
@@ -992,6 +1020,32 @@ class VNCCS_Equirect360ToViews:
                 view_np = np.array(view).astype(np.float32) / 255.0
                 
                 print(f"   - View: Pitch={pitch:3d}, Yaw={yaw:3d} | Proj: Rectilinear")
+                if debug_log:
+                    effective_fov = math.degrees(2.0 * math.atan(1.0 / max(float(focal), 1e-8)))
+                    proj_R = build_rotation_matrix(pitch, effective_yaw, 0.0)
+                    proj_center_ray = proj_R @ np.array([0.0, 0.0, 1.0], dtype=np.float32)
+                    proj_center_ray = proj_center_ray / max(float(np.linalg.norm(proj_center_ray)), 1e-8)
+                    pose_right = pose[:3, 0]
+                    pose_up = pose[:3, 1]
+                    pose_forward = pose[:3, 2]
+                    pose_forward_n = pose_forward / max(float(np.linalg.norm(pose_forward)), 1e-8)
+                    dot_forward = float(np.dot(proj_center_ray, pose_forward_n))
+                    dot_backward = float(np.dot(proj_center_ray, -pose_forward_n))
+                    if dot_forward < 0.999:
+                        center_ray_mismatches += 1
+                    pose_yaw_dbg, pose_pitch_dbg, pose_roll_dbg = _camera_debug_angles_from_pose(pose)
+                    print(
+                        f"[Equirect360ToViews][DEBUG][VIEW {len(views):03d}] "
+                        f"yaw={yaw:.3f}, pitch={pitch:.3f}, effective_yaw={effective_yaw:.3f}, "
+                        f"base_fov={float(fov):.3f}, effective_fov={effective_fov:.3f}, focal_norm={float(focal):.6f}, "
+                        f"K=(fx={float(intra[0,0]):.4f}, fy={float(intra[1,1]):.4f}, "
+                        f"cx={float(intra[0,2]):.4f}, cy={float(intra[1,2]):.4f}), "
+                        f"pose_angles=(yaw={pose_yaw_dbg:.3f}, pitch={pose_pitch_dbg:.3f}, roll={pose_roll_dbg:.3f}), "
+                        f"right={_fmt_vec3_np(pose_right)}, up={_fmt_vec3_np(pose_up)}, forward={_fmt_vec3_np(pose_forward)}, "
+                        f"proj_center_ray={_fmt_vec3_np(proj_center_ray)}, "
+                        f"proj_center_dot_pose_forward={dot_forward:.6f}, "
+                        f"proj_center_dot_pose_backward={dot_backward:.6f}"
+                    )
                      
                 views.append(view_np)
         
@@ -1000,6 +1054,12 @@ class VNCCS_Equirect360ToViews:
         poses_tensor = torch.from_numpy(np.stack(poses_list, axis=0))
         
         print(f"✅ Extracted {total} views (Channels: {views_tensor.shape[-1]})")
+        if debug_log:
+            print(
+                "[Equirect360ToViews][DEBUG][END] "
+                f"views={tuple(views_tensor.shape)}, intrinsics={tuple(intrinsics_tensor.shape)}, "
+                f"poses={tuple(poses_tensor.shape)}, center_ray_mismatches={center_ray_mismatches}"
+            )
         
         return (views_tensor, intrinsics_tensor, poses_tensor)
 
