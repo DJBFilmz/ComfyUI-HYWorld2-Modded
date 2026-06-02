@@ -91,7 +91,11 @@ ipch/
 input/
 output/
 temp/
-models/
+/models/
+!hyworld2/
+!hyworld2/worldgen/
+!hyworld2/worldgen/models/
+!hyworld2/worldgen/models/**
 checkpoints/
 embeddings/
 loras/
