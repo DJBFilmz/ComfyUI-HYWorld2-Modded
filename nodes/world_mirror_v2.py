@@ -196,6 +196,53 @@ def _align_camera_priors_to_image_count(images, camera_poses, camera_intrinsics)
     )
 
 
+def _normalize_camera_poses_to_first(camera_poses):
+    """Match official pipeline prior-camera normalization: inv(first_pose) @ pose."""
+    if not isinstance(camera_poses, torch.Tensor):
+        return camera_poses
+
+    poses = camera_poses
+    had_batch = poses.dim() == 4 and poses.shape[0] == 1
+    if had_batch:
+        work = poses[0]
+    elif poses.dim() == 3:
+        work = poses
+    else:
+        return camera_poses
+
+    if work.shape[-2:] == (4, 4):
+        work4 = work
+        return_3x4 = False
+    elif work.shape[-2:] == (3, 4):
+        bottom = torch.zeros(
+            work.shape[0], 1, 4,
+            dtype=work.dtype,
+            device=work.device,
+        )
+        bottom[:, 0, 3] = 1.0
+        work4 = torch.cat([work, bottom], dim=1)
+        return_3x4 = True
+    else:
+        return camera_poses
+
+    if work4.shape[0] == 0:
+        return camera_poses
+
+    try:
+        first = work4[0]
+        inv_first = torch.linalg.inv(first.float()).to(dtype=work4.dtype, device=work4.device)
+        normalized = inv_first.unsqueeze(0) @ work4
+    except Exception as exc:
+        print(f"[V2] Official camera-pose normalization skipped: {type(exc).__name__}: {exc}")
+        return camera_poses
+
+    if return_3x4:
+        normalized = normalized[:, :3, :]
+    if had_batch:
+        normalized = normalized.unsqueeze(0)
+    return normalized
+
+
 def _extract_pose_tensor(value):
     if not isinstance(value, torch.Tensor):
         return None
@@ -919,6 +966,81 @@ def _scale_splat_scales(splats, scale):
     return out
 
 
+def _stabilize_camera_intrinsics(intrinsics, mode, image_hw=None):
+    if not isinstance(intrinsics, torch.Tensor):
+        return intrinsics
+    intrs = intrinsics.detach().clone().float()
+    had_batch = intrs.dim() == 4 and intrs.shape[0] == 1
+    if had_batch:
+        work = intrs[0]
+    elif intrs.dim() == 3:
+        work = intrs
+    else:
+        return intrinsics
+    if work.shape[-2:] != (3, 3) or work.shape[0] == 0:
+        return intrinsics
+
+    stable = work.clone()
+    finite = torch.isfinite(stable).all(dim=(1, 2))
+    if not bool(finite.any()):
+        return intrinsics
+    valid = stable[finite]
+    med = valid.median(dim=0).values
+
+    stable[:, 0, 0] = med[0, 0]
+    stable[:, 1, 1] = med[1, 1]
+    if mode in ("median_focal_center", "median_all"):
+        if image_hw is not None:
+            h, w = image_hw
+            stable[:, 0, 2] = float(w) * 0.5
+            stable[:, 1, 2] = float(h) * 0.5
+        else:
+            stable[:, 0, 2] = med[0, 2]
+            stable[:, 1, 2] = med[1, 2]
+    elif mode == "median_all":
+        stable[:, 0, 2] = med[0, 2]
+        stable[:, 1, 2] = med[1, 2]
+
+    return stable.unsqueeze(0) if had_batch else stable
+
+
+def _auto_stabilize_missing_input_cameras(predictions, mode, image_hw):
+    if mode == "off":
+        return None, None, None
+    pred_poses = predictions.get("camera_poses")
+    pred_intrs = predictions.get("camera_intrs")
+    poses = _extract_pose_tensor(pred_poses)
+    if poses is None or not isinstance(pred_intrs, torch.Tensor):
+        print("[V2] Missing-camera stabilization skipped: predicted cameras are unavailable.")
+        return None, None, None
+
+    intrs = pred_intrs.detach().float()
+    if intrs.dim() == 4 and intrs.shape[0] == 1:
+        intrs = intrs[0]
+    if intrs.dim() != 3 or intrs.shape[-2:] != (3, 3) or intrs.shape[0] != poses.shape[0]:
+        print("[V2] Missing-camera stabilization skipped: predicted intrinsics are invalid.")
+        return None, None, None
+
+    stable_intrs = _stabilize_camera_intrinsics(intrs, "median_focal_center", image_hw=image_hw)
+    stable_poses = poses.detach().clone().float()
+    info = {
+        "source": "predicted_cameras",
+        "mode": mode,
+        "fx_min": float(intrs[:, 0, 0].min().item()),
+        "fx_max": float(intrs[:, 0, 0].max().item()),
+        "fx_stable": float(stable_intrs[:, 0, 0].median().item()),
+        "fy_min": float(intrs[:, 1, 1].min().item()),
+        "fy_max": float(intrs[:, 1, 1].max().item()),
+        "fy_stable": float(stable_intrs[:, 1, 1].median().item()),
+    }
+    print(
+        "[V2] Missing-camera stabilization: "
+        f"mode={mode}, fx={info['fx_min']:.3f}..{info['fx_max']:.3f}->{info['fx_stable']:.3f}, "
+        f"fy={info['fy_min']:.3f}..{info['fy_max']:.3f}->{info['fy_stable']:.3f}"
+    )
+    return stable_poses, stable_intrs, info
+
+
 def _project_predictions_from_input_cameras(predictions, input_camera_poses, input_camera_intrinsics, scale_value):
     projected = dict(predictions)
     depth_device = projected["depth"].device if isinstance(projected.get("depth"), torch.Tensor) else torch.device("cpu")
@@ -1515,6 +1637,10 @@ class VNCCS_WorldMirrorV2_3D:
                     "default": "pose+intrinsics",
                     "tooltip": "Which input camera priors to pass into WorldMirror V2. Panorama poses are rotation-only, so testing intrinsics_only/none can reduce seam conflicts."
                 }),
+                "missing_camera_strategy": (["off", "stabilize_predicted_intrinsics", "reproject_stabilized_predicted"], {
+                    "default": "off",
+                    "tooltip": "When camera inputs are missing, derive pseudo input cameras from WorldMirror predictions. stabilize_predicted_intrinsics keeps predicted poses but uses sequence-median focal lengths. reproject_stabilized_predicted also rebuilds pts3d/splat means from depth with those stable cameras."
+                }),
                 "splat_camera_source": (["input_align", "input_when_available", "input_icp_scaled_depth", "predicted"], {
                     "default": "input_align",
                     "tooltip": "input_align keeps model depth/splats internally consistent, then aligns the complete predicted reconstruction to input cameras. input_when_available applies full ICP alignment. input_icp_scaled_depth is experimental and backprojects depths from input cameras. predicted matches official inference."
@@ -1598,6 +1724,8 @@ class VNCCS_WorldMirrorV2_3D:
         edge_depth_threshold  = 0.03,
         apply_confidence_mask = False,
         camera_conditioning = "pose+intrinsics",
+        normalize_camera_poses_to_first = False,
+        missing_camera_strategy = "off",
         splat_camera_source = "input_align",
         splat_color_source = "input_image",
         adaptive_target_size = False,
@@ -1637,6 +1765,9 @@ class VNCCS_WorldMirrorV2_3D:
             camera_poses,
             camera_intrinsics,
         )
+        if normalize_camera_poses_to_first and isinstance(camera_poses, torch.Tensor):
+            camera_poses = _normalize_camera_poses_to_first(camera_poses)
+            print("[V2] Official prior-camera normalization enabled: poses are relative to frame 0.")
         tensor_list = []
         adjusted_intrinsics = camera_intrinsics.clone().float() if isinstance(camera_intrinsics, torch.Tensor) else None
 
@@ -1866,9 +1997,6 @@ class VNCCS_WorldMirrorV2_3D:
 
         S, H, W = predictions["depth"].shape[1:4]
 
-        if debug_log:
-            _log_worldmirror_debug(predictions, views, camera_poses, camera_intrinsics, imgs_tensor)
-
         model_camera_poses = predictions.get("camera_poses")
         model_camera_intrs = predictions.get("camera_intrs")
         model_pts3d = predictions.get("pts3d")
@@ -1879,6 +2007,38 @@ class VNCCS_WorldMirrorV2_3D:
             model_camera_intrs = model_camera_intrs.detach().clone()
         if isinstance(model_pts3d, torch.Tensor):
             model_pts3d = model_pts3d.detach().clone()
+
+        input_cameras_were_missing = camera_poses is None and camera_intrinsics is None
+        missing_camera_info = None
+        if input_cameras_were_missing and missing_camera_strategy != "off":
+            auto_poses, auto_intrs, missing_camera_info = _auto_stabilize_missing_input_cameras(
+                predictions,
+                missing_camera_strategy,
+                image_hw=(H, W),
+            )
+            if auto_poses is not None and auto_intrs is not None:
+                camera_poses = auto_poses
+                camera_intrinsics = auto_intrs
+                if missing_camera_strategy == "stabilize_predicted_intrinsics":
+                    predictions = dict(predictions)
+                    predictions["camera_poses"] = auto_poses.unsqueeze(0).to(
+                        device=predictions["depth"].device,
+                        dtype=torch.float32,
+                    )
+                    predictions["camera_intrs"] = auto_intrs.unsqueeze(0).to(
+                        device=predictions["depth"].device,
+                        dtype=torch.float32,
+                    )
+                elif missing_camera_strategy == "reproject_stabilized_predicted":
+                    predictions = _project_predictions_from_input_cameras(
+                        predictions,
+                        auto_poses,
+                        auto_intrs,
+                        scale_value=1.0,
+                    )
+
+        if debug_log:
+            _log_worldmirror_debug(predictions, views, camera_poses, camera_intrinsics, imgs_tensor)
 
         input_camera_icp = None
         if use_input_global_align:
@@ -1999,7 +2159,8 @@ class VNCCS_WorldMirrorV2_3D:
             if input_camera_icp is not None:
                 print("[V2 DEBUG] splats stats after input-camera ICP processing")
                 _log_splat_stats(splats)
-                _log_per_view_points("splats.means after input-camera projection", splats.get("means"), S, H, W)
+                if isinstance(splats, dict):
+                    _log_per_view_points("splats.means after input-camera projection", splats.get("means"), S, H, W)
         splat_mask = gs_mask if gs_mask is not None else pts_mask
         splats = _apply_mask_to_splats(splats, splat_mask if filter_splats else None)
         if voxel_prune_splats:
@@ -2009,6 +2170,8 @@ class VNCCS_WorldMirrorV2_3D:
         ply_data = {
             "pts3d":          predictions.get("pts3d"),
             "pts3d_filtered": filtered_pts,
+            "depth":          predictions.get("depth"),
+            "normals":        predictions.get("normals"),
             "pts3d_conf":     predictions.get("pts3d_conf"),
             "depth_conf":     predictions.get("depth_conf"),
             "depth_mask":     predictions.get("depth_mask"),
@@ -2030,6 +2193,7 @@ class VNCCS_WorldMirrorV2_3D:
             "model_camera_intrs": model_camera_intrs,
             "model_pts3d": model_pts3d,
             "model_pts3d_filtered": model_pts3d_filtered,
+            "missing_camera_info": missing_camera_info,
         }
 
         # ── 10. Depth / normals → ComfyUI IMAGE [S,H,W,3] ────────────────────
@@ -2560,6 +2724,10 @@ class VNCCS_WorldMirrorV2_3D_Advanced(VNCCS_WorldMirrorV2_3D_Experimental):
     def INPUT_TYPES(cls):
         inputs = copy.deepcopy(super().INPUT_TYPES())
         inputs.get("optional", {}).pop("low_vram_mode", None)
+        inputs.setdefault("optional", {})["normalize_camera_poses_to_first"] = ("BOOLEAN", {
+            "default": False,
+            "tooltip": "Official pipeline behavior for prior cameras: convert input poses to frame-0-relative space with inv(first_pose) @ pose before conditioning/alignment."
+        })
         return inputs
 
 

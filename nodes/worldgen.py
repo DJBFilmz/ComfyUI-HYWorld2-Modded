@@ -277,9 +277,29 @@ def _depths_from_points(points, poses):
         w2c = torch.linalg.inv(c2w)
         homog = torch.cat([pts, torch.ones((pts.shape[0], 1), dtype=pts.dtype)], dim=1)
         cam = (homog @ w2c.T)[:, :3]
-        depth = cam.norm(dim=1).reshape(points.shape[1], points.shape[2])
+        depth = cam[:, 2].reshape(points.shape[1], points.shape[2])
         depths.append(depth.clamp_min(0.0))
     return torch.stack(depths, dim=0)
+
+
+def _depth_maps_to_metric_tensor(depth_maps):
+    depths = _as_cpu_float_tensor(depth_maps)
+    if depths is None:
+        return None
+    if depths.dim() == 5 and depths.shape[0] == 1 and depths.shape[-1] == 1:
+        depths = depths[0, ..., 0]
+    elif depths.dim() == 4 and depths.shape[-1] == 1:
+        depths = depths[..., 0]
+    elif depths.dim() == 4 and depths.shape[0] == 1 and depths.shape[-1] not in (1, 3, 4):
+        depths = depths[0]
+    elif depths.dim() == 4 and depths.shape[-1] in (3, 4):
+        depths = depths[..., 0]
+    if depths.dim() != 3:
+        return None
+    depths = torch.nan_to_num(depths.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    if not torch.isfinite(depths).all() or float(depths.max().item()) <= 0.0:
+        return None
+    return depths.contiguous()
 
 
 def _normal_maps_to_tensor(normal_maps):
@@ -287,6 +307,25 @@ def _normal_maps_to_tensor(normal_maps):
     if normals is None:
         return None
     return normals.clamp(0.0, 1.0)
+
+
+def _normal_maps_to_encoded_tensor(normal_maps):
+    normals = _as_cpu_float_tensor(normal_maps)
+    if normals is None:
+        return None
+    if normals.dim() == 5 and normals.shape[0] == 1:
+        normals = normals[0]
+    if normals.dim() == 4 and normals.shape[1] == 3 and normals.shape[-1] != 3:
+        normals = normals.permute(0, 2, 3, 1)
+    if normals.dim() != 4 or normals.shape[-1] != 3:
+        return None
+    if float(normals.min().item()) < -0.05:
+        normals = (normals.clamp(-1.0, 1.0) + 1.0) * 0.5
+    return normals[..., :3].clamp(0.0, 1.0).contiguous()
+
+
+def _raw_prediction_dict(raw_splats):
+    return raw_splats if isinstance(raw_splats, dict) else {}
 
 
 def _normal_tensor_is_usable(normals):
@@ -382,6 +421,19 @@ def _run_command(command, cwd, env=None, deep_logging=False, log_path=None):
     if log_path:
         result = f"[WorldGen] Full log saved: {log_path}\n{result}"
     return result
+
+
+def _official_strategy_args(max_steps):
+    refine_stop = max(1, min(750, int(max_steps) - 1))
+    return [
+        "--strategy.refine-start-iter", "150",
+        "--strategy.refine-stop-iter", str(refine_stop),
+        "--strategy.refine-every", "100",
+        "--strategy.refine-scale2d-stop-iter", str(refine_stop),
+        "--strategy.reset-every", "99990",
+        "--strategy.grow-grad2d", "0.0001",
+        "--strategy.prune-scale3d", "0.1",
+    ]
 
 
 def _find_latest_ply(result_dir):
@@ -599,6 +651,7 @@ class VNCCS_WorldGenBuildGSDataFromWorldMirror:
                 }),
                 "depth_maps": ("IMAGE",),
                 "normal_maps": ("IMAGE",),
+                "raw_splats": ("VNCCS_SPLAT",),
                 "out_name": ("STRING", {
                     "default": "gs_data",
                     "tooltip": "Subfolder inside workspace_dir where the trainer dataset is written.",
@@ -628,6 +681,7 @@ class VNCCS_WorldGenBuildGSDataFromWorldMirror:
         workspace_dir="",
         depth_maps=None,
         normal_maps=None,
+        raw_splats=None,
         out_name="gs_data",
         camera_bundle="connected_inputs",
         points_max=3_000_000,
@@ -689,15 +743,30 @@ class VNCCS_WorldGenBuildGSDataFromWorldMirror:
             pts_grid = _normalize_points_tensor(ply_data.get("model_pts3d"))
         else:
             pts_grid = _normalize_points_tensor(ply_data.get("pts3d") if isinstance(ply_data, dict) else None)
-        computed_depths = _depths_from_points(pts_grid, poses)
+        raw_predictions = _raw_prediction_dict(raw_splats)
+        raw_depths = _depth_maps_to_metric_tensor(raw_predictions.get("depth"))
+        if raw_depths is None and isinstance(ply_data, dict):
+            raw_depths = _depth_maps_to_metric_tensor(ply_data.get("depth"))
+        computed_depths = raw_depths if raw_depths is not None else _depths_from_points(pts_grid, poses)
         wm_image_tensor = _normalize_image_tensor(ply_data.get("images") if isinstance(ply_data, dict) else None)
         depth_image_tensor = _normalize_image_tensor(depth_maps) if depth_maps is not None else None
-        normal_tensor = _normal_maps_to_tensor(normal_maps) if write_normals else None
+        normal_tensor = None
+        if write_normals:
+            normal_tensor = _normal_maps_to_encoded_tensor(raw_predictions.get("normals"))
+            if normal_tensor is None and isinstance(ply_data, dict):
+                normal_tensor = _normal_maps_to_encoded_tensor(ply_data.get("normals"))
+            if normal_tensor is None:
+                normal_tensor = _normal_maps_to_tensor(normal_maps)
         normal_source = "normal_maps" if _normal_tensor_is_usable(normal_tensor) else "none"
         if normal_tensor is not None and normal_source == "none":
             _clear_png_dir(normals_dir)
             normal_tensor = None
-        depth_source = "pts3d camera distance" if computed_depths is not None else "none"
+        if raw_depths is not None:
+            depth_source = "raw metric depth"
+        elif computed_depths is not None:
+            depth_source = "pts3d camera z-depth"
+        else:
+            depth_source = "none"
         if computed_depths is None:
             _clear_png_dir(depths_dir)
         _deep_log(deep_logging, f"build pts3d_shape={tuple(pts_grid.shape) if pts_grid is not None else None}")
@@ -889,7 +958,12 @@ class VNCCS_WorldGenTrain3DGS:
                 "depth_loss": ("BOOLEAN", {"default": True}),
                 "normal_loss": ("BOOLEAN", {"default": True}),
                 "use_scale_regularization": ("BOOLEAN", {"default": True}),
+                "use_mask_gaussian": ("BOOLEAN", {"default": True}),
                 "antialiased": ("BOOLEAN", {"default": True}),
+                "official_strategy_preset": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Use HY-World's stable training strategy: short densify/refine window, no opacity resets, conservative grow/prune thresholds.",
+                }),
                 "normalize_world_space": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Official trainer normalization. Disable for ComfyUI preview with original WorldMirror camera_poses.",
@@ -920,7 +994,9 @@ class VNCCS_WorldGenTrain3DGS:
         depth_loss=True,
         normal_loss=True,
         use_scale_regularization=True,
+        use_mask_gaussian=True,
         antialiased=True,
+        official_strategy_preset=True,
         normalize_world_space=False,
         perceptual_loss="lpips_vgg",
         extra_args="",
@@ -974,8 +1050,12 @@ class VNCCS_WorldGenTrain3DGS:
             print(f"[WorldGen] normal_loss requested but normals are missing/constant under {data_dir / 'normals'}; disabling normal_loss.")
         if use_scale_regularization:
             cmd.append("--use_scale_regularization")
+        if use_mask_gaussian:
+            cmd.append("--use_mask_gaussian")
         if antialiased:
             cmd.append("--antialiased")
+        if official_strategy_preset:
+            cmd.extend(_official_strategy_args(max_steps))
         if not normalize_world_space:
             cmd.append("--no-normalize")
         if perceptual_loss == "lpips_vgg":
@@ -1003,6 +1083,8 @@ class VNCCS_WorldGenTrain3DGS:
             "depth_loss_enabled": bool(depth_loss and depth_files_valid),
             "normal_loss_requested": bool(normal_loss),
             "normal_loss_enabled": bool(normal_loss and normal_files_valid),
+            "use_mask_gaussian": bool(use_mask_gaussian),
+            "official_strategy_preset": bool(official_strategy_preset),
             "normalize_world_space": bool(normalize_world_space),
             "perceptual_loss": perceptual_loss,
             "reset_existing_train_dir": True,

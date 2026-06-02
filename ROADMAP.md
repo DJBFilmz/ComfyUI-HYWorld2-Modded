@@ -32,6 +32,8 @@ The official early worldgen stages are intentionally skipped for now because the
 - [ ] Add or update a workflow that chains:
   `WorldMirrorV2 -> WorldGen Export Bank -> WorldGen Build GS Data -> WorldGen Train 3DGS`.
 - [ ] Add smoke tests for the new worldgen nodes with a tiny synthetic scene.
+- [ ] Expose native 3DGS mesh export (`--export_mesh`) in the WorldGen training node.
+- [ ] Expose native 3DGS SPZ export (`--convert_to_spz`) in the WorldGen training node.
+- [ ] Expose native 3DGS SPX export (`--convert_to_spx`) in the WorldGen training node.
 - [ ] Decide whether to replace the direct `gs_data` shortcut with official `memory_bank.alignment()` once the skipped stages are integrated.
 - [ ] Add UI docs explaining the difference between feed-forward WorldMirror splats and optimized scene-level 3DGS.
-
