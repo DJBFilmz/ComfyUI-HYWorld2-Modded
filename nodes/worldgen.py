@@ -504,6 +504,14 @@ def _load_train_camera_tensors(result_dir, data_dir):
     return torch.empty((0, 4, 4), dtype=torch.float32), torch.empty((0, 3, 3), dtype=torch.float32), ""
 
 
+def _gs_data_camera_translation_std(data_dir):
+    cameras_path = Path(data_dir) / "cameras.json"
+    if not cameras_path.exists():
+        return None
+    poses, _intrs = _load_camera_tensors_from_json(cameras_path)
+    return _camera_translation_std(poses)
+
+
 def _ensure_scene_type_meta(data_dir, scene_type="unknown"):
     data_dir = Path(data_dir)
     candidates = [data_dir.parent / "meta_info.json", data_dir / "meta_info.json"]
@@ -657,8 +665,8 @@ class VNCCS_WorldGenBuildGSDataFromWorldMirror:
                     "tooltip": "Subfolder inside workspace_dir where the trainer dataset is written.",
                 }),
                 "camera_bundle": (["connected_inputs", "model_predicted_when_input_zero"], {
-                    "default": "connected_inputs",
-                    "tooltip": "connected_inputs preserves the exact cameras/depth/points currently wired from WorldMirror. model_predicted_when_input_zero is experimental.",
+                    "default": "model_predicted_when_input_zero",
+                    "tooltip": "Use WorldMirror predicted cameras/geometry when connected cameras have zero translation. Native 3DGS needs camera baseline; rotation-only cameras collapse depth.",
                 }),
                 "points_max": ("INT", {"default": 3_000_000, "min": 0, "max": 50_000_000, "step": 100_000}),
                 "write_normals": ("BOOLEAN", {"default": True}),
@@ -683,7 +691,7 @@ class VNCCS_WorldGenBuildGSDataFromWorldMirror:
         normal_maps=None,
         raw_splats=None,
         out_name="gs_data",
-        camera_bundle="connected_inputs",
+        camera_bundle="model_predicted_when_input_zero",
         points_max=3_000_000,
         write_normals=True,
         deep_logging=False,
@@ -711,8 +719,6 @@ class VNCCS_WorldGenBuildGSDataFromWorldMirror:
         input_translation_std = _camera_translation_std(poses)
         model_translation_std = _camera_translation_std(model_poses)
         if (
-            camera_bundle == "model_predicted_when_input_zero"
-            and
             model_poses is not None
             and model_intrs is not None
             and input_translation_std < 1e-6
@@ -722,21 +728,27 @@ class VNCCS_WorldGenBuildGSDataFromWorldMirror:
             intrs = model_intrs
             camera_source = "worldmirror_model_predicted"
             geometry_source = "worldmirror_model_predicted"
+            print(
+                "[WorldGen] Connected camera_poses have zero translation; using "
+                "WorldMirror predicted cameras/geometry for native 3DGS."
+            )
         n = min(image_tensor.shape[0], poses.shape[0], intrs.shape[0])
         if n <= 0:
             raise ValueError("No frames available for gs_data.")
+        active_translation_std = _camera_translation_std(poses[:n])
         _deep_log(deep_logging, f"build image_shape={tuple(image_tensor.shape)}")
         _deep_log(deep_logging, f"build poses_shape={tuple(poses.shape)} intrinsics_shape={tuple(intrs.shape)} frames={n}")
         _deep_log(
             deep_logging,
             f"build camera_source={camera_source} input_translation_std={input_translation_std:.8f} "
-            f"model_translation_std={model_translation_std:.8f} camera_bundle={camera_bundle}",
+            f"model_translation_std={model_translation_std:.8f} active_translation_std={active_translation_std:.8f} "
+            f"camera_bundle={camera_bundle}",
         )
-        if input_translation_std < 1e-6 and camera_source == "input":
-            print(
-                "[WorldGen] WARNING: connected camera_poses have zero translation. "
-                "This is expected for equirect panorama view slices, but native 3DGS training "
-                "has no parallax and may collapse or smear geometry."
+        if active_translation_std < 1e-6:
+            raise ValueError(
+                "gs_data cameras have zero translation and no usable WorldMirror "
+                "predicted camera bundle was selected. Native 3DGS needs camera baseline; "
+                "rotation-only cameras collapse depth and produce holes/noise."
             )
 
         if geometry_source == "worldmirror_model_predicted" and isinstance(ply_data, dict):
@@ -844,6 +856,7 @@ class VNCCS_WorldGenBuildGSDataFromWorldMirror:
             "normal_source": normal_source,
             "camera_source": camera_source,
             "geometry_source": geometry_source,
+            "active_translation_std": active_translation_std,
             "points_path": points_path,
         }
         with open(gs_dir / "meta_info.json", "w", encoding="utf-8") as handle:
@@ -860,6 +873,7 @@ class VNCCS_WorldGenBuildGSDataFromWorldMirror:
             "geometry_source": geometry_source,
             "input_translation_std": input_translation_std,
             "model_translation_std": model_translation_std,
+            "active_translation_std": active_translation_std,
             "pts3d_shape": list(pts_grid.shape) if pts_grid is not None else None,
             "computed_depths_shape": list(computed_depths.shape) if computed_depths is not None else None,
             "depth_source": depth_source,
@@ -1005,6 +1019,13 @@ class VNCCS_WorldGenTrain3DGS:
         data_dir = Path(gs_data_dir)
         if not data_dir.exists():
             raise FileNotFoundError(f"gs_data_dir not found: {data_dir}")
+        translation_std = _gs_data_camera_translation_std(data_dir)
+        if translation_std is not None and translation_std < 1e-6:
+            raise ValueError(
+                f"gs_data cameras have zero translation (translation_std={translation_std:.8f}). "
+                "Native 3DGS cannot recover depth from rotation-only cameras; rebuild gs_data "
+                "with WorldMirror predicted cameras/geometry."
+            )
         out_dir = Path(train_dir) if str(train_dir).strip() else data_dir.parent / "gs_results"
         data_resolved = data_dir.resolve()
         out_resolved = out_dir.resolve()
