@@ -13,29 +13,43 @@ huggingface_hub
 safetensors
 
 # 3D / PLY
-gsplat
 plyfile
 trimesh
 open3d>=0.18.0
+ninja
 
 # Config / utils
 omegaconf
 einops
 jaxtyping
 typeguard
+packaging
 
 # COLMAP export (optional)
 # pycolmap==3.10.0
 
-# Gaussian Splatting (required for GS output)
-# gsplat>=1.5.3 — install manually, platform-specific wheel:
-# Linux:  pip install gsplat @ https://github.com/nerfstudio-project/gsplat/releases/download/v1.5.3/gsplat-1.5.3+pt24cu124-cp310-cp310-linux_x86_64.whl
-# Windows: pip install gsplat @ https://github.com/nerfstudio-project/gsplat/releases/download/v1.5.3/gsplat-1.5.3+pt24cu124-cp310-cp310-win_amd64.whl
+# Gaussian Splatting (required for GS output and native HY-World trainer)
+# Do not install PyPI/upstream gsplat here. HY-World worldgen requires the
+# vendored fork at hyworld2/worldgen/third_party/gsplat_maskgaussian, installed
+# by install.py / scripts/pipinstall.bat / the ComfyUI installer node.
+
+# HY-World native GS scene trainer (optional WorldMirror V2 checkbox)
+tyro
+viser
+nerfview
+splines
+imagesize
+torchmetrics
+tensorboard
+pytorch-msssim
+msgspec
+shtab
+yourdfpy
 
 # CPU offloading (optional, for model_cpu_offload)
 accelerate
 
-# PyTorch3D (required for WorldStereo point rendering) — install manually:
+# PyTorch3D (required for WorldStereo point rendering) - install manually:
 # pip install "git+https://github.com/facebookresearch/pytorch3d.git@stable"
 
 # MoGe depth estimator (required for WorldStereo)

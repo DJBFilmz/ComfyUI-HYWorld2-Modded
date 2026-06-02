@@ -122,3 +122,4 @@ scripts/portable_msvc/
 gsplat/*.whl
 !gsplat/gsplat-*.whl
 !gsplat/pytorch3d-*.whl
+tests/

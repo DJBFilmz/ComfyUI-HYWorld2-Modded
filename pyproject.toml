@@ -17,7 +17,6 @@ dependencies = [
     "omegaconf",
     "plyfile",
     "trimesh",
-    "gsplat",
     "einops",
     "jaxtyping",
     "typeguard",
@@ -33,7 +32,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gsplat = ["gsplat>=1.5.3"]
+gsplat = []
 fp8 = ["torchao"]
 colmap = ["pycolmap==3.10.0"]
 video = ["moviepy==1.0.3"]
