@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -34,13 +35,6 @@ def supported_python_tags() -> set[str]:
     return {tag.interpreter for tag in tags.sys_tags()}
 
 
-def clean_old_gsplat_wheels() -> None:
-    WHEELS_DIR.mkdir(exist_ok=True)
-    for wheel_path in WHEELS_DIR.glob("gsplat-*.whl"):
-        print(f"[INFO] Removing old gsplat wheel: {wheel_path.name}")
-        wheel_path.unlink()
-
-
 def find_compatible_wheel(local_label: str) -> Path | None:
     py_tags = supported_python_tags()
     for wheel_path in sorted(WHEELS_DIR.glob(f"gsplat-*+{local_label}-*.whl"), key=os.path.getmtime, reverse=True):
@@ -51,7 +45,11 @@ def find_compatible_wheel(local_label: str) -> Path | None:
 
 
 def build_wheel(local_label: str) -> Path:
-    clean_old_gsplat_wheels()
+    WHEELS_DIR.mkdir(exist_ok=True)
+    build_dir = FORK_DIR / "build"
+    if build_dir.exists():
+        print(f"[INFO] Removing stale build directory: {build_dir}")
+        shutil.rmtree(build_dir)
     env = os.environ.copy()
     env.setdefault("MAX_JOBS", "10")
     env["GSPLAT_LOCAL_VERSION"] = local_label
@@ -155,14 +153,13 @@ def main() -> None:
     local_label = torch_build_label()
     print(f"[INFO] Wheel local version label: {local_label}")
 
-    run_command([sys.executable, "-m", "pip", "uninstall", "-y", "gsplat"])
-
     wheel = find_compatible_wheel(local_label)
     if wheel is None:
         wheel = build_wheel(local_label)
     else:
         print(f"[INFO] Using cached HY-World gsplat wheel: {wheel}")
 
+    run_command([sys.executable, "-m", "pip", "uninstall", "-y", "gsplat"])
     run_command(
         [
             sys.executable,
