@@ -1869,6 +1869,17 @@ class VNCCS_WorldMirrorV2_3D:
         if debug_log:
             _log_worldmirror_debug(predictions, views, camera_poses, camera_intrinsics, imgs_tensor)
 
+        model_camera_poses = predictions.get("camera_poses")
+        model_camera_intrs = predictions.get("camera_intrs")
+        model_pts3d = predictions.get("pts3d")
+        model_pts3d_filtered = None
+        if isinstance(model_camera_poses, torch.Tensor):
+            model_camera_poses = model_camera_poses.detach().clone()
+        if isinstance(model_camera_intrs, torch.Tensor):
+            model_camera_intrs = model_camera_intrs.detach().clone()
+        if isinstance(model_pts3d, torch.Tensor):
+            model_pts3d = model_pts3d.detach().clone()
+
         input_camera_icp = None
         if use_input_global_align:
             predictions, input_camera_icp = _align_predictions_to_input_cameras_global(
@@ -1970,6 +1981,13 @@ class VNCCS_WorldMirrorV2_3D:
                 filtered_pts = pts[flat]
             else:
                 filtered_pts = pts
+        if isinstance(model_pts3d, torch.Tensor):
+            model_pts3d_flat = model_pts3d[0].reshape(-1, 3)
+            if pts_mask is not None and int(np.prod(pts_mask.shape)) == int(model_pts3d_flat.shape[0]):
+                flat = torch.from_numpy(pts_mask.reshape(-1)).to(model_pts3d_flat.device)
+                model_pts3d_filtered = model_pts3d_flat[flat]
+            else:
+                model_pts3d_filtered = model_pts3d_flat
 
         # ── 8. Filter splats with GS-specific mask ────────────────────────────
         splats = predictions.get("splats")
@@ -2008,6 +2026,10 @@ class VNCCS_WorldMirrorV2_3D:
             ),
             "camera_poses":   predictions.get("camera_poses"),
             "camera_intrs":   predictions.get("camera_intrs"),
+            "model_camera_poses": model_camera_poses,
+            "model_camera_intrs": model_camera_intrs,
+            "model_pts3d": model_pts3d,
+            "model_pts3d_filtered": model_pts3d_filtered,
         }
 
         # ── 10. Depth / normals → ComfyUI IMAGE [S,H,W,3] ────────────────────

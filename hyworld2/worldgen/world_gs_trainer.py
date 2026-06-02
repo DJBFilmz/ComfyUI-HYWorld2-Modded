@@ -36,8 +36,6 @@ from nerfview import CameraState, RenderTabState, apply_float_colormap
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
-from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
-from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
 
 from gs.gsplat_viewer import GsplatViewer, GsplatRenderTabState
@@ -50,6 +48,40 @@ from gs.traj import (
 )
 
 _RASTERIZATION_KWARGS = set(inspect.signature(rasterization).parameters)
+
+
+class SimplePerceptualLoss(torch.nn.Module):
+    """Dependency-light image loss: multi-scale color plus image-gradient L1."""
+
+    def forward(self, colors: Tensor, pixels: Tensor) -> Tensor:
+        colors = colors.clamp(0.0, 1.0)
+        pixels = pixels.clamp(0.0, 1.0)
+        loss = F.l1_loss(colors, pixels)
+        for scale in (2, 4):
+            if colors.shape[-2] >= scale and colors.shape[-1] >= scale:
+                c_small = F.avg_pool2d(colors, kernel_size=scale, stride=scale)
+                p_small = F.avg_pool2d(pixels, kernel_size=scale, stride=scale)
+                loss = loss + 0.5 / scale * F.l1_loss(c_small, p_small)
+        dx_c = colors[..., :, 1:] - colors[..., :, :-1]
+        dx_p = pixels[..., :, 1:] - pixels[..., :, :-1]
+        dy_c = colors[..., 1:, :] - colors[..., :-1, :]
+        dy_p = pixels[..., 1:, :] - pixels[..., :-1, :]
+        return loss + 0.25 * (F.l1_loss(dx_c, dx_p) + F.l1_loss(dy_c, dy_p))
+
+
+class SimplePSNR(torch.nn.Module):
+    def __init__(self, data_range: float = 1.0):
+        super().__init__()
+        self.data_range = float(data_range)
+
+    def forward(self, colors: Tensor, pixels: Tensor) -> Tensor:
+        mse = F.mse_loss(colors, pixels).clamp_min(1e-12)
+        return 20.0 * math.log10(self.data_range) - 10.0 * torch.log10(mse)
+
+
+class SimpleSSIM(torch.nn.Module):
+    def forward(self, colors: Tensor, pixels: Tensor) -> Tensor:
+        return fused_ssim(colors, pixels, padding="valid")
 
 
 @dataclass
@@ -255,7 +287,7 @@ class Config:
     # Save training images to tensorboard
     tb_save_image: bool = False
 
-    lpips_net: Literal["vgg", "alex"] = "vgg"
+    lpips_net: Literal["vgg", "alex", "simple", "none"] = "vgg"
 
     # 3DGUT (uncented transform + eval 3D)
     with_ut: bool = False
@@ -846,16 +878,22 @@ class Runner:
             ]
 
         # Losses & Metrics.
-        self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
-        self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
+        self.ssim = SimpleSSIM().to(self.device)
+        self.psnr = SimplePSNR(data_range=1.0).to(self.device)
 
-        if cfg.lpips_lambda1 <= 0 and cfg.lpips_lambda2 <= 0:
+        if cfg.lpips_lambda1 <= 0 and cfg.lpips_lambda2 <= 0 or cfg.lpips_net == "none":
             self.lpips = lambda colors, pixels: torch.zeros((), device=self.device)
+        elif cfg.lpips_net == "simple":
+            self.lpips = SimplePerceptualLoss().to(self.device)
         elif cfg.lpips_net == "alex":
+            from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+
             self.lpips = LearnedPerceptualImagePatchSimilarity(
                 net_type="alex", normalize=True
             ).to(self.device)
         elif cfg.lpips_net == "vgg":
+            from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+
             # The 3DGS official repo uses lpips vgg, which is equivalent with the following:
             self.lpips = LearnedPerceptualImagePatchSimilarity(
                 net_type="vgg", normalize=False
@@ -1388,14 +1426,13 @@ class Runner:
                 )
             if (step in ply_steps or step == max_steps - 1) and cfg.save_ply:
                 # load scene-level meta info
+                scene_type = None
                 if os.path.exists(f"{'/'.join(cfg.data_dir.split('/')[:-1])}/meta_info.json"):
                     with open(f"{'/'.join(cfg.data_dir.split('/')[:-1])}/meta_info.json") as f:
-                        scene_type = json.load(f)["scene_type"]
+                        scene_type = json.load(f).get("scene_type")
                 elif os.path.exists(f"{cfg.data_dir}/meta_info.json"):
                     with open(f"{cfg.data_dir}/meta_info.json") as f:
-                        scene_type = json.load(f)["scene_type"]
-                else:
-                    scene_type = None
+                        scene_type = json.load(f).get("scene_type")
 
                 if self.cfg.app_opt:
                     # eval at origin to bake the appearance into the colors
@@ -1612,6 +1649,23 @@ class Runner:
 
                     with open(f"{self.ply_dir}/position_meta_info.json", "w") as f:
                         json.dump(pos_meta_info, f)
+
+                    trainer_cameras = {
+                        "camera_order": list(self.parser.camera_ids),
+                        "cameras": {},
+                    }
+                    for cam_idx, camera_id in enumerate(self.parser.camera_ids):
+                        c2w = np.array(self.parser.camtoworlds[cam_idx], dtype=np.float64)
+                        trainer_cameras["cameras"][camera_id] = {
+                            "camera_pose": c2w.tolist(),
+                            "extrinsic": np.linalg.inv(c2w).tolist(),
+                            "intrinsic": np.array(self.parser.Ks_dict[camera_id], dtype=np.float64).tolist(),
+                        }
+                    camera_json_path = f"{self.ply_dir}/trainer_cameras_{step}.json"
+                    with open(camera_json_path, "w") as f:
+                        json.dump(trainer_cameras, f)
+                    with open(f"{self.ply_dir}/trainer_cameras.json", "w") as f:
+                        json.dump(trainer_cameras, f)
 
                     if cfg.convert_to_spz:
                         import spz
