@@ -271,6 +271,11 @@ if __name__ == '__main__':
                         rank0_log(f"Downsampling cameras from {w2cs.shape[0]} to {len(frames)}")
                         w2cs = w2cs[0::4]
                         Ks = Ks[0::4]
+                    elif w2cs.shape[0] > len(frames):
+                        rank0_log(f"Sampling cameras from {w2cs.shape[0]} to {len(frames)}")
+                        camera_indices = np.linspace(0, w2cs.shape[0] - 1, len(frames), dtype=int)
+                        w2cs = w2cs[camera_indices]
+                        Ks = Ks[camera_indices]
                     else:
                         raise ValueError(f"Frame/camera mismatch: {len(frames)} vs {w2cs.shape[0]}")
 

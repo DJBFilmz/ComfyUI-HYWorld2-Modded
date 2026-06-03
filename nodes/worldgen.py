@@ -537,6 +537,8 @@ def _load_camera_tensors_from_json(path):
         intrs = []
         for camera_id in sorted(data.keys()):
             entry = data[camera_id]
+            if not isinstance(entry, dict) or "extrinsic" not in entry or "intrinsic" not in entry:
+                continue
             poses.append(np.linalg.inv(np.asarray(entry["extrinsic"], dtype=np.float32)))
             intrs.append(np.asarray(entry["intrinsic"], dtype=np.float32))
     if not poses or not intrs:
