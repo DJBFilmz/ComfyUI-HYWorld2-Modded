@@ -26,7 +26,7 @@ dependencies = [
     "scikit-learn",
     "accelerate",
     "diffusers>=0.36.0",
-    "transformers>=4.40.0",
+    "transformers>=5.2.0",
     "bitsandbytes>=0.43.0",
     "optimum-quanto>=0.2.4",
     "torchao",
@@ -36,7 +36,6 @@ dependencies = [
     "zim-anything",
     "openai",
     "utils3d",
-    "llama-cpp-python[server]>=0.3.33",
 ]
 
 [project.optional-dependencies]

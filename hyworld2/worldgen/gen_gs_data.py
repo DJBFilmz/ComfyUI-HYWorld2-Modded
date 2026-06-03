@@ -16,10 +16,16 @@ from PIL import Image
 from moge.model.v2 import MoGeModel
 from tqdm import tqdm
 
-from src.general_utils import rank0_log, Timer, load_video, save_16bit_png_depth
-from src.panorama_utils import split_panorama_image, split_panorama_depth, rotate_around_z_axis
-from src.distributed_compat import distributed_backend
-from src import utils3d_compat as u3d
+try:
+    from .src.general_utils import rank0_log, Timer, load_video, save_16bit_png_depth
+    from .src.panorama_utils import split_panorama_image, split_panorama_depth, rotate_around_z_axis
+    from .src.distributed_compat import distributed_backend
+    from .src import utils3d_compat as u3d
+except ImportError:
+    from src.general_utils import rank0_log, Timer, load_video, save_16bit_png_depth
+    from src.panorama_utils import split_panorama_image, split_panorama_depth, rotate_around_z_axis
+    from src.distributed_compat import distributed_backend
+    from src import utils3d_compat as u3d
 
 timer = Timer()
 
@@ -64,6 +70,205 @@ def gather_and_merge_cameras(local_cameras: dict, world_size: int, rank: int) ->
             merged_cameras.update(cameras)
         return merged_cameras
     return {}
+
+
+def run_gen_gs_data(
+    root_path,
+    out_name="gs_data",
+    result_name="worldstereo-memory-dmd",
+    save_normal=True,
+    split_sky=True,
+    split_align=False,
+    skip_start_frame=False,
+    no_aerial=False,
+    interval=1,
+    pano_name="panorama",
+    world_size=1,
+):
+    """Native single-process GS data builder for ComfyUI nodes.
+
+    This mirrors the official script path without launching torchrun/subprocess.
+    Distributed CLI execution remains available below for the original workflow.
+    """
+    if int(world_size) != 1:
+        raise ValueError("run_gen_gs_data is native single-process; use ComfyUI nodes rather than torchrun.")
+
+    scene_path = str(root_path)
+    output_path = f"{scene_path}/{out_name}"
+    required_files = [
+        f"{scene_path}/render_results/generation_bank_{result_name}/global_pcd.ply",
+        f"{scene_path}/render_results/generation_bank_{result_name}/aligned_pcd.ply",
+    ]
+    missing = [f for f in required_files if not os.path.exists(f)]
+    if missing:
+        raise FileNotFoundError(f"Missing HYWorld2 aligned bank files: {missing}")
+
+    pano_image_path = f"{scene_path}/{pano_name}.png"
+    if not os.path.exists(pano_image_path):
+        pano_image_path = f"{scene_path}/{pano_name.replace('_sr', '')}.png"
+
+    if os.path.exists(output_path):
+        shutil.rmtree(output_path, ignore_errors=True)
+    os.makedirs(f"{output_path}/images", exist_ok=True)
+    os.makedirs(f"{output_path}/depths", exist_ok=True)
+    if save_normal:
+        os.makedirs(f"{output_path}/normals", exist_ok=True)
+
+    rank0_log("[Native] Loading/Downsampling pointcloud")
+    global_pcd = trimesh.load(f"{scene_path}/render_results/generation_bank_{result_name}/global_pcd.ply")
+    global_points = global_pcd.vertices
+    global_rgbs = global_pcd.colors
+    if global_points.shape[0] > 3_000_000:
+        rdv_indices = np.random.choice(global_points.shape[0], 3_000_000, replace=False)
+        global_points = global_points[rdv_indices]
+        global_rgbs = global_rgbs[rdv_indices]
+
+    extra_pcd = trimesh.load(f"{scene_path}/render_results/generation_bank_{result_name}/aligned_pcd.ply")
+    extra_points = extra_pcd.vertices
+    extra_rgbs = extra_pcd.colors
+    sky_pcd = None
+    sky_path = f"{scene_path}/render_results/generation_bank_{result_name}/sky_pcd.ply"
+    if os.path.exists(sky_path):
+        sky_pcd = trimesh.load(sky_path)
+        if hasattr(sky_pcd, "vertices") and sky_pcd.vertices.shape[0] > 300_000:
+            rdv_indices = np.random.choice(sky_pcd.vertices.shape[0], 300_000, replace=False)
+            sky_pcd.vertices = sky_pcd.vertices[rdv_indices]
+            sky_pcd.colors = sky_pcd.colors[rdv_indices]
+
+    if split_align:
+        trimesh.PointCloud(vertices=extra_points, colors=extra_rgbs).export(f"{output_path}/align_points.ply")
+    else:
+        global_points = np.concatenate([extra_points, global_points])
+        global_rgbs = np.concatenate([extra_rgbs, global_rgbs])
+    if sky_pcd is not None and hasattr(sky_pcd, "vertices"):
+        if split_sky:
+            sky_pcd.export(f"{output_path}/sky_points.ply")
+        else:
+            global_points = np.concatenate([sky_pcd.vertices, global_points], axis=0)
+            global_rgbs = np.concatenate([sky_pcd.colors, global_rgbs], axis=0)
+    trimesh.PointCloud(vertices=global_points, colors=global_rgbs).export(f"{output_path}/points.ply")
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    moge_model = None
+    if save_normal:
+        moge_model = MoGeModel.from_pretrained("Ruicheng/moge-2-vitl-normal").to(device)
+        moge_model.eval()
+    to_tensor = transforms.ToTensor()
+    save_cameras = {}
+    img_width, img_height = None, None
+
+    if no_aerial:
+        video_paths = (
+            glob(f"{scene_path}/render_results/view*/*/{result_name}_result.mp4")
+            + glob(f"{scene_path}/render_results/target*/traj0/{result_name}_result.mp4")
+            + glob(f"{scene_path}/render_results/reconstruct*/traj0/{result_name}_result.mp4")
+            + glob(f"{scene_path}/render_results/wonder*/traj0/{result_name}_result.mp4")
+        )
+    else:
+        video_paths = (
+            glob(f"{scene_path}/render_results/view*/*/{result_name}_result.mp4")
+            + glob(f"{scene_path}/render_results/target*/*/{result_name}_result.mp4")
+            + glob(f"{scene_path}/render_results/reconstruct*/*/{result_name}_result.mp4")
+            + glob(f"{scene_path}/render_results/wonder*/*/{result_name}_result.mp4")
+        )
+    video_paths = sorted(video_paths, key=_view_traj_from_video_path)
+
+    for video_path in tqdm(video_paths, desc="[Native] Loading video frames"):
+        view_id, traj_id = _view_traj_from_video_path(video_path)
+        video_dir = os.path.dirname(video_path)
+        view_dir = os.path.dirname(video_dir)
+        frames = load_video(video_path)
+        if not frames:
+            continue
+        if img_width is None:
+            img_width, img_height = frames[0].size
+        with open(os.path.join(video_dir, "camera.json"), "r", encoding="utf-8") as f:
+            render_camera = json.load(f)
+        w2cs = np.array(render_camera["extrinsic"])
+        Ks = np.array(render_camera["intrinsic"])
+        if w2cs.shape[0] != len(frames):
+            if w2cs.shape[0] == 81 and len(frames) == 21:
+                w2cs = w2cs[0::4]
+                Ks = Ks[0::4]
+            elif w2cs.shape[0] > len(frames):
+                camera_indices = np.linspace(0, w2cs.shape[0] - 1, len(frames), dtype=int)
+                w2cs = w2cs[camera_indices]
+                Ks = Ks[camera_indices]
+            else:
+                raise ValueError(f"Frame/camera mismatch: {len(frames)} vs {w2cs.shape[0]}")
+        indices = np.arange(len(frames))
+        frames = frames[:: int(interval)]
+        w2cs = w2cs[:: int(interval)]
+        Ks = Ks[:: int(interval)]
+        indices = indices[:: int(interval)]
+        replace_start_frame = not skip_start_frame and not (view_id.startswith("reconstruct_") and traj_id == "traj1")
+        if replace_start_frame:
+            frames[0] = Image.open(os.path.join(view_dir, "start_frame.png"))
+        for i in range(len(frames)):
+            if frames[i].size[0] != img_width or frames[i].size[1] != img_height:
+                frames[i] = frames[i].resize((img_width, img_height), Image.LANCZOS)
+            depth_path = f"{scene_path}/render_results/generation_bank_{result_name}/{view_id}/{traj_id}/depths/{indices[i]:04d}.png"
+            if not os.path.exists(depth_path):
+                depth_path = None
+            if save_normal:
+                with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
+                    moge_prediction = moge_model.infer(to_tensor(frames[i])[None].to(device))
+                    normal_map = moge_prediction["normal"][0].cpu().numpy()
+            else:
+                normal_map = None
+            fname = f"{view_id}-{traj_id}_{indices[i]:06d}"
+            fname, extrinsic, intrinsic = save_io(fname, frames[i], depth_path, normal_map, w2cs[i], Ks[i], output_path)
+            save_cameras[fname] = {"extrinsic": extrinsic, "intrinsic": intrinsic}
+
+    if img_width is None or img_height is None:
+        pano_bank_images = sorted(glob(f"{scene_path}/render_results/pano_bank/images/*.png"))
+        if pano_bank_images:
+            img_width, img_height = Image.open(pano_bank_images[0]).size
+
+    for bank_name, prefix in (("pano_bank", "panorama"), ("polar_bank", "polar")):
+        bank_path = f"{scene_path}/render_results/{bank_name}"
+        image_list = sorted(glob(f"{bank_path}/images/*.png"))
+        camera_path = f"{bank_path}/cameras.json"
+        if not image_list or not os.path.exists(camera_path):
+            continue
+        with open(camera_path, "r", encoding="utf-8") as f:
+            bank_cameras = json.load(f)
+        for image_path in image_list:
+            orig_fname = Path(image_path).stem
+            fname = f"{prefix}_{orig_fname}"
+            save_cameras[fname] = {
+                "extrinsic": bank_cameras[orig_fname]["extrinsic"],
+                "intrinsic": bank_cameras[orig_fname]["intrinsic"],
+            }
+            shutil.copy(image_path, f"{output_path}/images/{fname}.png")
+            depth_path = f"{bank_path}/depths/{orig_fname}.png"
+            if os.path.exists(depth_path):
+                shutil.copy(depth_path, f"{output_path}/depths/{fname}.png")
+            if save_normal:
+                frame = Image.open(image_path)
+                with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
+                    moge_prediction = moge_model.infer(to_tensor(frame)[None].to(device))
+                    normal_map = moge_prediction["normal"][0].cpu().numpy()
+                Image.fromarray(((normal_map + 1.0) / 2.0 * 255.0).astype(np.uint8)).save(f"{output_path}/normals/{fname}.png")
+
+    save_cameras["width"] = img_width
+    save_cameras["height"] = img_height
+    with open(f"{output_path}/cameras.json", "w", encoding="utf-8") as handle:
+        json.dump(save_cameras, handle, indent=2)
+    meta_src = f"{scene_path}/meta_info.json"
+    if os.path.exists(meta_src):
+        shutil.copy(meta_src, f"{output_path}/meta_info.json")
+    else:
+        with open(f"{output_path}/meta_info.json", "w", encoding="utf-8") as handle:
+            json.dump({"scene_type": "unknown"}, handle, indent=2)
+    return {
+        "scene_path": scene_path,
+        "output_path": output_path,
+        "result_name": result_name,
+        "video_count": len(video_paths),
+        "camera_count": max(0, len(save_cameras) - 2),
+        "points_path": f"{output_path}/points.ply",
+    }
 
 
 if __name__ == '__main__':

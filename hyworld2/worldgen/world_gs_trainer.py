@@ -134,6 +134,9 @@ class Config:
 
     # Batch size for training. Learning rates are scaled automatically
     batch_size: int = 1
+    # DataLoader workers. Keep the official CLI default >0, but Comfy in-process
+    # execution on Windows should set this to 0 to avoid spawn importing Comfy main.py.
+    dataloader_num_workers: int = 4
     # A global factor to scale the number of training steps
     steps_scaler: float = 1.0
 
@@ -1067,8 +1070,8 @@ class Runner:
             self.trainset,
             batch_size=cfg.batch_size,
             shuffle=True,
-            num_workers=4,
-            persistent_workers=True,
+            num_workers=cfg.dataloader_num_workers,
+            persistent_workers=cfg.dataloader_num_workers > 0,
             pin_memory=True,
         )
         trainloader_iter = iter(trainloader)
@@ -1962,7 +1965,13 @@ class Runner:
         device = self.device
         world_rank = self.world_rank
 
-        valloader = torch.utils.data.DataLoader(self.valset, batch_size=1, shuffle=False, num_workers=1)
+        valloader = torch.utils.data.DataLoader(
+            self.valset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=cfg.dataloader_num_workers,
+            persistent_workers=cfg.dataloader_num_workers > 0,
+        )
 
         ellipse_time = 0
         metrics = defaultdict(list)
@@ -2351,8 +2360,8 @@ class Runner:
             self.trainset,
             batch_size=cfg.batch_size,
             shuffle=True,
-            num_workers=4,
-            persistent_workers=True,
+            num_workers=cfg.dataloader_num_workers,
+            persistent_workers=cfg.dataloader_num_workers > 0,
             pin_memory=True,
         )
         trainloader_iter = iter(trainloader)

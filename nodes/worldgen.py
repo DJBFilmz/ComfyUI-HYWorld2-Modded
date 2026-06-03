@@ -1717,23 +1717,11 @@ class VNCCS_WorldGenTrain3DGS:
 
 
 NODE_CLASS_MAPPINGS = {
-    "VNCCS_WorldGenPreparePanoramaScene": VNCCS_WorldGenPreparePanoramaScene,
-    "VNCCS_WorldGenGenerateTrajectories": VNCCS_WorldGenGenerateTrajectories,
-    "VNCCS_WorldGenRenderTrajectories": VNCCS_WorldGenRenderTrajectories,
-    "VNCCS_WorldGenWorldStereoVideo": VNCCS_WorldGenWorldStereoVideo,
     "VNCCS_WorldGenExportBankFromPLY": VNCCS_WorldGenExportBankFromPLY,
     "VNCCS_WorldGenBuildGSDataFromWorldMirror": VNCCS_WorldGenBuildGSDataFromWorldMirror,
-    "VNCCS_WorldGenRunOfficialGSData": VNCCS_WorldGenRunOfficialGSData,
-    "VNCCS_WorldGenTrain3DGS": VNCCS_WorldGenTrain3DGS,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "VNCCS_WorldGenPreparePanoramaScene": "WorldGen Prepare Panorama Scene",
-    "VNCCS_WorldGenGenerateTrajectories": "WorldGen Generate Trajectories",
-    "VNCCS_WorldGenRenderTrajectories": "WorldGen Render Trajectories",
-    "VNCCS_WorldGenWorldStereoVideo": "WorldGen WorldStereo Video",
     "VNCCS_WorldGenExportBankFromPLY": "WorldGen Prepare Workspace",
     "VNCCS_WorldGenBuildGSDataFromWorldMirror": "WorldGen Build GS Data From WorldMirror",
-    "VNCCS_WorldGenRunOfficialGSData": "WorldGen Run Official gen_gs_data",
-    "VNCCS_WorldGenTrain3DGS": "WorldGen Train Native 3DGS",
 }

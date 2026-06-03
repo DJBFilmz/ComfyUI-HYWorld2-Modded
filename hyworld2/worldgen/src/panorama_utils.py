@@ -17,7 +17,10 @@ from moge.utils.panorama import (
 from scipy.sparse import csr_array
 from tqdm import tqdm
 
-from src import utils3d_compat as u3d
+try:
+    from . import utils3d_compat as u3d
+except ImportError:
+    from src import utils3d_compat as u3d
 
 
 def subdivide_icosahedron(subdivisions: int = 1) -> np.ndarray:

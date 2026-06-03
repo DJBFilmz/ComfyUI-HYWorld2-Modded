@@ -23,7 +23,7 @@ from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation as R
 
 try:
-    from ..src.general_utils import rank0_log
+    from .general_utils import rank0_log
 except ImportError:
     from src.general_utils import rank0_log
 

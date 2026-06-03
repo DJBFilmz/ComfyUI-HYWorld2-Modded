@@ -73,7 +73,6 @@ cupy-cuda13x
 zim-anything
 openai
 utils3d
-llama-cpp-python[server]>=0.3.33
 
 # Sky segmentation ONNX fallback (optional)
 # onnxruntime
