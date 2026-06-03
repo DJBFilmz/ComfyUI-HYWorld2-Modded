@@ -70,14 +70,45 @@ def _release_model_memory(label="HYWorld2"):
             pass
 
 
-def _ensure_single_process_dist():
+class _SingleProcessDist:
+    @staticmethod
+    def is_available():
+        return True
+
+    @staticmethod
+    def is_initialized():
+        return True
+
+    @staticmethod
+    def get_rank():
+        return 0
+
+    @staticmethod
+    def get_world_size():
+        return 1
+
+    @staticmethod
+    def barrier(*args, **kwargs):
+        return None
+
+    @staticmethod
+    def all_gather_object(object_list, obj, *args, **kwargs):
+        if object_list:
+            object_list[0] = obj
+        return None
+
+
+def _ensure_single_process_dist(bank=None):
     if dist.is_available() and dist.is_initialized():
         return
-    if not dist.is_available():
-        raise RuntimeError("torch.distributed is required by HYWorld2 memory alignment.")
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = "29631"
-    dist.init_process_group(backend="gloo", rank=0, world_size=1)
+    shim = _SingleProcessDist()
+    module_names = {"hyworld2.worldgen.src.retrieval_wm", "src.retrieval_wm"}
+    if bank is not None:
+        module_names.add(bank.__class__.__module__)
+    for module_name in module_names:
+        module = sys.modules.get(module_name)
+        if module is not None and hasattr(module, "dist"):
+            module.dist = shim
 
 
 def _reset_dir(path, label="directory"):
@@ -1261,7 +1292,7 @@ class HYWorld2MemoryAlignment:
         for index, depth in enumerate(depths):
             np.save(depth_dir / f"depth_{index:04d}.npy", depth)
         if mode == "align_and_export":
-            _ensure_single_process_dist()
+            _ensure_single_process_dist(bank)
             bank.alignment(debug_mode=bool(debug_mode))
             export_dir = Path(bank.root_path) / "render_results" / bank.results_path
             _ensure_dir(export_dir)
@@ -1471,13 +1502,11 @@ class HYWorld2Train3DGS:
             candidates = sorted((out_dir / "ply").glob("trainer_cameras_*.json")) if (out_dir / "ply").exists() else []
             camera_json = candidates[-1] if candidates else data_dir / "cameras.json"
         poses, intrs = _load_camera_tensors_from_json(camera_json) if camera_json.exists() else (torch.empty((0, 4, 4)), torch.empty((0, 3, 3)))
-        if poses.numel() > 0:
-            poses = torch.stack([_worldstereo_c2w_to_worldmirror_c2w(pose) for pose in poses]).float()
         info = {
             "ply_path": ply_path,
             "train_dir": str(out_dir),
             "camera_json": str(camera_json) if camera_json.exists() else "",
-            "camera_pose_basis": "worldmirror_c2w",
+            "camera_pose_basis": "trainer_c2w",
         }
         return (ply_path, poses, intrs, str(out_dir), _safe_json_dumps(info))
 
