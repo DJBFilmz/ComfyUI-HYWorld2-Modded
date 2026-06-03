@@ -4,6 +4,7 @@ import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from glob import glob
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -21,6 +22,10 @@ from src.distributed_compat import distributed_backend
 from src import utils3d_compat as u3d
 
 timer = Timer()
+
+def _view_traj_from_video_path(video_path):
+    path = Path(video_path)
+    return path.parent.parent.name, path.parent.name
 
 def save_io(fname, frame_img, depth_path, normal_map, w2c, K, output_path):
     img_path = f"{output_path}/images/{fname}.png"
@@ -243,12 +248,12 @@ if __name__ == '__main__':
                                glob(f"{scene_path}/render_results/reconstruct*/*/{result_name}_result.mp4") +
                                glob(f"{scene_path}/render_results/wonder*/*/{result_name}_result.mp4"))
 
-        video_paths = sorted(video_paths, key=lambda x: (x.split("/")[-3], x.split("/")[-2]))
+        video_paths = sorted(video_paths, key=_view_traj_from_video_path)
         video_paths = video_paths[rank::world_size]
 
         with timer.track("[IO] Loading & Processing video frames"):
             for video_path in tqdm(video_paths, desc="Loading & Processing video...", disable=rank != 0):
-                view_id, traj_id = video_path.split("/")[-3], video_path.split("/")[-2]
+                view_id, traj_id = _view_traj_from_video_path(video_path)
                 video_dir = os.path.dirname(video_path)
                 view_dir = os.path.dirname(video_dir)
                 frames = load_video(video_path)
@@ -388,7 +393,7 @@ if __name__ == '__main__':
                 with open(f"{pano_bank_path}/cameras.json", "r") as f:
                     pano_cameras = json.load(f)
                 for i in tqdm(range(len(splitted_pano_list)), disable=rank != 0):
-                    orig_fname = splitted_pano_list[i].split('/')[-1].split('.')[0]
+                    orig_fname = Path(splitted_pano_list[i]).stem
                     fname = f"panorama_{orig_fname}"
 
                     save_cameras[fname] = {
@@ -519,7 +524,7 @@ if __name__ == '__main__':
                     pano_cameras = json.load(f)
 
                 for i in tqdm(range(len(splitted_pano_list)), disable=rank != 0):
-                    orig_fname = splitted_pano_list[i].split('/')[-1].split('.')[0]
+                    orig_fname = Path(splitted_pano_list[i]).stem
                     fname = f"polar_{orig_fname}"
 
                     save_cameras[fname] = {

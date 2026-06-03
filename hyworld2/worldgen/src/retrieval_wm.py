@@ -1059,7 +1059,8 @@ class PanoramaMemoryBank:
 
         # Downsample frames that need updates in the memory bank, skipping the first frame.
         nframe = len(gen_frames)
-        indices = sample_align_nframe(nframe, self.align_nframe)
+        effective_align_nframe = min(self.align_nframe, max(1, nframe - 1))
+        indices = sample_align_nframe(nframe, effective_align_nframe)
         updated_tar_w2cs = tar_w2cs_full[indices]
         updated_tar_Ks = tar_Ks_full[indices]
         gen_frames = [gen_frames[idx] for idx in indices]
@@ -1150,8 +1151,21 @@ class PanoramaMemoryBank:
         torch.cuda.empty_cache()
         if self.rank == 0:
             if not (skip_exist and os.path.exists(f"{self.world_mirror_dir}/name_map.json")):
-                wm_cmd = [
-                    sys.executable, "-m", "torch.distributed.run", f"--nproc_per_node={self.world_size}", "-m", "hyworld2.worldrecon.pipeline",
+                worldgen_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                hyworld2_dir = os.path.dirname(worldgen_dir)
+                project_root = os.path.dirname(hyworld2_dir)
+                worldmirror_model_root = None
+                models_dir = os.environ.get("COMFYUI_MODELS_DIR")
+                if models_dir:
+                    candidate = os.path.join(models_dir, "WorldMirror-V2")
+                    if os.path.isfile(os.path.join(candidate, "HY-WorldMirror-2.0", "model.safetensors")):
+                        worldmirror_model_root = candidate
+                if worldmirror_model_root is None:
+                    candidate = os.path.abspath(os.path.join(project_root, "..", "..", "models", "WorldMirror-V2"))
+                    if os.path.isfile(os.path.join(candidate, "HY-WorldMirror-2.0", "model.safetensors")):
+                        worldmirror_model_root = candidate
+
+                wm_args = [
                     "--input_path", f"{self.world_mirror_dir}/images",
                     "--prior_cam_path", f"{self.world_mirror_dir}/cameras.json",
                     "--strict_output_path", f"{self.world_mirror_dir}/results",
@@ -1163,15 +1177,37 @@ class PanoramaMemoryBank:
                     "--no_save_points",
                     "--no_sky_mask",
                     "--no_edge_mask",
-                    "--use_fsdp",
                     "--enable_bf16",
                     "--disable_heads", "normal", "points", "gs"
                 ]
+                if worldmirror_model_root is not None:
+                    wm_args.extend(["--pretrained_model_name_or_path", worldmirror_model_root])
+                if self.world_size <= 1:
+                    wm_entry = (
+                        "import runpy, sys; "
+                        f"sys.path.insert(0, {project_root!r}); "
+                        f"sys.path.insert(0, {hyworld2_dir!r}); "
+                        "runpy.run_module('hyworld2.worldrecon.pipeline', run_name='__main__')"
+                    )
+                    wm_cmd = [
+                        sys.executable, "-c", wm_entry,
+                        *wm_args,
+                    ]
+                else:
+                    wm_cmd = [
+                        sys.executable, "-m", "torch.distributed.run", f"--nproc_per_node={self.world_size}",
+                        "-m", "hyworld2.worldrecon.pipeline",
+                        *wm_args,
+                        "--use_fsdp",
+                    ]
                 color_print(f"[Rank0] Running World Mirror inference: {' '.join(wm_cmd)}", "info")
-                worldgen_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                hyworld2_dir = os.path.dirname(worldgen_dir)
-                project_root = os.path.dirname(hyworld2_dir)
                 wm_env = os.environ.copy()
+                wm_env["USE_LIBUV"] = "0"
+                wm_env.setdefault("RANK", "0")
+                wm_env.setdefault("WORLD_SIZE", str(self.world_size))
+                wm_env.setdefault("LOCAL_RANK", "0")
+                wm_env.setdefault("PYTHONIOENCODING", "utf-8")
+                wm_env.setdefault("PYTHONUTF8", "1")
                 wm_env["PYTHONPATH"] = os.pathsep.join([
                     project_root,
                     hyworld2_dir,

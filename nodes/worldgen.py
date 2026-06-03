@@ -412,6 +412,7 @@ def _run_command(command, cwd, env=None, deep_logging=False, log_path=None):
     process_env.setdefault("RANK", "0")
     process_env.setdefault("WORLD_SIZE", "1")
     process_env.setdefault("LOCAL_RANK", "0")
+    process_env.setdefault("COMFYUI_MODELS_DIR", str(_models_root()))
     if env:
         process_env.update(env)
     process_env["PYTHONPATH"] = os.pathsep.join([
