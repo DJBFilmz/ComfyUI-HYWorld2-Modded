@@ -231,7 +231,38 @@ def _normalize_bypass_images(images):
     return None
 
 
+def _bypass_splat_points_and_colors(splats):
+    means = _splat_tensor_any(splats, ("means", "xyz", "positions"), 3)
+    if means is None:
+        return None, None
+
+    colors = _splat_tensor_any(splats, ("colors", "rgb", "rgbs"), 3)
+    if colors is None:
+        sh = _splat_tensor_any(splats, ("sh", "features_dc"), 3)
+        if sh is not None:
+            sh_c0 = 0.28209479177387814
+            colors = (0.5 + sh_c0 * sh).clamp(0.0, 1.0)
+    if colors is None or colors.shape[0] not in (1, means.shape[0]):
+        colors = torch.full_like(means, 0.5)
+    elif colors.shape[0] == 1 and means.shape[0] > 1:
+        colors = colors.repeat(means.shape[0], 1)
+
+    finite = torch.isfinite(means).all(dim=1)
+    means = means[finite]
+    colors = colors[finite]
+    if means.numel() == 0:
+        return None, None
+    colors_u8 = (colors.clamp(0.0, 1.0).numpy() * 255.0 + 0.5).astype(np.uint8)
+    return means.numpy().astype(np.float32), colors_u8
+
+
 def _bypass_points_and_colors(ply_data, raw_splats=None):
+    for container in (ply_data, raw_splats):
+        if isinstance(container, dict):
+            points, colors = _bypass_splat_points_and_colors(container.get("splats"))
+            if points is not None and colors is not None:
+                return points, colors
+
     sources = []
     if isinstance(ply_data, dict):
         sources.extend(
@@ -283,6 +314,26 @@ def _write_bypass_point_ply(path, points, colors):
 
     save_points_ply(Path(path), points, colors)
     return str(path)
+
+
+def _export_bypass_memory_bank_pcds(bank, ply_data, raw_splats, downsampled_pts):
+    points, colors = _bypass_points_and_colors(ply_data, raw_splats)
+    if points is None or colors is None:
+        raise ValueError(
+            "HYWorld2 Memory Alignment bypass could not build aligned_pcd.ply: "
+            "no Gaussian means or point geometry found in ply_data/raw_splats."
+        )
+
+    export_dir = Path(bank.root_path) / "render_results" / bank.results_path
+    _ensure_dir(export_dir)
+    bank.global_points = {
+        "worldmirror_bypass": {
+            "points": points,
+            "colors": colors,
+        }
+    }
+    bank.export_pcd(str(export_dir), N_points=max(1, int(downsampled_pts)))
+    return str(export_dir / "aligned_pcd.ply"), int(points.shape[0])
 
 
 def _save_worldmirror_ply_data_for_bypass(ply_data, output_path, raw_splats=None):
@@ -1205,7 +1256,7 @@ class HYWorld2MemoryAlignment:
         world_mirror_dir = Path(worldmirror_batch["world_mirror_dir"])
         depth_dir = _ensure_dir(world_mirror_dir / "results" / "depth")
         depths, depth_source = _raw_worldmirror_depths_to_numpy(raw_splats)
-        if not depths:
+        if not depths and mode != "bypass":
             raise ValueError("HYWorld2 Memory Alignment requires raw_splats with metric float depth: raw_splats.gs_depth or raw_splats.depth.")
         for index, depth in enumerate(depths):
             np.save(depth_dir / f"depth_{index:04d}.npy", depth)
@@ -1216,14 +1267,12 @@ class HYWorld2MemoryAlignment:
             _ensure_dir(export_dir)
             bank.export_pcd(str(export_dir), N_points=int(downsampled_pts))
             aligned = str(export_dir / "aligned_pcd.ply")
+            bypass_source_points = 0
         elif mode == "bypass":
-            aligned = _save_worldmirror_ply_data_for_bypass(
-                ply_data,
-                world_mirror_dir / "results" / "bypass_worldmirror.ply",
-                raw_splats=raw_splats,
-            )
+            aligned, bypass_source_points = _export_bypass_memory_bank_pcds(bank, ply_data, raw_splats, downsampled_pts)
         else:
             aligned = ""
+            bypass_source_points = 0
         memory_bank["bank"] = bank
         return (
             memory_bank,
@@ -1234,6 +1283,7 @@ class HYWorld2MemoryAlignment:
                     "depths_written": len(depths),
                     "depth_source": depth_source,
                     "aligned_ply": aligned,
+                    "bypass_source_points": bypass_source_points,
                     "alignment_ran": mode == "align_and_export",
                 }
             ),
@@ -1308,6 +1358,7 @@ class HYWorld2Train3DGS:
                 "save_steps": ("STRING", {"default": "1500"}),
                 "eval_steps": ("STRING", {"default": "1500"}),
                 "ply_steps": ("STRING", {"default": "1500"}),
+                "downsample_pts_num": ("INT", {"default": 1_000_000, "min": 1, "max": 50_000_000, "step": 100000}),
                 "save_ply": ("BOOLEAN", {"default": True}),
                 "disable_video": ("BOOLEAN", {"default": True}),
                 "disable_viewer": ("BOOLEAN", {"default": True}),
@@ -1330,7 +1381,7 @@ class HYWorld2Train3DGS:
     CATEGORY = "VNCCS/HYWorld2"
     OUTPUT_NODE = True
 
-    def run(self, gs_data, max_steps=1500, save_steps="1500", eval_steps="1500", ply_steps="1500", save_ply=True, disable_video=True, disable_viewer=True, depth_loss=True, normal_loss=True, sky_depth_from_pcd=True, use_scale_regularization=True, use_mask_gaussian=False, mask_export_stochastic=False, antialiased=True, official_strategy_preset=True, normalize_world_space=True, perceptual_loss="lpips_vgg"):
+    def run(self, gs_data, max_steps=1500, save_steps="1500", eval_steps="1500", ply_steps="1500", downsample_pts_num=1_000_000, save_ply=True, disable_video=True, disable_viewer=True, depth_loss=True, normal_loss=True, sky_depth_from_pcd=True, use_scale_regularization=True, use_mask_gaussian=False, mask_export_stochastic=False, antialiased=True, official_strategy_preset=True, normalize_world_space=True, perceptual_loss="lpips_vgg"):
         _ensure_worldgen_path()
         import hyworld2.worldgen.world_gs_trainer as trainer
         from gsplat.strategy import DefaultStrategy
@@ -1349,6 +1400,7 @@ class HYWorld2Train3DGS:
         cfg.save_steps = _parse_int_list(save_steps)
         cfg.eval_steps = _parse_int_list(eval_steps)
         cfg.ply_steps = _parse_int_list(ply_steps)
+        cfg.downsample_pts_num = int(downsample_pts_num)
         cfg.save_ply = bool(save_ply)
         cfg.disable_video = bool(disable_video)
         cfg.disable_viewer = bool(disable_viewer)
@@ -1382,6 +1434,7 @@ class HYWorld2Train3DGS:
             "save_steps": cfg.save_steps,
             "eval_steps": cfg.eval_steps,
             "ply_steps": cfg.ply_steps,
+            "downsample_pts_num": int(cfg.downsample_pts_num),
             "save_ply": bool(cfg.save_ply),
             "disable_video": bool(cfg.disable_video),
             "disable_viewer": bool(cfg.disable_viewer),
