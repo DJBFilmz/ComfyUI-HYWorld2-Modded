@@ -644,8 +644,33 @@ def _has_valid_depth_files(data_dir, max_files=3):
     return False
 
 
-def _shell_split(value):
-    return shlex.split(str(value or ""), posix=os.name != "nt")
+def _shell_split(value, boolean_flags=None):
+    if isinstance(value, bool):
+        return []
+    raw = str(value or "").strip()
+    if not raw or raw.lower() in {"false", "none", "null"}:
+        return []
+    tokens = shlex.split(raw, posix=os.name != "nt")
+    boolean_flags = set(boolean_flags or ())
+    normalized = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token.lower() in {"false", "none", "null"}:
+            i += 1
+            continue
+        if token in boolean_flags and i + 1 < len(tokens):
+            next_token = tokens[i + 1].lower()
+            if next_token in {"false", "0", "no", "off"}:
+                i += 2
+                continue
+            if next_token in {"true", "1", "yes", "on"}:
+                normalized.append(token)
+                i += 2
+                continue
+        normalized.append(token)
+        i += 1
+    return normalized
 
 
 def _torchrun_command(script_name, nproc_per_node):
@@ -698,6 +723,19 @@ def _write_manual_traj_prompts(scene_dir, prompt):
             with open(prompt_path, "w", encoding="utf-8") as handle:
                 json.dump({"prompt": prompt}, handle, indent=2)
     return written
+
+
+def _missing_traj_caption_paths(scene_dir):
+    missing = []
+    for scene in _scene_list_from_scene_dir(scene_dir):
+        render_root = scene / "render_results"
+        if not render_root.exists():
+            continue
+        for render_path in render_root.glob("*/traj*/render.mp4"):
+            caption_path = render_path.with_name("traj_caption.json")
+            if not caption_path.exists():
+                missing.append(caption_path)
+    return missing
 
 
 def _worldstereo_cli_args(worldstereo_model, model_type):
@@ -900,6 +938,11 @@ class VNCCS_WorldGenRenderTrajectories:
                     "default": False,
                     "tooltip": "Temporary test default: off. Re-enable VLM/LLM captions for final WorldGen prompts.",
                 }),
+                "manual_prompt": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": "Used to create traj_caption.json files when VLM/LLM captioning is disabled.",
+                }),
                 "extra_args": ("STRING", {"default": "", "multiline": False}),
                 "deep_logging": ("BOOLEAN", {"default": False}),
             },
@@ -920,6 +963,7 @@ class VNCCS_WorldGenRenderTrajectories:
         llm_port=8000,
         llm_name="Qwen/Qwen3-VL-8B-Instruct",
         enable_vlm_caption=False,
+        manual_prompt="",
         extra_args="",
         deep_logging=False,
     ):
@@ -938,8 +982,25 @@ class VNCCS_WorldGenRenderTrajectories:
             # TEMPORARY TEST MODE: LLM/VLM captioning is disabled.
             # Turn enable_vlm_caption back on for production-quality trajectory prompts.
             cmd.append("--disable_vlm_caption")
-        cmd.extend(_shell_split(extra_args))
+        cmd.extend(_shell_split(extra_args, boolean_flags={"--disable_vlm_caption"}))
         log = _run_command(cmd, WORLDGEN_DIR, deep_logging=deep_logging, log_path=scene / "worldgen_traj_render_full.log")
+        manual_prompt_count = 0
+        if not enable_vlm_caption:
+            manual_prompt_count = _write_manual_traj_prompts(scene, manual_prompt)
+            missing_captions = _missing_traj_caption_paths(scene)
+            if missing_captions:
+                sample = "\n".join(str(path) for path in missing_captions[:8])
+                raise ValueError(
+                    "VLM captioning is disabled, but manual_prompt is empty or did not cover all rendered "
+                    "trajectories. Fill manual_prompt in WorldGen Render Trajectories or enable VLM captioning. "
+                    f"Missing {len(missing_captions)} traj_caption.json file(s):\n{sample}"
+                )
+        if manual_prompt_count:
+            log = (
+                f"[WorldGen] Manual prompt test mode wrote {manual_prompt_count} missing traj_caption.json file(s). "
+                "Re-enable VLM/LLM captions for final production prompts.\n"
+                f"{log}"
+            )
         return (str(scene), log)
 
 
