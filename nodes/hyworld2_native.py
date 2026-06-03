@@ -157,6 +157,210 @@ def _raw_worldmirror_depths_to_numpy(raw_splats):
     return [], ""
 
 
+def _first_existing_ply_path(*values):
+    for value in values:
+        if isinstance(value, dict):
+            nested = _first_existing_ply_path(
+                value.get("ply_path"),
+                value.get("path"),
+                value.get("file"),
+                value.get("filepath"),
+                value.get("gaussian_ply"),
+                value.get("points_ply"),
+            )
+            if nested:
+                return nested
+        elif isinstance(value, (str, os.PathLike)) and str(value).lower().endswith(".ply"):
+            path = Path(value)
+            if path.exists():
+                return str(path)
+    return ""
+
+
+def _first_splat_tensor(splats, key, dim):
+    if not isinstance(splats, dict):
+        return None
+    value = splats.get(key)
+    if value is None:
+        return None
+    if isinstance(value, list):
+        if not value:
+            return None
+        value = value[0]
+    if not isinstance(value, torch.Tensor):
+        return None
+    value = value.detach().cpu().float()
+    if value.dim() >= 2 and value.shape[0] == 1 and value.shape[-1] == dim:
+        value = value[0]
+    if value.shape[-1] != dim:
+        return None
+    return value.reshape(-1, dim)
+
+
+def _splat_tensor_any(splats, keys, dim):
+    for key in keys:
+        tensor = _first_splat_tensor(splats, key, dim)
+        if tensor is not None:
+            return tensor
+    return None
+
+
+def _normalize_bypass_points(points):
+    if not isinstance(points, torch.Tensor):
+        return None
+    points = points.detach().cpu().float()
+    if points.dim() == 5 and points.shape[0] == 1:
+        points = points[0]
+    if points.dim() == 4 and points.shape[-1] == 3:
+        return points
+    if points.dim() == 2 and points.shape[-1] == 3:
+        return points
+    return None
+
+
+def _normalize_bypass_images(images):
+    if not isinstance(images, torch.Tensor):
+        return None
+    images = images.detach().cpu().float()
+    if images.dim() == 5 and images.shape[0] == 1:
+        images = images[0]
+    if images.dim() == 4 and images.shape[1] in (1, 3, 4) and images.shape[-1] not in (1, 3, 4):
+        images = images.permute(0, 2, 3, 1)
+    if images.dim() == 4 and images.shape[-1] in (1, 3, 4):
+        return images[..., :3]
+    return None
+
+
+def _bypass_points_and_colors(ply_data, raw_splats=None):
+    sources = []
+    if isinstance(ply_data, dict):
+        sources.extend(
+            [
+                ply_data.get("pts3d_filtered"),
+                ply_data.get("pts3d"),
+                ply_data.get("model_pts3d_filtered"),
+                ply_data.get("model_pts3d"),
+            ]
+        )
+    if isinstance(raw_splats, dict):
+        sources.extend([raw_splats.get("pts3d_filtered"), raw_splats.get("pts3d")])
+
+    points = None
+    for source in sources:
+        points = _normalize_bypass_points(source)
+        if points is not None:
+            break
+    if points is None:
+        return None, None
+
+    images = None
+    if isinstance(ply_data, dict):
+        images = _normalize_bypass_images(ply_data.get("images"))
+    if images is None and isinstance(raw_splats, dict):
+        images = _normalize_bypass_images(raw_splats.get("images"))
+
+    if points.dim() == 4:
+        flat_points = points.reshape(-1, 3)
+        if images is not None and images.shape[0] == points.shape[0] and images.shape[1:3] == points.shape[1:3]:
+            flat_colors = images.reshape(-1, 3)
+        else:
+            flat_colors = torch.full_like(flat_points, 0.5)
+    else:
+        flat_points = points.reshape(-1, 3)
+        flat_colors = torch.full_like(flat_points, 0.5)
+
+    finite = torch.isfinite(flat_points).all(dim=1)
+    flat_points = flat_points[finite]
+    flat_colors = flat_colors[finite]
+    if flat_points.numel() == 0:
+        return None, None
+    colors_u8 = (flat_colors.clamp(0.0, 1.0).numpy() * 255.0 + 0.5).astype(np.uint8)
+    return flat_points.numpy().astype(np.float32), colors_u8
+
+
+def _write_bypass_point_ply(path, points, colors):
+    from hyworld2.worldrecon.hyworldmirror.utils.save_utils import save_points_ply
+
+    save_points_ply(Path(path), points, colors)
+    return str(path)
+
+
+def _save_worldmirror_ply_data_for_bypass(ply_data, output_path, raw_splats=None):
+    existing = _first_existing_ply_path(ply_data, raw_splats)
+    if existing:
+        return existing
+
+    if not isinstance(ply_data, dict):
+        raise ValueError("HYWorld2 Memory Alignment bypass requires the WorldMirror PLY_DATA output connected to ply_data.")
+
+    output_path = Path(output_path)
+    _ensure_dir(output_path.parent)
+    splats = ply_data.get("splats")
+    if not isinstance(splats, dict) and isinstance(raw_splats, dict):
+        splats = raw_splats.get("splats")
+    means = _splat_tensor_any(splats, ("means", "xyz", "positions"), 3)
+    scales = _splat_tensor_any(splats, ("scales", "scale"), 3)
+    quats = _splat_tensor_any(splats, ("quats", "rotations", "rotation", "rots"), 4)
+    opacities = _splat_tensor_any(splats, ("opacities", "opacity"), 1)
+    colors = _splat_tensor_any(splats, ("sh", "features_dc"), 3)
+    if colors is None:
+        colors = _splat_tensor_any(splats, ("colors", "rgb", "rgbs"), 3)
+        if colors is not None:
+            sh_c0 = 0.28209479177387814
+            colors = (colors - 0.5) / sh_c0
+    if colors is not None and means is not None and colors.shape[0] == 1 and means.shape[0] > 1:
+        colors = colors.repeat(means.shape[0], 1)
+
+    if all(t is not None for t in (means, scales, quats, opacities, colors)):
+        from hyworld2.worldrecon.hyworldmirror.utils.save_utils import _build_gs_ply_data
+
+        count = min(means.shape[0], scales.shape[0], quats.shape[0], opacities.shape[0], colors.shape[0])
+        ply = _build_gs_ply_data(
+            means[:count],
+            scales[:count].clamp_min(1e-8),
+            quats[:count],
+            colors[:count],
+            opacities[:count].reshape(-1),
+            quantile_threshold=1.0,
+        )
+        ply.write(str(output_path))
+        return str(output_path)
+
+    try:
+        from .world_mirror_v1 import extract_splat_params
+    except Exception:
+        extract_splat_params = None
+    if extract_splat_params is not None:
+        params = extract_splat_params(ply_data)
+        if params:
+            from hyworld2.worldrecon.hyworldmirror.utils.save_utils import _build_gs_ply_data
+
+            means, scales, quats, rgb, opacities = params
+            sh_c0 = 0.28209479177387814
+            colors = (rgb.detach().cpu().float() - 0.5) / sh_c0
+            ply = _build_gs_ply_data(
+                means.detach().cpu().float(),
+                scales.detach().cpu().float().clamp_min(1e-8),
+                quats.detach().cpu().float(),
+                colors,
+                opacities.detach().cpu().float().reshape(-1),
+                quantile_threshold=1.0,
+            )
+            ply.write(str(output_path))
+            return str(output_path)
+
+    points, colors = _bypass_points_and_colors(ply_data, raw_splats)
+    if points is not None and colors is not None:
+        return _write_bypass_point_ply(output_path, points, colors)
+
+    keys = sorted(str(k) for k in ply_data.keys())
+    raw_keys = sorted(str(k) for k in raw_splats.keys()) if isinstance(raw_splats, dict) else []
+    raise ValueError(
+        "HYWorld2 Memory Alignment bypass could not find Gaussian splats or point geometry "
+        f"in connected ply_data/raw_splats. ply_data keys={keys}, raw_splats keys={raw_keys}"
+    )
+
+
 def _to_c2w(poses):
     if not isinstance(poses, torch.Tensor):
         return torch.empty((0, 4, 4), dtype=torch.float32)
@@ -180,6 +384,30 @@ def _to_intrinsics(intrs):
     if intrs.dim() == 2:
         intrs = intrs.unsqueeze(0)
     return intrs
+
+
+_WORLDSTEREO_TO_WORLDMIRROR_BASIS = torch.tensor(
+    [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, -1.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    dtype=torch.float32,
+)
+
+
+def _worldstereo_w2c_to_worldmirror_c2w(w2c):
+    """Convert WorldStereo Z-up W2C cameras to WorldMirror panorama C2W poses."""
+    c2w = torch.linalg.inv(w2c.detach().cpu().float())
+    return _worldstereo_c2w_to_worldmirror_c2w(c2w)
+
+
+def _worldstereo_c2w_to_worldmirror_c2w(c2w):
+    """Convert WorldStereo/worldgen Z-up C2W cameras to WorldMirror panorama C2W poses."""
+    c2w = c2w.detach().cpu().float()
+    basis = _WORLDSTEREO_TO_WORLDMIRROR_BASIS.to(dtype=c2w.dtype)
+    return basis @ c2w
 
 
 def _load_camera_tensors_from_json(path):
@@ -932,10 +1160,11 @@ class HYWorld2PrepareWorldMirrorBatch:
             view_id, traj_id, frame_id = fname.split("/")
             image = bank.ref_frames[gi].convert("RGB")
             image.save(images_dir / f"{camera_id}.png")
-            cameras["extrinsics"].append({"camera_id": camera_id, "matrix": bank.ref_w2cs[gi].inverse().detach().cpu().numpy().tolist()})
+            pose = _worldstereo_w2c_to_worldmirror_c2w(bank.ref_w2cs[gi])
+            cameras["extrinsics"].append({"camera_id": camera_id, "matrix": pose.numpy().tolist()})
             cameras["intrinsics"].append({"camera_id": camera_id, "matrix": bank.ref_Ks[gi].detach().cpu().numpy().tolist()})
             images.append(image)
-            poses.append(bank.ref_w2cs[gi].inverse().detach().cpu())
+            poses.append(pose)
             intrs.append(bank.ref_Ks[gi].detach().cpu())
             name_map[fname] = str(index).zfill(4)
         cameras["num_cameras"] = len(images)
@@ -956,9 +1185,10 @@ class HYWorld2MemoryAlignment:
             "required": {
                 "worldmirror_batch": ("HYWORLD2_WORLDMIRROR_BATCH",),
                 "raw_splats": ("VNCCS_SPLAT",),
-                "mode": (["consume_worldmirror_depths", "align_and_export"], {"default": "align_and_export"}),
+                "mode": (["consume_worldmirror_depths", "align_and_export", "bypass"], {"default": "align_and_export"}),
             },
             "optional": {
+                "ply_data": ("PLY_DATA",),
                 "downsampled_pts": ("INT", {"default": 2_000_000, "min": 1, "max": 50_000_000, "step": 100000}),
                 "debug_mode": ("BOOLEAN", {"default": False}),
             },
@@ -969,7 +1199,7 @@ class HYWorld2MemoryAlignment:
     FUNCTION = "run"
     CATEGORY = "VNCCS/HYWorld2"
 
-    def run(self, worldmirror_batch, raw_splats, mode, downsampled_pts=2_000_000, debug_mode=False):
+    def run(self, worldmirror_batch, raw_splats, mode, ply_data=None, downsampled_pts=2_000_000, debug_mode=False):
         memory_bank = worldmirror_batch["memory_bank"]
         bank = memory_bank["bank"]
         world_mirror_dir = Path(worldmirror_batch["world_mirror_dir"])
@@ -986,10 +1216,28 @@ class HYWorld2MemoryAlignment:
             _ensure_dir(export_dir)
             bank.export_pcd(str(export_dir), N_points=int(downsampled_pts))
             aligned = str(export_dir / "aligned_pcd.ply")
+        elif mode == "bypass":
+            aligned = _save_worldmirror_ply_data_for_bypass(
+                ply_data,
+                world_mirror_dir / "results" / "bypass_worldmirror.ply",
+                raw_splats=raw_splats,
+            )
         else:
             aligned = ""
         memory_bank["bank"] = bank
-        return (memory_bank, aligned, _safe_json_dumps({"depths_written": len(depths), "depth_source": depth_source, "aligned_ply": aligned}))
+        return (
+            memory_bank,
+            aligned,
+            _safe_json_dumps(
+                {
+                    "mode": mode,
+                    "depths_written": len(depths),
+                    "depth_source": depth_source,
+                    "aligned_ply": aligned,
+                    "alignment_ran": mode == "align_and_export",
+                }
+            ),
+        )
 
 
 class HYWorld2GSData:
@@ -1170,7 +1418,14 @@ class HYWorld2Train3DGS:
             candidates = sorted((out_dir / "ply").glob("trainer_cameras_*.json")) if (out_dir / "ply").exists() else []
             camera_json = candidates[-1] if candidates else data_dir / "cameras.json"
         poses, intrs = _load_camera_tensors_from_json(camera_json) if camera_json.exists() else (torch.empty((0, 4, 4)), torch.empty((0, 3, 3)))
-        info = {"ply_path": ply_path, "train_dir": str(out_dir), "camera_json": str(camera_json) if camera_json.exists() else ""}
+        if poses.numel() > 0:
+            poses = torch.stack([_worldstereo_c2w_to_worldmirror_c2w(pose) for pose in poses]).float()
+        info = {
+            "ply_path": ply_path,
+            "train_dir": str(out_dir),
+            "camera_json": str(camera_json) if camera_json.exists() else "",
+            "camera_pose_basis": "worldmirror_c2w",
+        }
         return (ply_path, poses, intrs, str(out_dir), _safe_json_dumps(info))
 
 

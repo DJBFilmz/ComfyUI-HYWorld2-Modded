@@ -876,8 +876,8 @@ def _align_predictions_to_input_cameras_global(predictions, input_camera_poses, 
         aligned["pts3d"] = _transform_points_similarity(aligned["pts3d"], transform)
     if isinstance(aligned.get("splats"), dict):
         aligned["splats"] = _transform_splats_similarity(aligned["splats"], transform)
-    aligned["_splat_camera_source"] = "input_align"
-    aligned["_input_align_transform"] = transform
+    aligned["_splat_camera_source"] = "camera_inputs"
+    aligned["_input_camera_transform"] = transform
     return aligned, transform
 
 
@@ -1641,9 +1641,9 @@ class VNCCS_WorldMirrorV2_3D:
                     "default": "off",
                     "tooltip": "When camera inputs are missing, derive pseudo input cameras from WorldMirror predictions. stabilize_predicted_intrinsics keeps predicted poses but uses sequence-median focal lengths. reproject_stabilized_predicted also rebuilds pts3d/splat means from depth with those stable cameras."
                 }),
-                "splat_camera_source": (["input_align", "input_when_available", "input_icp_scaled_depth", "predicted"], {
-                    "default": "input_align",
-                    "tooltip": "input_align keeps model depth/splats internally consistent, then aligns the complete predicted reconstruction to input cameras. input_when_available applies full ICP alignment. input_icp_scaled_depth is experimental and backprojects depths from input cameras. predicted matches official inference."
+                "splat_camera_source": (["camera_inputs", "predicted"], {
+                    "default": "camera_inputs",
+                    "tooltip": "camera_inputs backprojects depths from input cameras using ICP scale. predicted uses the model predicted cameras."
                 }),
                 "splat_color_source": (["input_image", "model_sh"], {
                     "default": "input_image",
@@ -1726,7 +1726,7 @@ class VNCCS_WorldMirrorV2_3D:
         camera_conditioning = "pose+intrinsics",
         normalize_camera_poses_to_first = False,
         missing_camera_strategy = "off",
-        splat_camera_source = "input_align",
+        splat_camera_source = "camera_inputs",
         splat_color_source = "input_image",
         adaptive_target_size = False,
         apply_model_masks = False,
@@ -1810,10 +1810,8 @@ class VNCCS_WorldMirrorV2_3D:
         use_pose_prior = camera_conditioning in ("pose+intrinsics", "pose_only")
         use_intrinsics_prior = camera_conditioning in ("pose+intrinsics", "intrinsics_only")
         has_input_cameras = camera_poses is not None and camera_intrinsics is not None
-        use_input_global_align = splat_camera_source == "input_align" and has_input_cameras
-        use_input_icp_align = splat_camera_source == "input_when_available" and has_input_cameras
-        use_input_icp_scaled_depth = splat_camera_source == "input_icp_scaled_depth" and has_input_cameras
-        use_input_splat_cameras = use_input_global_align or use_input_icp_align or use_input_icp_scaled_depth
+        use_input_camera_source = splat_camera_source == "camera_inputs" and has_input_cameras
+        use_input_splat_cameras = use_input_camera_source
 
         if (use_pose_prior or use_input_splat_cameras) and camera_poses is not None:
             views["camera_poses"] = camera_poses.unsqueeze(0).to(exec_dev)
@@ -1866,11 +1864,7 @@ class VNCCS_WorldMirrorV2_3D:
         effective_splat_camera_source = "predicted"
         if worldmirror.enable_gs and gs_renderer is not None:
             gs_renderer.inference_position_from = "gsdepth+predcamera"
-            if use_input_global_align:
-                effective_splat_camera_source = "predicted+global_input_align"
-            elif use_input_icp_align:
-                effective_splat_camera_source = "predicted+input_icp"
-            elif use_input_icp_scaled_depth:
+            if use_input_camera_source:
                 effective_splat_camera_source = "predicted_depth+input_camera_icp_scale"
             else:
                 effective_splat_camera_source = "predicted"
@@ -2041,21 +2035,7 @@ class VNCCS_WorldMirrorV2_3D:
             _log_worldmirror_debug(predictions, views, camera_poses, camera_intrinsics, imgs_tensor)
 
         input_camera_icp = None
-        if use_input_global_align:
-            predictions, input_camera_icp = _align_predictions_to_input_cameras_global(
-                predictions,
-                camera_poses,
-                camera_intrinsics,
-                image_hw=(H, W),
-            )
-        elif use_input_icp_align:
-            predictions, input_camera_icp = _align_predictions_to_input_cameras_icp(
-                predictions,
-                camera_poses,
-                camera_intrinsics,
-                image_hw=(H, W),
-            )
-        elif use_input_icp_scaled_depth:
+        if use_input_camera_source:
             predictions, input_camera_icp = _reproject_predictions_from_input_cameras_with_icp_scale(
                 predictions,
                 camera_poses,
@@ -2510,25 +2490,11 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
             align_corners=False,
         )[:, 0]
 
-        if raw.get("_splat_camera_source") == "input_align":
-            poses = _extract_pose_tensor(raw.get("camera_poses"))
-            raw_intrs = raw.get("camera_intrs")
-            intrs = self._scale_intrinsics_to_highres(raw_intrs, source_w, W) if isinstance(raw_intrs, torch.Tensor) else None
-            if poses is None or intrs is None:
-                print("⚠️ [V2 EXP] input_align upsample fallback: aligned predicted cameras unavailable; using input cameras.")
-                predicted_poses = raw.get("camera_poses")
-                if predicted_poses is None and len(output) > 3:
-                    predicted_poses = output[3]
-                poses = _rescale_input_pose_translation_to_prediction(camera_poses, predicted_poses)
-                intrs = highres_intrs.detach().cpu().float()
-            else:
-                print("[V2 EXP] input_align upsample: backprojecting depth with aligned predicted cameras.")
-        else:
-            predicted_poses = raw.get("camera_poses")
-            if predicted_poses is None and len(output) > 3:
-                predicted_poses = output[3]
-            poses = _rescale_input_pose_translation_to_prediction(camera_poses, predicted_poses)
-            intrs = highres_intrs.detach().cpu().float()
+        predicted_poses = raw.get("camera_poses")
+        if predicted_poses is None and len(output) > 3:
+            predicted_poses = output[3]
+        poses = _rescale_input_pose_translation_to_prediction(camera_poses, predicted_poses)
+        intrs = highres_intrs.detach().cpu().float()
         if poses is None:
             print("⚠️ [V2 EXP] splat upsample skipped: invalid input camera_poses.")
             return output
@@ -2796,9 +2762,9 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
                     "default": 1.75, "min": 0.0, "max": 8.0, "step": 0.05,
                     "tooltip": "Preserve proportionally more far splats when applying the point cap."
                 }),
-                "splat_camera_source": (["input_align", "input_when_available", "input_icp_scaled_depth", "predicted"], {
-                    "default": "input_align",
-                    "tooltip": "input_align keeps model depth/splats internally consistent, then aligns the complete predicted reconstruction to input cameras. input_when_available applies full ICP alignment. input_icp_scaled_depth is experimental and backprojects depths from input cameras. predicted matches official inference."
+                "splat_camera_source": (["camera_inputs", "predicted"], {
+                    "default": "camera_inputs",
+                    "tooltip": "camera_inputs backprojects depths from input cameras using ICP scale. predicted uses the model predicted cameras."
                 }),
                 "camera_intrinsics": ("TENSOR", {
                     "tooltip": "Optional: intrinsics from Equirect360ToViews or WorldStereo."
@@ -2824,7 +2790,7 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
         gs_param_chunk_size=1,
         transformer_mlp_chunk_size=32768,
         apply_sky_mask=False,
-        splat_camera_source="input_align",
+        splat_camera_source="camera_inputs",
         splat_upsample_mode="depth_backproject",
         splat_upsample_size=1022,
         splat_upsample_scale=0.003,
