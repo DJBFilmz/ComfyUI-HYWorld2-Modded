@@ -24,9 +24,11 @@ supported values:
 from __future__ import annotations
 
 import gc
+import inspect
 import json
 import os
 import types
+from contextlib import contextmanager
 from typing import Any
 
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
@@ -34,9 +36,12 @@ os.environ["DIFFUSERS_VERBOSITY"] = "error"
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from diffusers.models import AutoencoderKLWan
 from diffusers.schedulers import UniPCMultistepScheduler
 from omegaconf import OmegaConf
+from safetensors import safe_open
+from safetensors.torch import load as load_safetensors_bytes
 from safetensors.torch import load_file as load_safetensors
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
@@ -93,6 +98,160 @@ warnings.filterwarnings("ignore", category=UserWarning, module="diffusers")
 # ──────────────────────────────────────────────────────────────────────
 
 SUPPORTED_MODEL_TYPES = ("worldstereo-camera", "worldstereo-memory", "worldstereo-memory-dmd")
+_HYWORLD2_SINGLE_FORMAT = "hyworld2_worldstereo_single_transformer_v1"
+
+
+class _Int4Linear(torch.nn.Module):
+    def __init__(self, in_features: int, out_features: int, bias: bool, group_size: int, device=None):
+        super().__init__()
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.group_size = int(group_size)
+        padded_in = ((self.in_features + self.group_size - 1) // self.group_size) * self.group_size
+        self.register_buffer("weight_packed", torch.empty((self.out_features, padded_in // 2), dtype=torch.uint8, device=device))
+        self.register_buffer("weight_scale", torch.empty((self.out_features, padded_in // self.group_size), dtype=torch.float16, device=device))
+        if bias:
+            self.bias = torch.nn.Parameter(torch.empty(self.out_features, device=device))
+        else:
+            self.register_parameter("bias", None)
+
+    def _dequantize_weight(self, dtype: torch.dtype, device) -> torch.Tensor:
+        packed = self.weight_packed.to(device=device)
+        unpacked = torch.empty((packed.shape[0], packed.shape[1] * 2), dtype=torch.uint8, device=device)
+        unpacked[:, 0::2] = packed & 0x0F
+        unpacked[:, 1::2] = packed >> 4
+        unpacked = unpacked[:, : self.in_features].to(torch.float32) - 8.0
+        scales = self.weight_scale.to(device=device, dtype=torch.float32)
+        scales = scales.repeat_interleave(self.group_size, dim=1)[:, : self.in_features]
+        return (unpacked * scales).to(dtype=dtype)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        bias = self.bias.to(device=input.device, dtype=input.dtype) if self.bias is not None else None
+        return F.linear(input, self._dequantize_weight(input.dtype, input.device), bias)
+
+
+def _load_safetensors_cpu(path: str) -> dict[str, torch.Tensor]:
+    try:
+        return load_safetensors(path, device="cpu")
+    except OSError as exc:
+        if "1455" not in str(exc) and "paging file" not in str(exc).lower():
+            raise
+        file_size_gb = os.path.getsize(path) / (1024 ** 3)
+        if file_size_gb > 8:
+            raise OSError(
+                f"Safetensors mmap failed for a huge checkpoint ({file_size_gb:.2f} GB): {path}. "
+                "Use a recent ComfyUI build with model mmap support."
+            ) from exc
+        with open(path, "rb") as f:
+            return load_safetensors_bytes(f.read())
+
+
+def _read_safetensors_metadata(path: str) -> dict[str, str]:
+    with safe_open(path, framework="pt", device="cpu") as f:
+        return dict(f.metadata() or {})
+
+
+@contextmanager
+def _empty_weights_context():
+    try:
+        from accelerate import init_empty_weights
+    except Exception:
+        with torch.device("meta"):
+            yield
+    else:
+        with init_empty_weights():
+            yield
+
+
+def _assign_tensor_to_module(module: torch.nn.Module, key: str, tensor: torch.Tensor) -> None:
+    module_path, _, tensor_name = key.rpartition(".")
+    parent = module.get_submodule(module_path) if module_path else module
+    if tensor_name in parent._parameters:
+        old_param = parent._parameters[tensor_name]
+        requires_grad = old_param.requires_grad if old_param is not None else False
+        parent._parameters[tensor_name] = torch.nn.Parameter(tensor, requires_grad=requires_grad)
+        return
+    if tensor_name in parent._buffers:
+        parent._buffers[tensor_name] = tensor
+        return
+    raise KeyError(f"{key!r} is not a parameter or buffer in {parent.__class__.__name__}")
+
+
+def _replace_submodule(module: torch.nn.Module, module_path: str, replacement: torch.nn.Module) -> None:
+    parent_path, _, child_name = module_path.rpartition(".")
+    parent = module.get_submodule(parent_path) if parent_path else module
+    setattr(parent, child_name, replacement)
+
+
+def _floating_load_dtype(tensor: torch.Tensor, target_dtype: torch.dtype) -> torch.dtype | None:
+    if not tensor.is_floating_point() or str(tensor.dtype).startswith("torch.float8"):
+        return None
+    return target_dtype
+
+
+def _prepare_int4_linears(module: torch.nn.Module, path: str, *, device) -> int:
+    with safe_open(path, framework="pt", device="cpu") as f:
+        packed_keys = sorted(key for key in f.keys() if key.endswith(".weight_packed"))
+        group_size = int((f.metadata() or {}).get("int4_group_size", "128"))
+    replaced = 0
+    for packed_key in packed_keys:
+        module_name = packed_key[: -len(".weight_packed")]
+        original = module.get_submodule(module_name)
+        if not isinstance(original, torch.nn.Linear):
+            raise TypeError(f"int4 key {packed_key!r} targets {original.__class__.__name__}, not Linear")
+        replacement = _Int4Linear(original.in_features, original.out_features, original.bias is not None, group_size, device=device)
+        if original.bias is not None:
+            replacement.bias.requires_grad = original.bias.requires_grad
+        _replace_submodule(module, module_name, replacement)
+        replaced += 1
+    return replaced
+
+
+def _stream_safetensors_to_module(module: torch.nn.Module, path: str, *, device, dtype: torch.dtype) -> tuple[list[str], list[str]]:
+    expected_keys = set(module.state_dict().keys())
+    with safe_open(path, framework="pt", device="cpu") as f:
+        checkpoint_keys = set(f.keys())
+        load_keys = sorted(checkpoint_keys & expected_keys)
+        missing_keys = sorted(expected_keys - checkpoint_keys)
+        unexpected_keys = sorted(checkpoint_keys - expected_keys)
+        for key in load_keys:
+            tensor = f.get_tensor(key)
+            target_dtype = _floating_load_dtype(tensor, dtype)
+            tensor = tensor.to(device=device) if target_dtype is None else tensor.to(device=device, dtype=target_dtype)
+            _assign_tensor_to_module(module, key, tensor)
+    return missing_keys, unexpected_keys
+
+
+def _stream_int4_safetensors_to_module(module: torch.nn.Module, path: str, *, device, dtype: torch.dtype) -> tuple[list[str], list[str]]:
+    expected_keys = set(module.state_dict().keys())
+    with safe_open(path, framework="pt", device="cpu") as f:
+        checkpoint_keys = set(f.keys())
+        shape_keys = {key for key in checkpoint_keys if key.endswith(".weight_shape")}
+        effective_keys = checkpoint_keys - shape_keys
+        load_keys = sorted(effective_keys & expected_keys)
+        missing_keys = sorted(expected_keys - effective_keys)
+        unexpected_keys = sorted(effective_keys - expected_keys)
+        for key in load_keys:
+            tensor = f.get_tensor(key)
+            if key.endswith(".weight_packed"):
+                tensor = tensor.to(device=device)
+            else:
+                target_dtype = _floating_load_dtype(tensor, dtype)
+                tensor = tensor.to(device=device) if target_dtype is None else tensor.to(device=device, dtype=target_dtype)
+            _assign_tensor_to_module(module, key, tensor)
+    return missing_keys, unexpected_keys
+
+
+def _constructor_kwargs_from_config(model_cls, config: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
+    signature = inspect.signature(model_cls.__init__)
+    valid = {
+        name
+        for name, param in signature.parameters.items()
+        if name != "self" and param.kind in (param.POSITIONAL_OR_KEYWORD, param.KEYWORD_ONLY)
+    }
+    kwargs = {key: value for key, value in config.items() if key in valid}
+    kwargs.update(extra)
+    return kwargs
 
 
 def _get_half_dtype() -> torch.dtype:
@@ -206,6 +365,80 @@ class WorldStereo:
         )
 
         rank0_log(f"WorldStereo ({model_type}) ready.")
+        return cls(pipeline=pipeline, cfg=cfg)
+
+    @classmethod
+    def from_single_transformer(
+        cls,
+        repo_id: str,
+        single_model_path: str,
+        *,
+        subfolder: str = "",
+        local_files_only: bool = False,
+        sp_world_size: int = 1,
+        fsdp: bool = False,
+        device_mesh=None,
+        device: torch.device | None = None,
+        model_device: torch.device | str | None = None,
+    ) -> "WorldStereo":
+        """Build the official worldgen pipeline from a HYWorld2 single-transformer checkpoint."""
+        if fsdp:
+            raise NotImplementedError("from_single_transformer does not support FSDP yet.")
+        if not os.path.exists(single_model_path):
+            raise FileNotFoundError(f"Single transformer checkpoint not found: {single_model_path}")
+
+        if os.path.isdir(repo_id):
+            json_cfg_path = os.path.join(repo_id, subfolder, "config.json")
+        else:
+            from huggingface_hub import hf_hub_download
+            json_cfg_path = hf_hub_download(
+                repo_id=repo_id,
+                filename="config.json",
+                subfolder=subfolder if subfolder else None,
+                local_files_only=local_files_only,
+            )
+        if not os.path.exists(json_cfg_path):
+            raise FileNotFoundError(f"config.json not found under {json_cfg_path!r}")
+
+        cfg = OmegaConf.create(cls._load_hf_config(json_cfg_path))
+        model_type = subfolder
+        if model_type not in SUPPORTED_MODEL_TYPES:
+            raise ValueError(
+                f"Unsupported model_type {model_type!r}. "
+                f"Expected one of {SUPPORTED_MODEL_TYPES}."
+            )
+
+        model_device = model_device if model_device is not None else device
+        transformer = cls._load_single_transformer(
+            cfg,
+            model_type,
+            single_model_path,
+            sp_world_size=sp_world_size,
+            device=model_device,
+        )
+
+        text_encoder, image_clip, vae = cls._load_aux(
+            cfg, device=model_device, device_mesh=device_mesh, fsdp=False, local_files_only=local_files_only
+        )
+        image_processor = CLIPImageProcessor.from_pretrained(
+            cfg.base_model, do_rescale=False, subfolder="image_processor", local_files_only=local_files_only
+        )
+        tokenizer = AutoTokenizer.from_pretrained(cfg.base_model, subfolder="tokenizer", local_files_only=local_files_only)
+
+        pipeline = cls._build_pipeline(
+            model_type,
+            cfg,
+            transformer=transformer,
+            text_encoder=text_encoder,
+            image_clip=image_clip,
+            image_processor=image_processor,
+            tokenizer=tokenizer,
+            vae=vae,
+            device=device,
+            local_files_only=local_files_only,
+        )
+
+        rank0_log(f"WorldStereo single transformer ({model_type}) ready.")
         return cls(pipeline=pipeline, cfg=cfg)
 
     # ------------------------------------------------------------------
@@ -344,6 +577,101 @@ class WorldStereo:
         return transformer.eval()
 
     @staticmethod
+    def _load_single_transformer(
+        cfg,
+        model_type: str,
+        weights_path: str,
+        *,
+        sp_world_size: int,
+        device,
+    ):
+        half_dtype = _get_half_dtype()
+        transformer_config_path = os.path.join(cfg.base_model, "transformer", "config.json")
+        if not os.path.exists(transformer_config_path):
+            raise FileNotFoundError(
+                f"Base transformer config is required for single checkpoint loading: {transformer_config_path}"
+            )
+        with open(transformer_config_path, "r", encoding="utf-8") as f:
+            transformer_config = json.load(f)
+
+        model_cls = WorldStereoModel if model_type == "worldstereo-camera" else WorldStereoRefSModel
+        init_kwargs = _constructor_kwargs_from_config(
+            model_cls,
+            transformer_config,
+            {
+                "controlnet_cfg": cfg.controlnet_cfg,
+                "base_model": cfg.base_model,
+            },
+        )
+
+        def _configure_sequence_parallel(transformer):
+            if sp_world_size <= 1:
+                return
+            transformer.sp_size = sp_world_size
+            for layer in transformer.controlnet.controlnet_blocks:
+                layer.self_attn.processor.sp_size = sp_world_size
+            for block in transformer.blocks:
+                if model_type == "worldstereo-camera":
+                    block.attn1.set_processor(WanAttnProcessorSP(sp_size=sp_world_size))
+                else:
+                    block.attn1.processor.sp_size = sp_world_size
+
+        try:
+            metadata = _read_safetensors_metadata(weights_path)
+        except Exception as exc:
+            metadata = {}
+            rank0_log(f"Could not read single checkpoint metadata ({type(exc).__name__}: {exc}).", "WARNING")
+
+        if metadata.get("format") == _HYWORLD2_SINGLE_FORMAT:
+            rank0_log(f"Building empty transformer for single checkpoint ({model_type})... dtype={half_dtype}")
+            with _empty_weights_context():
+                transformer = model_cls(**init_kwargs)
+                transformer.build_controlnet(load_uni3c=False, freeze_backbone=cfg.freeze_backbone)
+            if metadata.get("precision") == "int4":
+                replaced = _prepare_int4_linears(transformer, weights_path, device=device)
+                rank0_log(f"Prepared int4 Linear modules: {replaced}")
+            _configure_sequence_parallel(transformer)
+            if metadata.get("precision") == "int4":
+                missing_keys, unexpected_keys = _stream_int4_safetensors_to_module(
+                    transformer,
+                    weights_path,
+                    device=device,
+                    dtype=half_dtype,
+                )
+            else:
+                missing_keys, unexpected_keys = _stream_safetensors_to_module(
+                    transformer,
+                    weights_path,
+                    device=device,
+                    dtype=half_dtype,
+                )
+            if missing_keys:
+                raise RuntimeError(
+                    f"Single checkpoint is missing {len(missing_keys)} tensor(s); first missing key: {missing_keys[0]}"
+                )
+            if unexpected_keys:
+                rank0_log(f"Single checkpoint unexpected keys: {len(unexpected_keys)}", "WARNING")
+            gc.collect()
+            torch.cuda.empty_cache()
+            return transformer.eval()
+
+        rank0_log(f"Building transformer from single checkpoint ({model_type})... dtype={half_dtype}")
+        transformer = model_cls(**init_kwargs)
+        transformer.build_controlnet(load_uni3c=False, freeze_backbone=cfg.freeze_backbone)
+        _configure_sequence_parallel(transformer)
+        weights = _load_safetensors_cpu(weights_path)
+        result = transformer.load_state_dict(weights, strict=False)
+        if result.missing_keys:
+            rank0_log(f"Single checkpoint missing keys: {len(result.missing_keys)}", "WARNING")
+        if result.unexpected_keys:
+            rank0_log(f"Single checkpoint unexpected keys: {len(result.unexpected_keys)}", "WARNING")
+        del weights
+        transformer = transformer.to(dtype=half_dtype, device=device)
+        gc.collect()
+        torch.cuda.empty_cache()
+        return transformer.eval()
+
+    @staticmethod
     def _load_aux(cfg, *, device, device_mesh, fsdp: bool, local_files_only: bool = False):
         import transformers as _tr
         from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
@@ -356,7 +684,8 @@ class WorldStereo:
         if _tr.__version__ >= "5.0.0":
             rank0_log("Patching text_encoder.encoder.embed_tokens for transformers>=5.0.0", "WARNING")
             text_encoder.encoder.embed_tokens = text_encoder.shared
-        text_encoder = torch.compile(text_encoder)
+        # torch.compile and accelerate CPU-offload hooks do not compose reliably:
+        # Dynamo tries to trace the hook's parameter moves and fails inside UMT5.
 
         # ---- image encoder ----
         rank0_log("Loading ImageEncoder (CLIP)…")
@@ -365,6 +694,7 @@ class WorldStereo:
         ).eval()
         if _tr.__version__ >= "5.0.0":
             rank0_log("Patching CLIP vision forward for transformers>=5.0.0", "WARNING")
+            clip_vision = getattr(image_clip, "vision_model", image_clip)
 
             def _clip_vision_forward(self, pixel_values=None, interpolate_pos_encoding=False, **kwargs):
                 if pixel_values is None:
@@ -388,8 +718,8 @@ class WorldStereo:
                 encoder_states = encoder_states + (hidden_states,)
                 return BaseModelOutput(last_hidden_state=hidden_states, hidden_states=encoder_states)
 
-            image_clip.vision_model.forward = types.MethodType(_clip_vision_forward, image_clip.vision_model)
-            image_clip.vision_model.encoder.forward = types.MethodType(_clip_encoder_forward, image_clip.vision_model.encoder)
+            clip_vision.forward = types.MethodType(_clip_vision_forward, clip_vision)
+            clip_vision.encoder.forward = types.MethodType(_clip_encoder_forward, clip_vision.encoder)
 
         # ---- VAE ----
         vae_dtype = _get_half_dtype()
@@ -412,7 +742,8 @@ class WorldStereo:
             fully_shard(text_encoder, **fsdp_kwargs)
             rank0_log("FSDP wrapping done for T5.")
 
-            for layer in image_clip.vision_model.encoder.layers:
+            clip_vision = getattr(image_clip, "vision_model", image_clip)
+            for layer in clip_vision.encoder.layers:
                 fully_shard(layer, **fsdp_kwargs)
             fully_shard(image_clip, **fsdp_kwargs)
             rank0_log("FSDP wrapping done for CLIP.")

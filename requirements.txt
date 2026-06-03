@@ -1,7 +1,7 @@
 # Core
 torch
 torchvision
-numpy
+numpy>=2.0,<2.3
 Pillow
 opencv-python
 scipy
@@ -17,6 +17,8 @@ plyfile
 trimesh
 open3d>=0.18.0
 ninja
+pybind11
+scikit-learn
 
 # Config / utils
 omegaconf
@@ -32,6 +34,8 @@ packaging
 # Do not install PyPI/upstream gsplat here. HY-World worldgen requires the
 # vendored fork at hyworld2/worldgen/third_party/gsplat_maskgaussian, installed
 # by install.py / scripts/pipinstall.bat / the ComfyUI installer node.
+# WorldGen trajectory planning also requires the local recast wheel built from
+# hyworld2/worldgen/third_party/navmesh by scripts/build_gsplat.py.
 
 # HY-World native GS scene trainer (optional WorldMirror V2 checkbox)
 tyro
@@ -57,12 +61,19 @@ git+https://github.com/microsoft/MoGe.git@0286b495230a074aadf1c76cc5c679e943e5d1
 
 # WorldStereo
 diffusers>=0.36.0
-transformers>=4.40.0
+transformers>=5.2.0
 bitsandbytes>=0.43.0
 optimum-quanto>=0.2.4
 torchao
 imageio[ffmpeg]
 kornia
+
+# WorldGen trajectory/video pipeline
+cupy-cuda13x
+zim-anything
+openai
+utils3d
+llama-cpp-python[server]>=0.3.33
 
 # Sky segmentation ONNX fallback (optional)
 # onnxruntime

@@ -8,7 +8,6 @@ import open3d as o3d
 import torch
 import torch.nn.functional as F
 import trimesh
-import utils3d
 from PIL import Image
 from cupyx.scipy.sparse import csr_matrix as cp_csr_matrix
 from cupyx.scipy.sparse.linalg import lsmr as cp_lsmr
@@ -17,6 +16,8 @@ from moge.utils.panorama import (
 )
 from scipy.sparse import csr_array
 from tqdm import tqdm
+
+from src import utils3d_compat as u3d
 
 
 def subdivide_icosahedron(subdivisions: int = 1) -> np.ndarray:
@@ -34,7 +35,7 @@ def subdivide_icosahedron(subdivisions: int = 1) -> np.ndarray:
     Returns:
         vertices: (N, 3) Subdivided vertex coordinates on the unit sphere.
     """
-    vertices, faces = utils3d.numpy.icosahedron()
+    vertices, faces = u3d.icosahedron()
 
     # Convert to a list so new vertices can be appended dynamically.
     vertices_list = [v for v in vertices]
@@ -96,8 +97,8 @@ def subdivide_icosahedron(subdivisions: int = 1) -> np.ndarray:
 
 def get_panorama_cameras_v2(subdivisions=0):
     vertices = subdivide_icosahedron(subdivisions=subdivisions)
-    intrinsics = utils3d.numpy.intrinsics_from_fov(fov_x=np.deg2rad(90), fov_y=np.deg2rad(90))
-    extrinsics = utils3d.numpy.extrinsics_look_at([0, 0, 0], vertices, [0, 0, 1]).astype(np.float32)
+    intrinsics = u3d.intrinsics_from_fov(fov_x=np.deg2rad(90), fov_y=np.deg2rad(90))
+    extrinsics = u3d.extrinsics_look_at([0, 0, 0], vertices, [0, 0, 1]).astype(np.float32)
     return extrinsics, [intrinsics] * len(vertices)
 
 
@@ -144,13 +145,13 @@ def split_panorama_image(image: np.ndarray, extrinsics: np.ndarray, intrinsics: 
     safe_height = height // 2
     safe_width = int(round(safe_height / h * w))
     if interp == cv2.INTER_AREA: # remap does not support area downsampling; remap to a safe resolution first to avoid frequency artifacts.
-        uv = utils3d.numpy.image_uv(width=safe_width, height=safe_height)
+        uv = u3d.image_uv(width=safe_width, height=safe_height)
     else:
-        uv = utils3d.numpy.image_uv(width=w, height=h)
+        uv = u3d.image_uv(width=w, height=h)
     splitted_images = []
     for i in range(len(extrinsics)):
-        spherical_uv = directions_to_spherical_uv(utils3d.numpy.unproject_cv(uv, extrinsics=extrinsics[i], intrinsics=intrinsics[i]))
-        pixels = utils3d.numpy.uv_to_pixel(spherical_uv, width=width, height=height).astype(np.float32)
+        spherical_uv = directions_to_spherical_uv(u3d.unproject_cv(uv, extrinsics=extrinsics[i], intrinsics=intrinsics[i]))
+        pixels = u3d.uv_to_pixel(spherical_uv, width=width, height=height).astype(np.float32)
         if interp == cv2.INTER_AREA: # remap does not support area downsampling; remap to a safe resolution first to avoid frequency artifacts.
             splitted_image = cv2.remap(image, pixels[..., 0], pixels[..., 1], interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
             splitted_image = cv2.resize(splitted_image, (w, h), interpolation=interp)
@@ -163,12 +164,12 @@ def split_panorama_image(image: np.ndarray, extrinsics: np.ndarray, intrinsics: 
 def split_panorama_depth(depth: np.ndarray, extrinsics: np.ndarray, intrinsics: np.ndarray, h: int, w: int, distance_to_depth=False):
     height, width = depth.shape[:2]
     depth = torch.tensor(depth, dtype=torch.float32)[None, None]
-    uv = utils3d.numpy.image_uv(width=w, height=h)
+    uv = u3d.image_uv(width=w, height=h)
     u_grid, v_grid = np.meshgrid(np.arange(w), np.arange(h))
     splitted_depths = []
     for i in range(len(extrinsics)):
-        spherical_uv = directions_to_spherical_uv(utils3d.numpy.unproject_cv(uv, extrinsics=extrinsics[i], intrinsics=intrinsics[i]))
-        pixels = utils3d.numpy.uv_to_pixel(spherical_uv, width=width, height=height).astype(np.float32)
+        spherical_uv = directions_to_spherical_uv(u3d.unproject_cv(uv, extrinsics=extrinsics[i], intrinsics=intrinsics[i]))
+        pixels = u3d.uv_to_pixel(spherical_uv, width=width, height=height).astype(np.float32)
         pixels = torch.tensor(pixels, dtype=torch.float32)[None, ...]  # [1,h,w,2]
         pixels[..., 0] /= width
         pixels[..., 1] /= height
@@ -301,7 +302,7 @@ def merge_panorama_depth_gpu(width: int, height: int, distance_maps: List[np.nda
     else:
         panorama_depth_init = None
 
-    uv = utils3d.numpy.image_uv(width=width, height=height)
+    uv = u3d.image_uv(width=width, height=height)
     spherical_directions = spherical_uv_to_directions(uv)  # [h,w,3]
 
     # Warp each view to the panorama
@@ -309,10 +310,10 @@ def merge_panorama_depth_gpu(width: int, height: int, distance_maps: List[np.nda
     panorama_log_distance_laplacian_maps, panorama_laplacian_masks = [], []
     panorama_pred_masks = []
     for i in range(len(distance_maps)):
-        projected_uv, projected_depth = utils3d.numpy.project_cv(spherical_directions, extrinsics=extrinsics[i], intrinsics=intrinsics[i])
+        projected_uv, projected_depth = u3d.project_cv(spherical_directions, extrinsics=extrinsics[i], intrinsics=intrinsics[i])
         projection_valid_mask = (projected_depth > 0) & (projected_uv > 0).all(axis=-1) & (projected_uv < 1).all(axis=-1)
 
-        projected_pixels = utils3d.numpy.uv_to_pixel(np.clip(projected_uv, 0, 1), width=distance_maps[i].shape[1], height=distance_maps[i].shape[0]).astype(np.float32)
+        projected_pixels = u3d.uv_to_pixel(np.clip(projected_uv, 0, 1), width=distance_maps[i].shape[1], height=distance_maps[i].shape[0]).astype(np.float32)
 
         log_splitted_distance = np.log(distance_maps[i])
         panorama_log_distance_map = np.where(projection_valid_mask,
@@ -429,7 +430,7 @@ def pred_pano_depth(model, image: Image.Image, scale=1.0, resize_to=1920, remove
         ).permute(0, 3, 1, 2)
 
         fov_x, _ = np.rad2deg(  # fov_y is not used by model.infer
-            utils3d.numpy.intrinsics_to_fov(np.array(current_batch_intrinsics))
+            u3d.intrinsics_to_fov(np.array(current_batch_intrinsics))
         )
         fov_x_tensor = torch.tensor(
             fov_x, dtype=torch.float32, device=next(model.parameters()).device
@@ -451,7 +452,7 @@ def pred_pano_depth(model, image: Image.Image, scale=1.0, resize_to=1920, remove
     else:
         skip_ratio_info = f"{skipped_count / (pred_count + skipped_count):.2%}"
 
-    print(f"\t 🔍 Predicted {pred_count} splitted images, skipped {skipped_count} splitted images. Skip ratio: {skip_ratio_info}")
+    print(f"\t Predicted {pred_count} splitted images, skipped {skipped_count} splitted images. Skip ratio: {skip_ratio_info}")
 
     # merge moge depth
     merging_width, merging_height = width, height
@@ -476,7 +477,7 @@ def pred_pano_depth(model, image: Image.Image, scale=1.0, resize_to=1920, remove
     print("\t - Smoothing south pole depth for consistency")
     panorama_depth = smooth_south_pole_depth(panorama_depth, smooth_height_ratio=0.05)
 
-    rays = torch.from_numpy(spherical_uv_to_directions(utils3d.numpy.image_uv(width=width_origin, height=height_origin))).to(next(model.parameters()).device)
+    rays = torch.from_numpy(spherical_uv_to_directions(u3d.image_uv(width=width_origin, height=height_origin))).to(next(model.parameters()).device)
 
     panorama_depth = (
             torch.from_numpy(panorama_depth).to(next(model.parameters()).device) * scale
@@ -1355,7 +1356,7 @@ def _fill_small_boundary_spikes(
 
 def get_view_point_from_panorama_point(global_pcd, w2c, K, image_h, image_w):
     # Get valid points corresponding to the current view.
-    projected_uv, projected_depth = utils3d.numpy.project_cv(global_pcd.vertices, extrinsics=w2c, intrinsics=K)
+    projected_uv, projected_depth = u3d.project_cv(global_pcd.vertices, extrinsics=w2c, intrinsics=K)
     projection_valid_mask = (projected_depth > 0) & (projected_uv > 0).all(axis=-1) & (projected_uv < 1).all(axis=-1)
     projected_uv = projected_uv[projection_valid_mask]
     projected_uv[:, 0] = (projected_uv[:, 0] * image_w).round()

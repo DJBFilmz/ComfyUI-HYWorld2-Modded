@@ -4,6 +4,7 @@ import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from glob import glob
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -15,6 +16,7 @@ from diffusers.utils import export_to_video
 from tqdm import tqdm
 
 from src.general_utils import set_seed, Timer, rank0_log
+from src.distributed_compat import distributed_backend
 from src.pointcloud import multi_gpu_point_rendering
 from src.vlm_utils import get_traj_caption
 
@@ -28,11 +30,18 @@ LLM_PORT = 8000
 
 def caption_single_video(args):
     """Caption one rendered video."""
-    render_path, llm_addr, llm_port, model_name = args
-    output_path = render_path.replace('/render.mp4', '/traj_caption.json')
+    render_path, llm_addr, llm_port, model_name, caption_sample_count, caption_max_tokens = args
+    output_path = str(Path(render_path).with_name("traj_caption.json"))
 
     try:
-        traj_caption = get_traj_caption(llm_addr, llm_port, model_name, render_path)
+        traj_caption = get_traj_caption(
+            llm_addr,
+            llm_port,
+            model_name,
+            render_path,
+            sample_count=caption_sample_count,
+            max_tokens=caption_max_tokens,
+        )
         with open(output_path, "w") as write:
             json.dump({"prompt": traj_caption}, write, indent=2)
         return render_path, True, None
@@ -53,6 +62,14 @@ if __name__ == '__main__':
     parser.add_argument("--llm_addr", type=str, default=LLM_ADDR, help="vLLM server address")
     parser.add_argument("--llm_port", type=int, default=LLM_PORT, help="vLLM server port")
     parser.add_argument("--llm_name", type=str, default=MODEL_NAME, help="VLM model name served by vLLM")
+    parser.add_argument("--caption_workers", type=int, default=1, help="Concurrent VLM caption requests")
+    parser.add_argument("--caption_sample_count", type=int, default=4, help="Video frames sampled per VLM caption")
+    parser.add_argument("--caption_max_tokens", type=int, default=256, help="Maximum tokens per VLM caption")
+    parser.add_argument(
+        "--disable_vlm_caption",
+        action="store_true",
+        help="Skip VLM/LLM trajectory captioning. Re-enable VLM captions for final production prompts.",
+    )
 
     args = parser.parse_args()
 
@@ -68,7 +85,7 @@ if __name__ == '__main__':
     device_num = torch.cuda.device_count()
     torch.cuda.set_device(local_rank)
     dist.init_process_group(
-        backend="cpu:gloo,cuda:nccl",
+        backend=distributed_backend(),
         rank=rank,
         world_size=world_size,
     )
@@ -98,8 +115,10 @@ if __name__ == '__main__':
 
             with open(f"{traj_path}/camera.json", "r") as f:
                 camera_info = json.load(f)
-            view_id, traj_id = traj_path.split('/')[-2], traj_path.split('/')[-1]
-            image_path = f"{scene_path}/render_results/{view_id}/start_frame.png"
+            traj_dir = Path(traj_path)
+            view_dir = traj_dir.parent
+            view_id, traj_id = view_dir.name, traj_dir.name
+            image_path = view_dir / "start_frame.png"
             splitted_image = Image.open(image_path)
             image_w, image_h = splitted_image.size
 
@@ -128,20 +147,40 @@ if __name__ == '__main__':
 
             if rank == 0:
                 with timer.track("[IO] Save rendered results"):
-                    export_to_video(render_video, f"{scene_path}/render_results/{view_id}/{traj_id}/render.mp4", fps=16)
-                    export_to_video(mask_video, f"{scene_path}/render_results/{view_id}/{traj_id}/render_mask.mp4", fps=16)
+                    export_to_video(render_video, str(traj_dir / "render.mp4"), fps=16)
+                    export_to_video(mask_video, str(traj_dir / "render_mask.mp4"), fps=16)
 
             dist.barrier()
 
         # Caption rendered trajectories with concurrent vLLM requests.
         if rank == 0:
+            if args.disable_vlm_caption:
+                # TEMPORARY TEST MODE: VLM/LLM captions are disabled here.
+                # Re-enable VLM captions for production runs so each trajectory gets a real prompt.
+                rank0_log("VLM trajectory captioning is disabled; WorldStereo must receive manual traj prompts.", "WARNING")
+                dist.barrier()
+                if rank == 0:
+                    timer.summary()
+                continue
+
             total_render_list = glob(f"{scene_path}/render_results/*/traj*/render.mp4")
-            total_render_list = [path for path in total_render_list if not (path.split("/")[-3].startswith("reconstruct_") and path.split("/")[-2] == "traj1")]
+            total_render_list = [
+                path for path in total_render_list
+                if not (Path(path).parent.parent.name.startswith("reconstruct_") and Path(path).parent.name == "traj1")
+            ]
+            total_render_list = [
+                path for path in total_render_list
+                if not Path(path).with_name("traj_caption.json").exists()
+            ]
 
             if total_render_list:
                 with timer.track("vllm Qwen3-VL trajectory caption (parallel)"):
-                    tasks = [(path, LLM_ADDR, LLM_PORT, MODEL_NAME) for path in total_render_list]
-                    with ThreadPoolExecutor(max_workers=min(len(tasks), 32)) as executor:
+                    tasks = [
+                        (path, LLM_ADDR, LLM_PORT, MODEL_NAME, args.caption_sample_count, args.caption_max_tokens)
+                        for path in total_render_list
+                    ]
+                    caption_workers = max(1, min(len(tasks), int(args.caption_workers)))
+                    with ThreadPoolExecutor(max_workers=caption_workers) as executor:
                         futures = [executor.submit(caption_single_video, task) for task in tasks]
                         for future in tqdm(as_completed(futures), total=len(futures), desc="VLLM Captioning..."):
                             render_path, success, error = future.result()

@@ -5,7 +5,7 @@ import sys
 
 # 优先从环境变量获取 Recast 路径（适配 pip 安装时的临时目录）
 # 若未设置环境变量，使用原相对路径（需确保安装前路径正确）
-recast_path = os.environ.get("RECAST_PATH", "../../third_party/recastnavigation")
+recast_path = os.environ.get("RECAST_PATH", "../recastnavigation")
 # 转换为绝对路径（避免 pip 安装时工作目录变化导致路径错误）
 recast_path = os.path.abspath(recast_path)
 

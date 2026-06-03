@@ -11,13 +11,14 @@ import torch
 import torch.distributed as dist
 import torchvision.transforms as transforms
 import trimesh
-import utils3d
 from PIL import Image
 from moge.model.v2 import MoGeModel
 from tqdm import tqdm
 
 from src.general_utils import rank0_log, Timer, load_video, save_16bit_png_depth
 from src.panorama_utils import split_panorama_image, split_panorama_depth, rotate_around_z_axis
+from src.distributed_compat import distributed_backend
+from src import utils3d_compat as u3d
 
 timer = Timer()
 
@@ -88,7 +89,7 @@ if __name__ == '__main__':
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(local_rank)
     dist.init_process_group(
-        backend="cpu:gloo,cuda:nccl",
+        backend=distributed_backend(),
         rank=rank,
         world_size=world_size,
     )
@@ -144,7 +145,7 @@ if __name__ == '__main__':
                 full_depth = torch.load(depth_pt_path, weights_only=False)
                 sky_mask = np.array(Image.open(sky_mask_path)) / 255
                 sky_mask = ~torch.from_numpy(sky_mask).bool()
-                edge_mask = torch.from_numpy(utils3d.numpy.depth_edge(full_depth["distance"].cpu().numpy(), rtol=0.1)).bool()
+                edge_mask = torch.from_numpy(u3d.depth_edge(full_depth["distance"].cpu().numpy(), rtol=0.1)).bool()
                 full_mask = (sky_mask | edge_mask).to(device)
             else:
                 rank0_log(f"Warning: full_depth_prediction.pt or sky_mask.png not found, depth/mask will be skipped for pano/polar regen")
@@ -337,9 +338,9 @@ if __name__ == '__main__':
                 direct_points = np.stack(direct_points, axis=0)
                 rank0_log(f"Panorama: {len(pano_layer_starts)} layers x {pano_n_az} azimuths (rot_deg={pano_rot_deg}) = {len(direct_points)} views")
 
-                intrinsics = utils3d.numpy.intrinsics_from_fov(fov_x=np.deg2rad(fov_x), fov_y=np.deg2rad(fov_y))
+                intrinsics = u3d.intrinsics_from_fov(fov_x=np.deg2rad(fov_x), fov_y=np.deg2rad(fov_y))
                 splitted_intrinsics = [intrinsics] * len(direct_points)
-                splitted_extrinsics = utils3d.numpy.extrinsics_look_at(np.array([0, 0, 0]), direct_points, np.array([0, 0, 1])).astype(np.float32)
+                splitted_extrinsics = u3d.extrinsics_look_at(np.array([0, 0, 0]), direct_points, np.array([0, 0, 1])).astype(np.float32)
 
                 splitted_images = split_panorama_image(np.array(full_img), splitted_extrinsics, splitted_intrinsics, h=out_h, w=out_w, interp=cv2.INTER_LINEAR)
                 if full_depth is not None and full_mask is not None:
@@ -414,7 +415,7 @@ if __name__ == '__main__':
             if args.high_res or regen_polar:
                 out_h = img_height * 2 if args.high_res else img_height
                 out_w = img_width * 2 if args.high_res else img_width
-                intrinsics = utils3d.numpy.intrinsics_from_fov(fov_x=np.deg2rad(fov_x), fov_y=np.deg2rad(fov_y))
+                intrinsics = u3d.intrinsics_from_fov(fov_x=np.deg2rad(fov_x), fov_y=np.deg2rad(fov_y))
 
                 # --- Polar Upper (sky) ---
                 up_mult = args.polar_up_density_mult
@@ -469,7 +470,7 @@ if __name__ == '__main__':
                 all_polar_meta = up_view_meta + down_view_meta
                 direct_points = np.stack(all_polar_points, axis=0)
                 splitted_intrinsics = [intrinsics] * len(direct_points)
-                splitted_extrinsics = utils3d.numpy.extrinsics_look_at(np.array([0, 0, 0]), direct_points, np.array([0, 0, 1])).astype(np.float32)
+                splitted_extrinsics = u3d.extrinsics_look_at(np.array([0, 0, 0]), direct_points, np.array([0, 0, 1])).astype(np.float32)
 
                 splitted_images = split_panorama_image(np.array(full_img), splitted_extrinsics, splitted_intrinsics, h=out_h, w=out_w, interp=cv2.INTER_LINEAR)
                 if full_depth is not None and full_mask is not None:

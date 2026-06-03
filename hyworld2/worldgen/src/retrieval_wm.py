@@ -3,8 +3,10 @@ import json
 import math
 import os
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from glob import glob
+from pathlib import Path
 from typing import Tuple, List
 
 import cv2
@@ -13,7 +15,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import trimesh
-import utils3d
 from PIL import Image
 from moge.model.v2 import MoGeModel
 from scipy.spatial import cKDTree
@@ -33,7 +34,23 @@ from .general_utils import (
     sample_align_nframe,
     colorize_depth
 )
+from . import utils3d_compat as u3d
 from .pointcloud import depth2pcd
+
+
+SAM3_REPO_ID = "MIUProject/sam3"
+SAM3_LOCAL_DIRNAME = "MIUProject_sam3"
+
+
+def _default_sam3_path():
+    env_path = os.environ.get("SAM3_PATH") or os.environ.get("HF_SAM3_PATH")
+    if env_path:
+        return env_path
+    for parent in Path(__file__).resolve().parents:
+        local_path = parent / "models" / "sam3" / SAM3_LOCAL_DIRNAME
+        if local_path.exists():
+            return str(local_path)
+    return SAM3_REPO_ID
 
 
 def statistical_outlier_removal(points, colors, nb_neighbors=20, std_ratio=2.0):
@@ -786,8 +803,9 @@ class PanoramaMemoryBank:
 
         def _load_item(args):
             img_p, dep_p, cam_dict = args
-            key = img_p.split('/')[-1].split('.')[0]
-            view_id, traj_id = img_p.split('/')[-4], img_p.split('/')[-3]
+            img_path = Path(img_p)
+            key = img_path.stem
+            view_id, traj_id = img_path.parts[-4], img_path.parts[-3]
             fname = f"{view_id}/{traj_id}/{key}"
             return (
                 np.array(cam_dict[key]['extrinsic']),
@@ -822,8 +840,9 @@ class PanoramaMemoryBank:
         rank0_log(f"Initializing SAM3 Model...")
         if sam3_model is None or sam3_processor is None:
             from transformers import Sam3VideoModel, Sam3VideoProcessor
-            self.sam3_model = Sam3VideoModel.from_pretrained("facebook/sam3").to(device, dtype=torch.bfloat16)
-            self.sam3_processor = Sam3VideoProcessor.from_pretrained("facebook/sam3")
+            sam3_path = _default_sam3_path()
+            self.sam3_model = Sam3VideoModel.from_pretrained(sam3_path).to(device, dtype=torch.bfloat16)
+            self.sam3_processor = Sam3VideoProcessor.from_pretrained(sam3_path)
         else:
             self.sam3_model = sam3_model
             self.sam3_processor = sam3_processor
@@ -1132,7 +1151,7 @@ class PanoramaMemoryBank:
         if self.rank == 0:
             if not (skip_exist and os.path.exists(f"{self.world_mirror_dir}/name_map.json")):
                 wm_cmd = [
-                    "torchrun", f"--nproc_per_node={self.world_size}", "-m", "worldrecon.pipeline",
+                    sys.executable, "-m", "torch.distributed.run", f"--nproc_per_node={self.world_size}", "-m", "hyworld2.worldrecon.pipeline",
                     "--input_path", f"{self.world_mirror_dir}/images",
                     "--prior_cam_path", f"{self.world_mirror_dir}/cameras.json",
                     "--strict_output_path", f"{self.world_mirror_dir}/results",
@@ -1149,7 +1168,16 @@ class PanoramaMemoryBank:
                     "--disable_heads", "normal", "points", "gs"
                 ]
                 color_print(f"[Rank0] Running World Mirror inference: {' '.join(wm_cmd)}", "info")
-                result = subprocess.run(wm_cmd, cwd="..")
+                worldgen_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                hyworld2_dir = os.path.dirname(worldgen_dir)
+                project_root = os.path.dirname(hyworld2_dir)
+                wm_env = os.environ.copy()
+                wm_env["PYTHONPATH"] = os.pathsep.join([
+                    project_root,
+                    hyworld2_dir,
+                    wm_env.get("PYTHONPATH", ""),
+                ])
+                result = subprocess.run(wm_cmd, cwd=project_root, env=wm_env)
 
                 if result.returncode != 0:
                     raise RuntimeError(f"World Mirror inference failed with return code {result.returncode}")
@@ -1436,7 +1464,7 @@ class PanoramaMemoryBank:
                 mono_depth[~mono_depth_mask] = 0
 
                 # Precompute masks that depend only on mono_depth so every branch can store them in the cache.
-                mono_edge_mask = ~torch.from_numpy(utils3d.numpy.depth_edge(mono_depth.cpu().numpy(), rtol=0.05)).to(self.device).bool()
+                mono_edge_mask = ~torch.from_numpy(u3d.depth_edge(mono_depth.cpu().numpy(), rtol=0.05)).to(self.device).bool()
                 depth_filter = torch.median(mono_depth[mono_depth > 0]) * 8
                 far_mask = mono_depth > depth_filter
 
@@ -1768,7 +1796,7 @@ class PanoramaMemoryBank:
                 aligned_depth = 1.0 / torch.clamp_min((1.0 / torch.clamp_min(mono_depth, eps)) * final_k + final_b, eps)
 
                 # Compute aligned_edge_mask and final_mask.
-                aligned_edge_mask = ~torch.from_numpy(utils3d.numpy.depth_edge(aligned_depth.cpu().numpy(), rtol=0.1)).to(self.device).bool()
+                aligned_edge_mask = ~torch.from_numpy(u3d.depth_edge(aligned_depth.cpu().numpy(), rtol=0.1)).to(self.device).bool()
                 combined_edge_mask = mono_edge_mask & aligned_edge_mask & mono_depth_mask
                 final_mask = (aligned_depth >= self.min_depth) & combined_edge_mask & (aligned_depth <= self.max_d)
                 aligned_depth[~final_mask] = 0

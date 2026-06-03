@@ -1745,6 +1745,11 @@ class VNCCS_LoadWorldStereoModel:
             "turbo_lora":  turbo_lora,
             "lora_strength": float(lora_strength),
             "turbo_lora_path": turbo_lora_path,
+            "pretrained_path": parent_dir,
+            "transformer_dir": transformer_dir,
+            "base_model_dir": base_model_dir,
+            "moge_dir": moge_dir,
+            "loader_type": "worldstereo_full",
         },)
 
 
@@ -1879,6 +1884,10 @@ class VNCCS_LoadWorldStereoLightModel:
             "turbo_lora_path": None,
             "single_model_path": single_model_path,
             "single_model_metadata": metadata,
+            "pretrained_path": parent_dir,
+            "transformer_dir": transformer_dir,
+            "base_model_dir": base_model_dir,
+            "moge_dir": moge_dir,
             "loader_type": "worldstereo_light",
             "selected_model": model,
         },)

@@ -1,6 +1,8 @@
+import gc
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -16,16 +18,55 @@ try:
 except ImportError:
     folder_paths = None
 
+try:
+    import comfy.model_management as comfy_model_management
+except ImportError:
+    comfy_model_management = None
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 WORLDGEN_DIR = PROJECT_ROOT / "hyworld2" / "worldgen"
+SAM3_REPO_ID = "MIUProject/sam3"
+SAM3_LOCAL_DIRNAME = "MIUProject_sam3"
 SH_C0 = 0.28209479177387814
+WORLDSTEREO_LIGHT_SINGLE_MODELS = {
+    "worldstereo-memory-dmd": "vnccs-worldstereo-memory-dmd-int4.safetensors",
+    "worldstereo-camera": "vnccs-worldstereo-camera-light-int4.safetensors",
+}
+
+
+def _default_sam3_path() -> str:
+    if folder_paths is not None:
+        models_dir = Path(folder_paths.models_dir)
+        local_path = models_dir / "sam3" / SAM3_LOCAL_DIRNAME
+        if local_path.exists():
+            return str(local_path)
+    return SAM3_REPO_ID
 
 
 def _output_root() -> Path:
     if folder_paths is not None:
         return Path(folder_paths.get_output_directory())
     return PROJECT_ROOT / "output"
+
+
+def _models_root() -> Path:
+    if folder_paths is not None:
+        return Path(folder_paths.models_dir)
+    return PROJECT_ROOT / "models"
+
+
+def _release_comfy_models_for_external_process():
+    if comfy_model_management is None:
+        return
+    print("[WorldGen] Releasing ComfyUI models before external WorldStereo process...")
+    comfy_model_management.unload_all_models()
+    comfy_model_management.cleanup_models_gc()
+    comfy_model_management.soft_empty_cache(force=True)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
 
 def _sanitize_name(value, fallback="scene"):
@@ -363,6 +404,14 @@ def _deep_log(enabled, message):
 
 def _run_command(command, cwd, env=None, deep_logging=False, log_path=None):
     process_env = os.environ.copy()
+    process_env["USE_LIBUV"] = "0"
+    process_env.setdefault("PYTHONIOENCODING", "utf-8")
+    process_env.setdefault("PYTHONUTF8", "1")
+    process_env.setdefault("MASTER_ADDR", "127.0.0.1")
+    process_env.setdefault("MASTER_PORT", "29500")
+    process_env.setdefault("RANK", "0")
+    process_env.setdefault("WORLD_SIZE", "1")
+    process_env.setdefault("LOCAL_RANK", "0")
     if env:
         process_env.update(env)
     process_env["PYTHONPATH"] = os.pathsep.join([
@@ -556,9 +605,456 @@ def _has_valid_normal_files(data_dir, max_files=3):
     return False
 
 
-def _has_depth_files(data_dir):
+def _load_metric_depth16_preview(path):
+    with Image.open(path) as depth_pil:
+        arr = np.asarray(depth_pil)
+    if arr.ndim != 2 or arr.dtype.itemsize < 2:
+        return None
+    depth = np.frombuffer(arr.astype(np.uint16, copy=False), dtype=np.float16).astype(np.float32)
+    depth = depth.reshape(arr.shape)
+    return depth
+
+
+def _has_valid_depth_files(data_dir, max_files=3):
     depths_dir = Path(data_dir) / "depths"
-    return depths_dir.exists() and any(depths_dir.glob("*.png"))
+    if not depths_dir.exists():
+        return False
+    depth_files = sorted(depths_dir.glob("*.png"))[:max_files]
+    if not depth_files:
+        return False
+    for path in depth_files:
+        try:
+            depth = _load_metric_depth16_preview(path)
+        except Exception:
+            continue
+        if depth is None:
+            continue
+        finite = np.isfinite(depth)
+        if float(finite.mean()) < 0.999:
+            continue
+        valid = depth[finite & (depth > 1e-4)]
+        if valid.size == 0:
+            continue
+        vmax = float(valid.max())
+        if vmax > 1e-3 and vmax < 1e6:
+            return True
+    return False
+
+
+def _shell_split(value):
+    return shlex.split(str(value or ""), posix=os.name != "nt")
+
+
+def _torchrun_command(script_name, nproc_per_node):
+    if int(nproc_per_node) <= 1:
+        return _script_command(script_name)
+    return [
+        sys.executable, "-m", "torch.distributed.run",
+        "--nproc_per_node", str(int(nproc_per_node)),
+        str(WORLDGEN_DIR / script_name),
+    ]
+
+
+def _script_command(script_name):
+    script_path = WORLDGEN_DIR / script_name
+    bootstrap = (
+        "import runpy, sys; "
+        f"sys.path.insert(0, {str(WORLDGEN_DIR)!r}); "
+        f"runpy.run_path({str(script_path)!r}, run_name='__main__')"
+    )
+    return [sys.executable, "-c", bootstrap]
+
+
+def _scene_list_from_scene_dir(scene_dir):
+    scene = Path(scene_dir)
+    if not scene.exists():
+        raise FileNotFoundError(f"scene_dir not found: {scene}")
+    if (scene / "panorama.png").exists():
+        return [scene]
+    return sorted(path for path in scene.iterdir() if path.is_dir() and (path / "panorama.png").exists())
+
+
+def _write_manual_traj_prompts(scene_dir, prompt):
+    prompt = str(prompt or "").strip()
+    if not prompt:
+        return 0
+    written = 0
+    for scene in _scene_list_from_scene_dir(scene_dir):
+        render_root = scene / "render_results"
+        if not render_root.exists():
+            continue
+        for render_path in render_root.glob("*/traj*/render.mp4"):
+            caption_path = render_path.with_name("traj_caption.json")
+            if caption_path.exists():
+                continue
+            with open(caption_path, "w", encoding="utf-8") as handle:
+                json.dump({"prompt": prompt}, handle, indent=2)
+            written += 1
+        prompt_path = render_root / "prompt.json"
+        if not prompt_path.exists():
+            with open(prompt_path, "w", encoding="utf-8") as handle:
+                json.dump({"prompt": prompt}, handle, indent=2)
+    return written
+
+
+def _worldstereo_cli_args(worldstereo_model, model_type):
+    if not isinstance(worldstereo_model, dict):
+        args = []
+        models_root = _models_root()
+        pretrained_path = models_root / "WorldStereo"
+        if pretrained_path.exists():
+            args.extend(["--pretrained_path", str(pretrained_path).replace("\\", "/")])
+            args.append("--local_files_only")
+        single_model_name = WORLDSTEREO_LIGHT_SINGLE_MODELS.get(model_type)
+        if single_model_name:
+            single_model_path = models_root / "WorldStereoLight" / single_model_name
+            if single_model_path.exists():
+                args.extend(["--single_model_path", str(single_model_path).replace("\\", "/")])
+        moge_dir = models_root / "MoGe"
+        if moge_dir.exists():
+            args.extend(["--moge_path", str(moge_dir).replace("\\", "/")])
+        return model_type, args
+    resolved_model_type = worldstereo_model.get("model_type") or model_type
+    args = []
+    pretrained_path = worldstereo_model.get("pretrained_path")
+    if pretrained_path:
+        args.extend(["--pretrained_path", str(pretrained_path).replace("\\", "/")])
+        args.append("--local_files_only")
+    single_model_path = worldstereo_model.get("single_model_path")
+    if single_model_path:
+        args.extend(["--single_model_path", str(single_model_path).replace("\\", "/")])
+    moge_dir = worldstereo_model.get("moge_dir")
+    if moge_dir:
+        args.extend(["--moge_path", str(moge_dir).replace("\\", "/")])
+    if resolved_model_type not in ("worldstereo-memory", "worldstereo-memory-dmd"):
+        raise ValueError(
+            f"video_gen.py supports worldstereo-memory/worldstereo-memory-dmd, got {resolved_model_type!r}. "
+            "Use Load WorldStereo Model with a memory model type for WorldGen WorldStereo Video."
+        )
+    return resolved_model_type, args
+
+
+class VNCCS_WorldGenPreparePanoramaScene:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "panorama": ("IMAGE",),
+                "workspace_name": ("STRING", {"default": "comfy_worldgen"}),
+            },
+            "optional": {
+                "root_dir": ("STRING", {
+                    "default": "",
+                    "tooltip": "Base output folder. Empty uses ComfyUI/output/hyworld2_worldgen.",
+                }),
+                "scene_type": (["unknown", "indoor", "outdoor"], {"default": "unknown"}),
+                "overwrite": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("scene_dir", "info")
+    FUNCTION = "prepare_scene"
+    CATEGORY = "VNCCS/WorldGen"
+    OUTPUT_NODE = True
+
+    def prepare_scene(self, panorama, workspace_name="comfy_worldgen", root_dir="", scene_type="unknown", overwrite=True):
+        root = Path(root_dir) if str(root_dir).strip() else _output_root() / "hyworld2_worldgen"
+        scene_dir = root / _sanitize_name(workspace_name)
+        if overwrite:
+            _reset_dir(scene_dir, "WorldGen panorama scene")
+        else:
+            _ensure_dir(scene_dir)
+        image_tensor = _normalize_image_tensor(panorama)
+        if image_tensor is None or image_tensor.shape[0] < 1:
+            raise ValueError("panorama must be a ComfyUI IMAGE tensor.")
+        pano = image_tensor[0]
+        _save_rgb_image(scene_dir / "panorama.png", pano)
+        meta = {"scene_type": None if scene_type == "unknown" else scene_type}
+        if meta["scene_type"] is not None:
+            with open(scene_dir / "meta_info.json", "w", encoding="utf-8") as handle:
+                json.dump(meta, handle, indent=2)
+        info = {
+            "scene_dir": str(scene_dir),
+            "panorama_path": str(scene_dir / "panorama.png"),
+            "scene_type": meta["scene_type"] or "auto/vlm",
+            "image_shape": list(image_tensor.shape),
+        }
+        return (str(scene_dir), json.dumps(info, indent=2))
+
+
+class VNCCS_WorldGenGenerateTrajectories:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "scene_dir": ("STRING", {"default": ""}),
+            },
+            "optional": {
+                "fov_x": ("FLOAT", {"default": 120.0, "min": 1.0, "max": 179.0, "step": 1.0}),
+                "fov_y": ("FLOAT", {"default": 90.0, "min": 1.0, "max": 179.0, "step": 1.0}),
+                "seed": ("INT", {"default": 1024, "min": 0, "max": 2**31 - 1, "step": 1}),
+                "split_view_num": ("INT", {"default": 3, "min": 1, "max": 16, "step": 1}),
+                "splitted_resolution": ("INT", {"default": 480, "min": 64, "max": 4096, "step": 16}),
+                "nframe": ("INT", {"default": 21, "min": 2, "max": 257, "step": 1}),
+                "apply_nav_traj": ("BOOLEAN", {"default": True}),
+                "apply_up_route": ("BOOLEAN", {"default": True}),
+                "apply_recon_iteration": ("BOOLEAN", {"default": True}),
+                "force_vlm": ("BOOLEAN", {"default": False}),
+                "skip_exist": ("BOOLEAN", {"default": False}),
+                "llm_addr": ("STRING", {"default": "localhost"}),
+                "llm_port": ("INT", {"default": 8000, "min": 1, "max": 65535, "step": 1}),
+                "llm_name": ("STRING", {"default": "Qwen/Qwen3-VL-8B-Instruct"}),
+                "sam3_path": ("STRING", {
+                    "default": _default_sam3_path(),
+                    "tooltip": "SAM3 repo id or local checkpoint path.",
+                }),
+                "local_files_only": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Use local Hugging Face cache/paths only. Enable when sam3_path points to a local checkpoint.",
+                }),
+                "extra_args": ("STRING", {"default": "", "multiline": False}),
+                "deep_logging": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("scene_dir", "log")
+    FUNCTION = "generate"
+    CATEGORY = "VNCCS/WorldGen"
+    OUTPUT_NODE = True
+
+    def generate(
+        self,
+        scene_dir,
+        fov_x=120.0,
+        fov_y=90.0,
+        seed=1024,
+        split_view_num=3,
+        splitted_resolution=480,
+        nframe=21,
+        apply_nav_traj=True,
+        apply_up_route=True,
+        apply_recon_iteration=True,
+        force_vlm=False,
+        skip_exist=False,
+        llm_addr="localhost",
+        llm_port=8000,
+        llm_name="Qwen/Qwen3-VL-8B-Instruct",
+        sam3_path=None,
+        local_files_only=False,
+        extra_args="",
+        deep_logging=False,
+    ):
+        scene = Path(scene_dir)
+        if not scene.exists():
+            raise FileNotFoundError(f"scene_dir not found: {scene}")
+        cmd = [
+            *_script_command("traj_generate.py"),
+            "--target_path", str(scene),
+            "--fov_x", str(float(fov_x)),
+            "--fov_y", str(float(fov_y)),
+            "--seed", str(int(seed)),
+            "--split_view_num", str(int(split_view_num)),
+            "--splitted_resolution", str(int(splitted_resolution)),
+            "--nframe", str(int(nframe)),
+            "--llm_addr", llm_addr,
+            "--llm_port", str(int(llm_port)),
+            "--llm_name", llm_name,
+            "--sam3_path", sam3_path or _default_sam3_path(),
+        ]
+        if local_files_only:
+            cmd.append("--local_files_only")
+        if apply_nav_traj:
+            cmd.append("--apply_nav_traj")
+        if apply_up_route:
+            cmd.append("--apply_up_route")
+        if apply_recon_iteration:
+            cmd.append("--apply_recon_iteration")
+        if force_vlm:
+            cmd.append("--force_vlm")
+        if skip_exist:
+            cmd.append("--skip_exist")
+        cmd.extend(_shell_split(extra_args))
+        log = _run_command(cmd, WORLDGEN_DIR, deep_logging=deep_logging, log_path=scene / "worldgen_traj_generate_full.log")
+        return (str(scene), log)
+
+
+class VNCCS_WorldGenRenderTrajectories:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "scene_dir": ("STRING", {"default": ""}),
+            },
+            "optional": {
+                "nproc_per_node": ("INT", {"default": 1, "min": 1, "max": 8, "step": 1}),
+                "seed": ("INT", {"default": 1024, "min": 0, "max": 2**31 - 1, "step": 1}),
+                "llm_addr": ("STRING", {"default": "localhost"}),
+                "llm_port": ("INT", {"default": 8000, "min": 1, "max": 65535, "step": 1}),
+                "llm_name": ("STRING", {"default": "Qwen/Qwen3-VL-8B-Instruct"}),
+                "enable_vlm_caption": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Temporary test default: off. Re-enable VLM/LLM captions for final WorldGen prompts.",
+                }),
+                "extra_args": ("STRING", {"default": "", "multiline": False}),
+                "deep_logging": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("scene_dir", "log")
+    FUNCTION = "render"
+    CATEGORY = "VNCCS/WorldGen"
+    OUTPUT_NODE = True
+
+    def render(
+        self,
+        scene_dir,
+        nproc_per_node=1,
+        seed=1024,
+        llm_addr="localhost",
+        llm_port=8000,
+        llm_name="Qwen/Qwen3-VL-8B-Instruct",
+        enable_vlm_caption=False,
+        extra_args="",
+        deep_logging=False,
+    ):
+        scene = Path(scene_dir)
+        if not scene.exists():
+            raise FileNotFoundError(f"scene_dir not found: {scene}")
+        cmd = _torchrun_command("traj_render.py", nproc_per_node)
+        cmd.extend([
+            "--target_path", str(scene),
+            "--seed", str(int(seed)),
+            "--llm_addr", llm_addr,
+            "--llm_port", str(int(llm_port)),
+            "--llm_name", llm_name,
+        ])
+        if not enable_vlm_caption:
+            # TEMPORARY TEST MODE: LLM/VLM captioning is disabled.
+            # Turn enable_vlm_caption back on for production-quality trajectory prompts.
+            cmd.append("--disable_vlm_caption")
+        cmd.extend(_shell_split(extra_args))
+        log = _run_command(cmd, WORLDGEN_DIR, deep_logging=deep_logging, log_path=scene / "worldgen_traj_render_full.log")
+        return (str(scene), log)
+
+
+class VNCCS_WorldGenWorldStereoVideo:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "scene_dir": ("STRING", {"default": ""}),
+            },
+            "optional": {
+                "worldstereo_model": ("WORLDSTEREO_MODEL", {
+                    "tooltip": "Optional. Connect Load WorldStereo Model only for custom paths; otherwise WorldGen resolves local model folders without loading a model in ComfyUI.",
+                }),
+                "model_type": (["worldstereo-memory", "worldstereo-memory-dmd"], {"default": "worldstereo-memory-dmd"}),
+                "nproc_per_node": ("INT", {"default": 1, "min": 1, "max": 8, "step": 1}),
+                "seed": ("INT", {"default": 1024, "min": 0, "max": 2**31 - 1, "step": 1}),
+                "nframe": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 81,
+                    "step": 1,
+                    "tooltip": "0 keeps the model config. Lower values such as 41 or 21 reduce WorldGen video VRAM for testing.",
+                }),
+                "align_nframe": ("INT", {"default": 8, "min": 1, "max": 64, "step": 1}),
+                "max_reference": ("INT", {"default": 8, "min": 1, "max": 64, "step": 1}),
+                "downsampled_pts": ("INT", {"default": 2_000_000, "min": 1, "max": 50_000_000, "step": 100_000}),
+                "fsdp": ("BOOLEAN", {"default": False}),
+                "skip_exist": ("BOOLEAN", {"default": False}),
+                "sam3_path": ("STRING", {
+                    "default": _default_sam3_path(),
+                    "tooltip": "SAM3 repo id or local checkpoint path.",
+                }),
+                "local_files_only": ("BOOLEAN", {"default": True}),
+                "manual_prompt": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": "Temporary test prompt used to create missing traj_caption.json files when VLM/LLM captions are disabled.",
+                }),
+                "extra_args": ("STRING", {"default": "", "multiline": False}),
+                "deep_logging": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("scene_dir", "generation_bank_dir", "log")
+    FUNCTION = "generate_video"
+    CATEGORY = "VNCCS/WorldGen"
+    OUTPUT_NODE = True
+
+    def generate_video(
+        self,
+        scene_dir,
+        worldstereo_model=None,
+        model_type="worldstereo-memory-dmd",
+        nproc_per_node=1,
+        seed=1024,
+        nframe=0,
+        align_nframe=8,
+        max_reference=8,
+        downsampled_pts=2_000_000,
+        fsdp=False,
+        skip_exist=False,
+        sam3_path=None,
+        local_files_only=True,
+        manual_prompt="",
+        extra_args="",
+        deep_logging=False,
+    ):
+        scene = Path(scene_dir)
+        if not scene.exists():
+            raise FileNotFoundError(f"scene_dir not found: {scene}")
+        manual_prompt_count = _write_manual_traj_prompts(scene, manual_prompt)
+        if manual_prompt_count:
+            print(
+                "[WorldGen] Wrote "
+                f"{manual_prompt_count} manual traj_caption.json file(s) from WorldStereo manual_prompt. "
+                "Re-enable VLM/LLM captions for final production prompts."
+            )
+        resolved_model_type, model_args = _worldstereo_cli_args(worldstereo_model, model_type)
+        worldstereo_model = None
+        _release_comfy_models_for_external_process()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        cmd = _torchrun_command("video_gen.py", nproc_per_node)
+        cmd.extend([
+            "--target_path", str(scene),
+            "--model_type", resolved_model_type,
+            "--seed", str(int(seed)),
+            "--nframe", str(int(nframe)),
+            "--align_nframe", str(int(align_nframe)),
+            "--max_reference", str(int(max_reference)),
+            "--downsampled_pts", str(int(downsampled_pts)),
+            "--sam3_path", sam3_path or _default_sam3_path(),
+        ])
+        cmd.extend(model_args)
+        if fsdp:
+            cmd.append("--fsdp")
+        if skip_exist:
+            cmd.append("--skip_exist")
+        if local_files_only and "--local_files_only" not in cmd:
+            cmd.append("--local_files_only")
+        cmd.extend(_shell_split(extra_args))
+        log = _run_command(cmd, WORLDGEN_DIR, deep_logging=deep_logging, log_path=scene / "worldgen_video_gen_full.log")
+        if manual_prompt_count:
+            log = (
+                f"[WorldGen] Manual prompt test mode wrote {manual_prompt_count} missing traj_caption.json file(s). "
+                "Re-enable VLM/LLM captions for final production prompts.\n"
+                f"{log}"
+            )
+        scene_list = _scene_list_from_scene_dir(scene)
+        bank_dirs = [
+            str(scene / "render_results" / f"generation_bank_{resolved_model_type}")
+            for scene in scene_list
+        ]
+        bank_dir = bank_dirs[0] if len(bank_dirs) == 1 else "\n".join(bank_dirs)
+        return (str(scene), bank_dir, log)
 
 
 class VNCCS_WorldGenExportBankFromPLY:
@@ -574,10 +1070,14 @@ class VNCCS_WorldGenExportBankFromPLY:
                 }),
             },
             "optional": {
+                "panorama": ("IMAGE", {
+                    "tooltip": "Optional source panorama for the same scene. When connected, this workspace can continue through Generate/Render/WorldStereo.",
+                }),
                 "root_dir": ("STRING", {
                     "default": "",
                     "tooltip": "Base output folder. Empty uses ComfyUI/output/hyworld2_worldgen.",
                 }),
+                "scene_type": (["unknown", "indoor", "outdoor"], {"default": "unknown"}),
                 "bank_name": ("STRING", {
                     "default": "comfy-worldmirror",
                     "tooltip": "Name suffix for render_results/generation_bank_<bank_name>. Official runs use worldstereo-memory-dmd.",
@@ -590,7 +1090,7 @@ class VNCCS_WorldGenExportBankFromPLY:
         }
 
     RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("workspace_dir", "info")
+    RETURN_NAMES = ("scene_dir", "info")
     FUNCTION = "export_bank"
     CATEGORY = "VNCCS/WorldGen"
     OUTPUT_NODE = True
@@ -600,7 +1100,9 @@ class VNCCS_WorldGenExportBankFromPLY:
         ply_data,
         images,
         workspace_name="comfy_worldgen",
+        panorama=None,
         root_dir="",
+        scene_type="unknown",
         bank_name="comfy-worldmirror",
         global_max_points=3_000_000,
         aligned_max_points=2_000_000,
@@ -609,14 +1111,17 @@ class VNCCS_WorldGenExportBankFromPLY:
     ):
         root = Path(root_dir) if root_dir.strip() else _output_root() / "hyworld2_worldgen"
         workspace_dir = _ensure_dir(root / _sanitize_name(workspace_name))
+        render_results_dir = _ensure_dir(workspace_dir / "render_results")
         bank_dir = _reset_dir(
-            workspace_dir / "render_results" / f"generation_bank_{_sanitize_name(bank_name, 'comfy-worldmirror')}",
+            render_results_dir / f"generation_bank_{_sanitize_name(bank_name, 'comfy-worldmirror')}",
             "WorldGen generation bank",
         )
         image_tensor = _normalize_image_tensor(images)
+        panorama_tensor = _normalize_image_tensor(panorama) if panorama is not None else None
         _deep_log(deep_logging, f"export workspace_dir={workspace_dir}")
         _deep_log(deep_logging, f"export bank_dir={bank_dir}")
         _deep_log(deep_logging, f"export image_shape={tuple(image_tensor.shape) if image_tensor is not None else None}")
+        _deep_log(deep_logging, f"export panorama_shape={tuple(panorama_tensor.shape) if panorama_tensor is not None else None}")
         _deep_log(deep_logging, f"export ply_keys={sorted(ply_data.keys()) if isinstance(ply_data, dict) else type(ply_data)}")
 
         global_points, global_colors = _points_and_colors_from_ply_data(
@@ -629,13 +1134,23 @@ class VNCCS_WorldGenExportBankFromPLY:
 
         global_path = _write_point_ply(bank_dir / "global_pcd.ply", global_points, global_colors)
         aligned_path = _write_point_ply(bank_dir / "aligned_pcd.ply", aligned_points, aligned_colors)
+        panorama_path = None
+        if panorama_tensor is not None and panorama_tensor.shape[0] > 0:
+            panorama_path = str(workspace_dir / "panorama.png")
+            _save_rgb_image(workspace_dir / "panorama.png", panorama_tensor[0])
+        if scene_type != "unknown":
+            meta = {"scene_type": scene_type}
+            with open(workspace_dir / "meta_info.json", "w", encoding="utf-8") as handle:
+                json.dump(meta, handle, indent=2)
         info = {
+            "scene_dir": str(workspace_dir),
             "workspace_dir": str(workspace_dir),
             "bank_dir": str(bank_dir),
             "bank_name": bank_name,
+            "panorama_path": panorama_path,
             "global_points": int(global_points.shape[0]),
             "aligned_points": int(aligned_points.shape[0]),
-            "note": "Official-like generation bank exported from current WorldMirror PLY_DATA; sky_pcd is not generated by this shortcut node.",
+            "note": "Workspace prepared from WorldMirror PLY_DATA. Official trajectory generation will create render_results/global_pcd.ply from panorama.png.",
         }
         with open(bank_dir / "pcd_info.json", "w", encoding="utf-8") as handle:
             json.dump(info, handle, indent=2)
@@ -929,14 +1444,12 @@ class VNCCS_WorldGenRunOfficialGSData:
             raise FileNotFoundError(f"scene_dir not found: {scene}")
         gs_out_dir = scene / _sanitize_name(out_name, "gs_data")
         _reset_dir(gs_out_dir, "official WorldGen gs_data")
-        cmd = [
-            sys.executable, "-m", "torch.distributed.run",
-            "--nproc_per_node", str(int(nproc_per_node)),
-            "gen_gs_data.py",
+        cmd = _torchrun_command("gen_gs_data.py", nproc_per_node)
+        cmd.extend([
             "--root_path", str(scene),
             "--out_name", out_name,
             "--result_name", result_name,
-        ]
+        ])
         if save_normal:
             cmd.append("--save_normal")
         if split_sky:
@@ -944,7 +1457,7 @@ class VNCCS_WorldGenRunOfficialGSData:
         if split_align:
             cmd.append("--split_align")
         if extra_args.strip():
-            cmd.extend(extra_args.split())
+            cmd.extend(_shell_split(extra_args))
         _deep_log(deep_logging, f"official gen_gs_data scene={scene}")
         log = _run_command(cmd, WORLDGEN_DIR, deep_logging=deep_logging, log_path=gs_out_dir / "worldgen_gen_gs_data_full.log")
         return (str(gs_out_dir), log)
@@ -972,15 +1485,22 @@ class VNCCS_WorldGenTrain3DGS:
                 "depth_loss": ("BOOLEAN", {"default": True}),
                 "normal_loss": ("BOOLEAN", {"default": True}),
                 "use_scale_regularization": ("BOOLEAN", {"default": True}),
-                "use_mask_gaussian": ("BOOLEAN", {"default": True}),
+                "use_mask_gaussian": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "MaskGaussian can stochastically prune exported splats and create holes. Keep off for the issue6/manual optimization path.",
+                }),
+                "mask_export_stochastic": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Only used when MaskGaussian is enabled. Disable to avoid random holes in the exported PLY.",
+                }),
                 "antialiased": ("BOOLEAN", {"default": True}),
                 "official_strategy_preset": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "Use HY-World's stable training strategy: short densify/refine window, no opacity resets, conservative grow/prune thresholds.",
                 }),
                 "normalize_world_space": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Official trainer normalization. Disable for ComfyUI preview with original WorldMirror camera_poses.",
+                    "default": True,
+                    "tooltip": "Official trainer normalization. Keep enabled for native 3DGS; disabling weakens depth scaling and can warp geometry.",
                 }),
                 "perceptual_loss": (["lpips_vgg", "lpips_alex", "simple", "off"], {"default": "lpips_vgg"}),
                 "extra_args": ("STRING", {"default": "", "multiline": False}),
@@ -1008,10 +1528,11 @@ class VNCCS_WorldGenTrain3DGS:
         depth_loss=True,
         normal_loss=True,
         use_scale_regularization=True,
-        use_mask_gaussian=True,
+        use_mask_gaussian=False,
+        mask_export_stochastic=False,
         antialiased=True,
         official_strategy_preset=True,
-        normalize_world_space=False,
+        normalize_world_space=True,
         perceptual_loss="lpips_vgg",
         extra_args="",
         deep_logging=False,
@@ -1059,11 +1580,11 @@ class VNCCS_WorldGenTrain3DGS:
             cmd.append("--disable_video")
         if disable_viewer:
             cmd.append("--disable_viewer")
-        depth_files_valid = _has_depth_files(data_dir)
+        depth_files_valid = _has_valid_depth_files(data_dir)
         if depth_loss and depth_files_valid:
             cmd.append("--depth_loss")
         elif depth_loss:
-            print(f"[WorldGen] depth_loss requested but metric depths are missing under {data_dir / 'depths'}; disabling depth_loss.")
+            print(f"[WorldGen] depth_loss requested but valid metric float16-packed depths are missing under {data_dir / 'depths'}; disabling depth_loss.")
         normal_files_valid = _has_valid_normal_files(data_dir)
         if normal_loss and normal_files_valid:
             cmd.append("--normal_loss")
@@ -1073,6 +1594,10 @@ class VNCCS_WorldGenTrain3DGS:
             cmd.append("--use_scale_regularization")
         if use_mask_gaussian:
             cmd.append("--use_mask_gaussian")
+            if mask_export_stochastic:
+                cmd.append("--mask_export_stochastic")
+            else:
+                cmd.append("--no-mask_export_stochastic")
         if antialiased:
             cmd.append("--antialiased")
         if official_strategy_preset:
@@ -1088,7 +1613,7 @@ class VNCCS_WorldGenTrain3DGS:
         elif perceptual_loss == "off":
             cmd.extend(["--lpips_net", "none", "--lpips_lambda1", "0", "--lpips_lambda2", "0"])
         if extra_args.strip():
-            cmd.extend(extra_args.split())
+            cmd.extend(_shell_split(extra_args))
 
         command_info = {
             "data_dir": str(data_dir),
@@ -1105,6 +1630,7 @@ class VNCCS_WorldGenTrain3DGS:
             "normal_loss_requested": bool(normal_loss),
             "normal_loss_enabled": bool(normal_loss and normal_files_valid),
             "use_mask_gaussian": bool(use_mask_gaussian),
+            "mask_export_stochastic": bool(mask_export_stochastic),
             "official_strategy_preset": bool(official_strategy_preset),
             "normalize_world_space": bool(normalize_world_space),
             "perceptual_loss": perceptual_loss,
@@ -1127,6 +1653,10 @@ class VNCCS_WorldGenTrain3DGS:
 
 
 NODE_CLASS_MAPPINGS = {
+    "VNCCS_WorldGenPreparePanoramaScene": VNCCS_WorldGenPreparePanoramaScene,
+    "VNCCS_WorldGenGenerateTrajectories": VNCCS_WorldGenGenerateTrajectories,
+    "VNCCS_WorldGenRenderTrajectories": VNCCS_WorldGenRenderTrajectories,
+    "VNCCS_WorldGenWorldStereoVideo": VNCCS_WorldGenWorldStereoVideo,
     "VNCCS_WorldGenExportBankFromPLY": VNCCS_WorldGenExportBankFromPLY,
     "VNCCS_WorldGenBuildGSDataFromWorldMirror": VNCCS_WorldGenBuildGSDataFromWorldMirror,
     "VNCCS_WorldGenRunOfficialGSData": VNCCS_WorldGenRunOfficialGSData,
@@ -1134,6 +1664,10 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "VNCCS_WorldGenPreparePanoramaScene": "WorldGen Prepare Panorama Scene",
+    "VNCCS_WorldGenGenerateTrajectories": "WorldGen Generate Trajectories",
+    "VNCCS_WorldGenRenderTrajectories": "WorldGen Render Trajectories",
+    "VNCCS_WorldGenWorldStereoVideo": "WorldGen WorldStereo Video",
     "VNCCS_WorldGenExportBankFromPLY": "WorldGen Prepare Workspace",
     "VNCCS_WorldGenBuildGSDataFromWorldMirror": "WorldGen Build GS Data From WorldMirror",
     "VNCCS_WorldGenRunOfficialGSData": "WorldGen Run Official gen_gs_data",

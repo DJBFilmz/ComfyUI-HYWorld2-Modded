@@ -1,5 +1,6 @@
 import json
 import os.path
+from pathlib import Path
 
 import einops
 import numpy as np
@@ -47,17 +48,21 @@ def sort_trajs(scene_path):
         if f"{view_path}/traj1/render.mp4" in traj_paths_:
             traj_paths.append(f"{view_path}/traj1/render.mp4")
         view_list.extend(traj_paths)
+    def traj_sort_key(path):
+        parts = Path(path).parts
+        return parts[-3], parts[-2]
+
     target_list = glob(f"{scene_path}/target*/traj*/render.mp4")
-    target_list.sort(key=lambda x: (x.split('/')[-3], x.split('/')[-2]))
+    target_list.sort(key=traj_sort_key)
     recon_list = glob(f"{scene_path}/reconstruct*/traj0/render.mp4")
-    recon_list.sort(key=lambda x: (x.split('/')[-3], x.split('/')[-2]))
+    recon_list.sort(key=traj_sort_key)
     wander_list = glob(f"{scene_path}/wonder*/traj*/render.mp4")
-    wander_list.sort(key=lambda x: (x.split('/')[-3], x.split('/')[-2]))
+    wander_list.sort(key=traj_sort_key)
     total_list = view_list + target_list + recon_list + wander_list
 
     # If iterative trajectories (reconstruct_*/traj1) exist, place them at the end
     iter_list = glob(f"{scene_path}/reconstruct*/traj1/render.mp4")
-    iter_list.sort(key=lambda x: (x.split('/')[-3], x.split('/')[-2]))
+    iter_list.sort(key=traj_sort_key)
     total_list = total_list + iter_list
 
     # Rename any paths whose 3rd-to-last directory contains "-" by replacing it with "_"
@@ -73,7 +78,8 @@ def rename_hyphen_to_underscore(path_list):
     """
     new_path_list = []
     for old_path in path_list:
-        parts = old_path.split('/')
+        old_path_obj = Path(old_path)
+        parts = list(old_path_obj.parts)
         dir_name = parts[-3]  # 3rd-to-last directory name
         if '-' not in dir_name:
             new_path_list.append(old_path)
@@ -81,15 +87,15 @@ def rename_hyphen_to_underscore(path_list):
 
         new_dir_name = dir_name.replace('-', '_')
         # Build old and new directory paths
-        parent_path = '/'.join(parts[:-3])
-        old_dir_path = os.path.join(parent_path, dir_name) if parent_path else dir_name
-        new_dir_path = os.path.join(parent_path, new_dir_name) if parent_path else new_dir_name
+        parent_path = Path(*parts[:-3]) if parts[:-3] else Path()
+        old_dir_path = parent_path / dir_name
+        new_dir_path = parent_path / new_dir_name
         if os.path.exists(old_dir_path) and not os.path.exists(new_dir_path):
             os.rename(old_dir_path, new_dir_path)
 
         # Update directory name in path
         parts[-3] = new_dir_name
-        new_path_list.append('/'.join(parts))
+        new_path_list.append(str(Path(*parts)))
     return new_path_list
 
 
@@ -198,5 +204,6 @@ def load_mutli_traj_dataset(cfg, input_path, output_path, view_id, traj_id, devi
 
     meta["width"] = width
     meta["height"] = height
+    meta["num_frames"] = int(meta["render_video"].shape[2])
 
     return meta

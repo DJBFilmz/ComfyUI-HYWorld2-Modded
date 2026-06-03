@@ -14,7 +14,6 @@ import torch
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 import trimesh
-import utils3d
 from PIL import Image
 from moge.model.v2 import MoGeModel
 from openai import OpenAI
@@ -24,6 +23,7 @@ from transformers import Sam3Processor, Sam3Model
 
 from src.camera_utils import add_scene_cam, get_c2w, CAM_COLORS, interpolate_poses, compute_lookat_xy_angle
 from src.general_utils import save_16bit_png_depth, set_seed, adjust_image_size, Timer, rank0_log
+from src import utils3d_compat as u3d
 from src.navi_utils import (
     find_robust_center,
     project_center_to_3d,
@@ -77,7 +77,7 @@ HF_CACHE_DIR = os.path.expanduser("~/.cache/huggingface/hub")
 ZIM_REPO_ID = "naver-iv/zim-anything-vitl"
 ZIM_SUBFOLDER = "zim_vit_l_2092"
 GD_REPO_ID = "IDEA-Research/grounding-dino-tiny"
-SAM3_REPO_ID = "facebook/sam3"
+SAM3_REPO_ID = "MIUProject/sam3"
 MOGE_ID = "Ruicheng/moge-2-vitl-normal"
 
 
@@ -113,6 +113,20 @@ def resolve_gd_checkpoint():
         allow_patterns=["*.json", "*.txt", "model.safetensors"],
         required_files=["config.json", "preprocessor_config.json", "model.safetensors"],
     )
+
+
+def load_sam3_model(model_path, device, local_files_only=False):
+    try:
+        model = Sam3Model.from_pretrained(model_path, local_files_only=local_files_only).to(device)
+        processor = Sam3Processor.from_pretrained(model_path, local_files_only=local_files_only)
+        return model, processor
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to load SAM3 for object segmentation. "
+            f"sam3_path={model_path!r}, local_files_only={local_files_only}. "
+            "SAM3 is a gated Hugging Face model; either login/provide HF_TOKEN "
+            "with approved access, or pass --sam3_path pointing to a local SAM3 checkpoint."
+        ) from exc
 
 
 def save_image(splitted_image, path):
@@ -185,6 +199,8 @@ if __name__ == '__main__':
     parser.add_argument("--llm_addr", type=str, default=LLM_ADDR, help="vLLM server address")
     parser.add_argument("--llm_port", type=int, default=LLM_PORT, help="vLLM server port")
     parser.add_argument("--llm_name", type=str, default=MODEL_NAME, help="VLM model name served by vLLM")
+    parser.add_argument("--sam3_path", type=str, default=SAM3_REPO_ID, help="SAM3 repo id or local checkpoint path")
+    parser.add_argument("--local_files_only", action="store_true", help="Do not download Hugging Face files; use local cache/paths only")
 
     args = parser.parse_args()
 
@@ -202,10 +218,10 @@ if __name__ == '__main__':
 
     depth_model = MoGeModel.from_pretrained(MOGE_ID).to(device).eval()
 
-    # VLM & SAM3
+    # VLM client. SAM3 is gated and only needed for object segmentation, so load it lazily.
     client = OpenAI(api_key="EMPTY", base_url=f"http://{LLM_ADDR}:{LLM_PORT}/v1")
-    sam3_model = Sam3Model.from_pretrained("facebook/sam3").to(device)
-    sam3_processor = Sam3Processor.from_pretrained("facebook/sam3")
+    sam3_model = None
+    sam3_processor = None
     print("Models Initializing over.")
 
     # Near-view rotations used by regular trajectory generation.
@@ -302,7 +318,7 @@ if __name__ == '__main__':
         else:
             with timer.track("Predict panorama depth"):
                 full_depth = pred_pano_depth(depth_model, full_img)
-                edge_mask = torch.from_numpy(utils3d.numpy.depth_edge(full_depth["distance"].cpu().numpy(), rtol=0.1)).bool()
+                edge_mask = torch.from_numpy(u3d.depth_edge(full_depth["distance"].cpu().numpy(), rtol=0.1)).bool()
                 sky_mask_for_depth = sky_mask
                 if sky_mask_for_depth.shape != edge_mask.shape:
                     sky_mask_for_depth = F.interpolate(
@@ -319,7 +335,7 @@ if __name__ == '__main__':
                     full_depth["distance"][contract_mask] = (2 * contract_distance) - (contract_distance ** 2 / (full_depth["distance"][contract_mask] + 1e-6))
             with timer.track("[IO] Save panorama depth"):
                 torch.save(full_depth, f"{scene_path}/render_results/full_depth_prediction.pt")
-        edge_mask = torch.from_numpy(utils3d.numpy.depth_edge(full_depth["distance"].cpu().numpy(), rtol=0.1)).bool()
+        edge_mask = torch.from_numpy(u3d.depth_edge(full_depth["distance"].cpu().numpy(), rtol=0.1)).bool()
         full_depth["distance"] = full_depth["distance"].to(device)
         full_depth["rays"] = full_depth["rays"].to(device)
         sky_mask_for_depth = sky_mask
@@ -417,9 +433,9 @@ if __name__ == '__main__':
                 for i in range(1, N_view):
                     direct_points.append(rotate_around_z_axis(polar_point.reshape(1, 3), rot_deg * i)[0])
             direct_points = np.stack(direct_points, axis=0)
-            intrinsics = utils3d.numpy.intrinsics_from_fov(fov_x=np.deg2rad(args.fov_x), fov_y=np.deg2rad(args.fov_y))
+            intrinsics = u3d.intrinsics_from_fov(fov_x=np.deg2rad(args.fov_x), fov_y=np.deg2rad(args.fov_y))
             splitted_intrinsics = [intrinsics] * len(direct_points)
-            splitted_extrinsics = utils3d.numpy.extrinsics_look_at(np.array([0, 0, 0]), direct_points, np.array([0, 0, 1])).astype(np.float32)
+            splitted_extrinsics = u3d.extrinsics_look_at(np.array([0, 0, 0]), direct_points, np.array([0, 0, 1])).astype(np.float32)
 
             # build polar bank
             splitted_images = split_panorama_image(np.array(full_img), splitted_extrinsics, splitted_intrinsics, h=image_h, w=image_w, interp=cv2.INTER_AREA)
@@ -473,9 +489,9 @@ if __name__ == '__main__':
                     if start_point[2] == 0:
                         mid_indices.append(len(direct_points) - 1)
             direct_points = np.stack(direct_points, axis=0)
-            intrinsics = utils3d.numpy.intrinsics_from_fov(fov_x=np.deg2rad(args.fov_x), fov_y=np.deg2rad(args.fov_y))
+            intrinsics = u3d.intrinsics_from_fov(fov_x=np.deg2rad(args.fov_x), fov_y=np.deg2rad(args.fov_y))
             splitted_intrinsics = [intrinsics] * len(direct_points)
-            splitted_extrinsics = utils3d.numpy.extrinsics_look_at(np.array([0, 0, 0]), direct_points, np.array([0, 0, 1])).astype(np.float32)
+            splitted_extrinsics = u3d.extrinsics_look_at(np.array([0, 0, 0]), direct_points, np.array([0, 0, 1])).astype(np.float32)
 
             # build memory bank
             splitted_images = split_panorama_image(np.array(full_img), splitted_extrinsics, splitted_intrinsics, h=image_h, w=image_w, interp=cv2.INTER_AREA)
@@ -536,9 +552,9 @@ if __name__ == '__main__':
             for i in range(1, args.split_view_num):
                 direct_points.append(rotate_around_z_axis(new_start_points.reshape(1, 3), rot_deg * i)[0])
             direct_points = np.stack(direct_points, axis=0)
-            intrinsics = utils3d.numpy.intrinsics_from_fov(fov_x=np.deg2rad(args.fov_x), fov_y=np.deg2rad(args.fov_y))
+            intrinsics = u3d.intrinsics_from_fov(fov_x=np.deg2rad(args.fov_x), fov_y=np.deg2rad(args.fov_y))
             splitted_intrinsics = [intrinsics] * len(direct_points)
-            splitted_extrinsics = utils3d.numpy.extrinsics_look_at(np.array([0, 0, 0]), direct_points, np.array([0, 0, 1])).astype(np.float32)
+            splitted_extrinsics = u3d.extrinsics_look_at(np.array([0, 0, 0]), direct_points, np.array([0, 0, 1])).astype(np.float32)
 
             splitted_images = split_panorama_image(np.array(full_img), splitted_extrinsics, splitted_intrinsics, h=image_h, w=image_w, interp=cv2.INTER_AREA)
             splitted_depths = split_panorama_depth(np.array(full_depth["distance"].cpu()), splitted_extrinsics, splitted_intrinsics, h=image_h, w=image_w, distance_to_depth=True)
@@ -701,6 +717,12 @@ if __name__ == '__main__':
                 seen_pairs = set()
 
                 print(f"SAM3 process for {scene_path}...")
+                if sam3_model is None or sam3_processor is None:
+                    sam3_model, sam3_processor = load_sam3_model(
+                        args.sam3_path,
+                        device,
+                        local_files_only=args.local_files_only,
+                    )
                 for i in range(0, len(unique_objects), SAM_BATCH_SIZE):
                     batch_objects = unique_objects[i: i + SAM_BATCH_SIZE]
                     batch_objects = [obj for obj in batch_objects if len(obj.split()) < 8 and obj.lower() not in ("sun")]

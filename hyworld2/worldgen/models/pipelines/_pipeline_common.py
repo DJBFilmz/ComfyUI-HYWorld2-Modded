@@ -79,8 +79,15 @@ class KeyframePipelineMixin:
             image_processor=image_processor,
         )
 
-        self.vae_scale_factor_temporal = 2 ** sum(self.vae.temperal_downsample) if getattr(self, "vae", None) else 4
-        self.vae_scale_factor_spatial = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
+        vae = getattr(self, "vae", None)
+        vae_source = getattr(vae, "_orig_mod", vae)
+        if vae_source is not None:
+            temporal_downsample = vae_source.temperal_downsample
+            self.vae_scale_factor_temporal = 2 ** sum(temporal_downsample)
+            self.vae_scale_factor_spatial = 2 ** len(temporal_downsample)
+        else:
+            self.vae_scale_factor_temporal = 4
+            self.vae_scale_factor_spatial = 8
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
         self.image_processor = image_processor
 

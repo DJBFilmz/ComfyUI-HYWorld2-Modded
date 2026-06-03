@@ -6,7 +6,7 @@ license = { file = "LICENSE" }
 dependencies = [
     "torch",
     "torchvision",
-    "numpy",
+    "numpy>=2.0,<2.3",
     "Pillow",
     "opencv-python",
     "scipy",
@@ -21,6 +21,9 @@ dependencies = [
     "jaxtyping",
     "typeguard",
     "open3d>=0.18.0",
+    "ninja",
+    "pybind11",
+    "scikit-learn",
     "accelerate",
     "diffusers>=0.36.0",
     "transformers>=4.40.0",
@@ -29,6 +32,11 @@ dependencies = [
     "torchao",
     "imageio[ffmpeg]",
     "kornia",
+    "cupy-cuda13x",
+    "zim-anything",
+    "openai",
+    "utils3d",
+    "llama-cpp-python[server]>=0.3.33",
 ]
 
 [project.optional-dependencies]

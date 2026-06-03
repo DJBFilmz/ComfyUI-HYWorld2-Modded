@@ -59,7 +59,7 @@ class RefKFDMDGeneratorPipeline(KeyframePipelineMixin, DiffusionPipeline, WanLor
             transformer: WorldStereoRefSModel,
             vae: AutoencoderKLWan,
             scheduler,
-            device,
+            device=None,
             vae_compile: bool = False,
             vae_compile_mode: str = "max-autotune"
     ):

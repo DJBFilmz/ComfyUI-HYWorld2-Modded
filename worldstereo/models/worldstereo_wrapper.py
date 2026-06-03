@@ -864,6 +864,7 @@ class WorldStereo:
         ).eval()
         if _tr.__version__ >= "5.0.0":
             rank0_log("Patching CLIP vision forward for transformers>=5.0.0", "WARNING")
+            clip_vision = getattr(image_clip, "vision_model", image_clip)
 
             def _clip_vision_forward(self, pixel_values=None, interpolate_pos_encoding=False, **kwargs):
                 if pixel_values is None:
@@ -887,8 +888,8 @@ class WorldStereo:
                 encoder_states = encoder_states + (hidden_states,)
                 return BaseModelOutput(last_hidden_state=hidden_states, hidden_states=encoder_states)
 
-            image_clip.vision_model.forward = types.MethodType(_clip_vision_forward, image_clip.vision_model)
-            image_clip.vision_model.encoder.forward = types.MethodType(_clip_encoder_forward, image_clip.vision_model.encoder)
+            clip_vision.forward = types.MethodType(_clip_vision_forward, clip_vision)
+            clip_vision.encoder.forward = types.MethodType(_clip_encoder_forward, clip_vision.encoder)
 
         # ---- VAE ----
         vae_dtype = half_dtype
@@ -915,7 +916,8 @@ class WorldStereo:
             fully_shard(text_encoder, **fsdp_kwargs)
             rank0_log("FSDP wrapping done for T5.")
 
-            for layer in image_clip.vision_model.encoder.layers:
+            clip_vision = getattr(image_clip, "vision_model", image_clip)
+            for layer in clip_vision.encoder.layers:
                 fully_shard(layer, **fsdp_kwargs)
             fully_shard(image_clip, **fsdp_kwargs)
             rank0_log("FSDP wrapping done for CLIP.")

@@ -146,7 +146,7 @@ def get_qwen_caption_format(task_type, sampled_images=None, desc_str_insert=None
         raise NotImplementedError(f"task_type {task_type} not implemented")
 
 
-def get_traj_caption(LLM_ADDR, LLM_PORT, MODEL_NAME, traj_path, sample_count=8):
+def get_traj_caption(LLM_ADDR, LLM_PORT, MODEL_NAME, traj_path, sample_count=4, max_tokens=256):
     client = OpenAI(api_key="EMPTY", base_url=f"http://{LLM_ADDR}:{LLM_PORT}/v1")
     prompt_text = ("Please generate a descriptive caption for the provided video, focusing strictly on the visual content of the scene while ignoring rendering artifacts. "
                    "1. Initial Scene Description: Start by providing a detailed description of the first frame. Specifically analyze the landscape, the style and material of the huts/tents, "
@@ -185,7 +185,7 @@ def get_traj_caption(LLM_ADDR, LLM_PORT, MODEL_NAME, traj_path, sample_count=8):
     response = client.chat.completions.create(
         model=MODEL_NAME,
         messages=messages,
-        max_tokens=1024,  # Adjust max_tokens to keep it concise
+        max_tokens=max_tokens,
         temperature=0.1,
         seed=1024
     )
