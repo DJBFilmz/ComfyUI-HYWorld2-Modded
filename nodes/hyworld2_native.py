@@ -294,6 +294,10 @@ def _hyworld2_trajectory_state_path(scene):
     return Path(scene) / "hyworld2_trajectories_state.json"
 
 
+def _hyworld2_world_expansion_state_path(scene):
+    return Path(scene) / "hyworld2_world_expansion_state.json"
+
+
 def _hyworld2_read_json_file(path, default=None):
     path = Path(path)
     if not path.is_file():
@@ -355,7 +359,9 @@ def _hyworld2_clear_workspace_derivatives(scene):
         scene / "hyworld2_trajectories_state.json",
         scene / "hyworld2_qwenvl_scene.json",
         scene / "objects.json",
+        scene / "detail_objects.json",
         scene / "meta_info.json",
+        scene / "hyworld2_world_expansion_state.json",
     ):
         if path.exists():
             path.unlink()
@@ -368,18 +374,39 @@ def _hyworld2_trajectory_dirs(render_root):
     return sorted(path.parent for path in render_root.glob("**/render.mp4") if path.is_file())
 
 
-def _hyworld2_trajectory_cache_status(scene, settings_signature, require_nav=False, require_anchor=False, anchor_topk=0, caption_mode="qwenvl_missing"):
+def _hyworld2_trajectory_cache_status(
+    scene,
+    settings_signature,
+    require_nav=False,
+    require_detail=False,
+    require_anchor=False,
+    anchor_topk=0,
+    caption_mode="qwenvl_missing",
+    workspace_cache_action=None,
+):
     scene = Path(scene)
     render_root = scene / "render_results"
     state = _hyworld2_read_json_file(_hyworld2_trajectory_state_path(scene), default={}) or {}
-    current_pano = _hyworld2_file_sha256(scene / "panorama.png")
+    current_pano = _hyworld2_image_file_pixel_fingerprint(scene / "panorama.png")
+    legacy_current_pano = _hyworld2_file_sha256(scene / "panorama.png")
     cached_pano = state.get("panorama")
     if not current_pano:
         return False, "panorama.png is missing", state
-    if cached_pano != current_pano:
+    workspace_says_unchanged = str(workspace_cache_action or "") == "panorama_unchanged"
+    pano_matches = cached_pano in (current_pano, legacy_current_pano)
+    if not pano_matches and not workspace_says_unchanged:
         return False, "panorama cache mismatch", state
-    if state.get("settings_signature") != settings_signature:
-        return False, "trajectory settings changed", state
+    state_signature = state.get("settings_signature")
+    repair_state = False
+    if state_signature != settings_signature:
+        if workspace_says_unchanged:
+            repair_state = True
+        else:
+            return False, "trajectory settings changed", state
+    if not pano_matches and workspace_says_unchanged:
+        repair_state = True
+    if repair_state:
+        state["_repair_state"] = True
 
     missing_geometry = _hyworld2_missing_memory_prerequisites(scene)
     if missing_geometry:
@@ -399,6 +426,20 @@ def _hyworld2_trajectory_cache_status(scene, settings_signature, require_nav=Fal
         if not nav_dirs:
             return False, "object navigation requested but no object trajectory renders were found", state
 
+    if require_detail:
+        if not (scene / "detail_objects.json").is_file():
+            return False, "extreme detail trajectories requested but detail_objects.json is missing", state
+        detail_targets = []
+        target_path = scene / "camera_trajectory" / "target_camera.json"
+        if target_path.is_file():
+            try:
+                target_data = _hyworld2_read_json_file(target_path, default=[]) or []
+                detail_targets = [item for item in target_data if isinstance(item, dict) and item.get("detail_pass")]
+            except Exception:
+                detail_targets = []
+        if not detail_targets:
+            return False, "extreme detail trajectories requested but no detail targets were found", state
+
     if require_anchor and int(anchor_topk) > 0:
         anchor_dirs = [path for path in trajectory_dirs if any(part.startswith("wonder_scan_") for part in path.parts)]
         if len(anchor_dirs) < int(anchor_topk):
@@ -407,7 +448,8 @@ def _hyworld2_trajectory_cache_status(scene, settings_signature, require_nav=Fal
     if caption_mode != "existing_files_only":
         missing_caption = [path for path in trajectory_dirs if not (path / "traj_caption.json").is_file()]
         if missing_caption:
-            return False, "trajectory captions are incomplete", state
+            state["_captions_incomplete"] = len(missing_caption)
+            state["_repair_state"] = True
 
     return True, "cached trajectory workspace is complete", state
 
@@ -1310,10 +1352,16 @@ def _parse_qwenvl_objects(text):
     return result
 
 
+def _qwenvl_object_key(item):
+    return " ".join(str(item or "").replace("-", "_").lower().strip().split())
+
+
 def _ensure_trajectory_planner_context(
     workspace,
     scene_type,
     apply_nav_traj,
+    apply_detail_traj,
+    detail_object_limit,
     force_vlm,
     qwen_model_id,
     qwen_quantization,
@@ -1325,7 +1373,7 @@ def _ensure_trajectory_planner_context(
     qwen_cpu_offload,
 ):
     from hyworld2.worldgen.src.vlm_utils import get_qwen_caption_format
-    from hyworld2.worldgen.src.navi_utils import get_navigation_instruction
+    from hyworld2.worldgen.src.navi_utils import get_detail_navigation_instruction, get_navigation_instruction
 
     qwen_device = "auto"
     qwen_cpu_offload = False
@@ -1384,7 +1432,7 @@ def _ensure_trajectory_planner_context(
     workspace["scene_type"] = str(meta.get("scene_type", workspace.get("scene_type", "unknown"))).lower()
 
     objects_path = scene / "objects.json"
-    if apply_nav_traj and not objects_path.exists():
+    if (apply_nav_traj or apply_detail_traj) and not objects_path.exists():
         print(f"[HYWorld2 Trajectories] Planner context: extracting navigation objects -> {objects_path}")
         text = qwen._generate(
             qwen_model_id,
@@ -1408,8 +1456,48 @@ def _ensure_trajectory_planner_context(
             json.dump(objects, handle, indent=2)
         written["objects"] = str(objects_path)
         print(f"[HYWorld2 Trajectories] Planner context: wrote {len(objects)} navigation object(s)")
-    elif apply_nav_traj:
+    elif apply_nav_traj or apply_detail_traj:
         print(f"[HYWorld2 Trajectories] Planner context: reusing navigation objects from {objects_path}")
+    detail_objects_path = scene / "detail_objects.json"
+    if apply_detail_traj and not detail_objects_path.exists():
+        existing_objects = []
+        if objects_path.exists():
+            try:
+                loaded_objects = _hyworld2_read_json_file(objects_path, default=[]) or []
+                if isinstance(loaded_objects, list):
+                    existing_objects = [str(item) for item in loaded_objects]
+            except Exception:
+                existing_objects = []
+        print(f"[HYWorld2 Trajectories] Planner context: extracting extreme detail objects -> {detail_objects_path}")
+        text = qwen._generate(
+            qwen_model_id,
+            get_detail_navigation_instruction(existing_objects, max_items=int(detail_object_limit), force_vlm=bool(force_vlm)),
+            images=pano_tensor,
+            device=qwen_device,
+            max_new_tokens=int(qwen_max_new_tokens),
+            max_image_edge=int(qwen_max_image_edge),
+            quantization=qwen_quantization,
+            attention_mode=qwen_attention_mode,
+            temperature=0.2,
+            top_p=0.9,
+            num_beams=1,
+            repetition_penalty=1.1,
+            keep_model_loaded=qwen_keep_model_loaded,
+            cpu_offload=qwen_cpu_offload,
+            seed=2048,
+        )
+        excluded = {_qwenvl_object_key(item) for item in existing_objects}
+        detail_candidates = _parse_qwenvl_objects(text)
+        detail_objects = [
+            item for item in detail_candidates
+            if _qwenvl_object_key(item) and _qwenvl_object_key(item) not in excluded
+        ][: max(1, int(detail_object_limit))]
+        with open(detail_objects_path, "w", encoding="utf-8") as handle:
+            json.dump(detail_objects, handle, indent=2)
+        written["detail_objects"] = str(detail_objects_path)
+        print(f"[HYWorld2 Trajectories] Planner context: wrote {len(detail_objects)} extreme detail object(s)")
+    elif apply_detail_traj:
+        print(f"[HYWorld2 Trajectories] Planner context: reusing extreme detail objects from {detail_objects_path}")
     if not qwen_keep_model_loaded:
         HYWorld2QwenVL._clear_cache()
     return written
@@ -1944,9 +2032,11 @@ class HYWorld2Trajectories:
                 "workspace": ("HYWORLD2_WORKSPACE",),
             },
             "optional": {
-                "seed": ("INT", {"default": 1024, "min": 0, "max": 2**31 - 1}),
+                "seed": ("INT", {"default": 1, "min": 0, "max": 2**31 - 1, "control_after_generate": "fixed"}),
                 "scene_type": (["auto", "indoor", "outdoor"], {"default": "auto"}),
                 "additional_nav_traj": ("BOOLEAN", {"default": False}),
+                "extreme_detail_traj": ("BOOLEAN", {"default": False}),
+                "detail_object_limit": ("INT", {"default": 6, "min": 1, "max": 16}),
                 "qwen_model_id": (_qwenvl_model_names(), {"default": HYWORLD2_QWENVL_DEFAULT}),
                 "qwen_quantization": (HYWORLD2_QWENVL_QUANTIZATION, {"default": HYWORLD2_QWENVL_DEFAULT_QUANTIZATION}),
                 "qwen_max_image_edge": ("INT", {"default": HYWORLD2_QWENVL_MAX_IMAGE_EDGE, "min": 128, "max": 4096, "step": 64}),
@@ -1985,10 +2075,41 @@ class HYWorld2Trajectories:
         return "|".join(state)
 
     def _sort(self, workspace, generated=False, captions_written=None, anchor_scans_written=None, logs=None):
-        from hyworld2.worldgen.src.data_utils import sort_trajs
-
         render_root = Path(workspace["scene_dir"]) / "render_results"
-        render_list = sort_trajs(str(render_root))
+        try:
+            from hyworld2.worldgen.src.data_utils import sort_trajs
+            render_list = sort_trajs(str(render_root))
+        except Exception as exc:
+            print(f"[HYWorld2 Trajectories] sort_trajs unavailable ({type(exc).__name__}: {exc}); using fallback.")
+            render_list = []
+        if not render_list:
+            def fallback_key(path):
+                path = Path(path)
+                view_id = path.parts[-3] if len(path.parts) >= 3 else ""
+                traj_id = path.parts[-2] if len(path.parts) >= 2 else ""
+                if view_id.startswith("view"):
+                    group = 0
+                    traj_order = {"traj2": 0, "traj0": 1, "traj1": 2}.get(traj_id, 99)
+                elif view_id.startswith("target"):
+                    group = 1
+                    traj_order = 0
+                elif view_id.startswith("reconstruct"):
+                    group = 4 if traj_id == "traj1" else 2
+                    traj_order = 0
+                elif view_id.startswith("wonder"):
+                    group = 3
+                    traj_order = 0
+                else:
+                    group = 9
+                    traj_order = 0
+                return group, view_id, traj_order, traj_id
+
+            render_list = [str(path) for path in sorted(render_root.glob("**/render.mp4"), key=fallback_key)]
+            if render_list:
+                print(
+                    "[HYWorld2 Trajectories] sort_trajs returned empty; "
+                    f"using Windows-safe fallback with {len(render_list)} render(s)."
+                )
         data = {
             "workspace": workspace,
             "render_list": render_list,
@@ -2014,9 +2135,11 @@ class HYWorld2Trajectories:
     def run(
         self,
         workspace,
-        seed=1024,
+        seed=1,
         scene_type="auto",
         additional_nav_traj=False,
+        extreme_detail_traj=False,
+        detail_object_limit=6,
         fov_x=120.0,
         fov_y=90.0,
         split_view_num=3,
@@ -2069,14 +2192,19 @@ class HYWorld2Trajectories:
     ):
         qwen_device = "auto"
         qwen_cpu_offload = False
-        apply_nav_traj = bool(additional_nav_traj or apply_nav_traj)
+        apply_detail_traj = bool(extreme_detail_traj)
+        detail_object_limit = max(1, min(16, int(detail_object_limit)))
+        apply_object_nav_traj = bool(additional_nav_traj or apply_nav_traj)
+        apply_nav_traj = bool(apply_object_nav_traj or apply_detail_traj)
         scene = Path(workspace["scene_dir"])
         render_root = scene / "render_results"
         logs = []
         settings_signature, settings_state = self._settings_signature(
             seed=int(seed),
             scene_type=str(scene_type),
-            additional_nav_traj=bool(apply_nav_traj),
+            additional_nav_traj=bool(apply_object_nav_traj),
+            extreme_detail_traj=bool(apply_detail_traj),
+            detail_object_limit=int(detail_object_limit),
             fov_x=float(fov_x),
             fov_y=float(fov_y),
             split_view_num=int(split_view_num),
@@ -2126,18 +2254,35 @@ class HYWorld2Trajectories:
             scene,
             settings_signature,
             require_nav=bool(apply_nav_traj),
+            require_detail=bool(apply_detail_traj),
             require_anchor=bool(apply_anchor_scan),
             anchor_topk=int(anchor_scan_topk),
             caption_mode=str(caption_mode),
+            workspace_cache_action=workspace.get("cache_action"),
         )
         if cache_ok:
             print(f"[HYWorld2 Trajectories] Auto cache hit: {cache_reason}. Reusing {render_root}")
             logs.append({"stage": "auto_cache", "action": "reuse_existing", "reason": cache_reason})
+            if cache_state.get("_repair_state") or cache_state.get("panorama") != _hyworld2_image_file_pixel_fingerprint(scene / "panorama.png"):
+                render_list = self._sort(workspace, generated=False, logs=logs)[0].get("render_list", [])
+                _hyworld2_write_json_file(
+                    _hyworld2_trajectory_state_path(scene),
+                    {
+                        "panorama": _hyworld2_image_file_pixel_fingerprint(scene / "panorama.png"),
+                        "settings_signature": settings_signature,
+                        "settings": settings_state,
+                        "render_count": len(render_list),
+                        "captions_written": 0,
+                        "anchor_scans_written": 0,
+                        "repaired_from_existing_artifacts": True,
+                    },
+                )
             return self._sort(workspace, generated=False, logs=logs)
 
         skip_exist = True
         render_root_existed = render_root.exists()
-        if cache_reason == "panorama cache mismatch" and render_root_existed:
+        print(f"[HYWorld2 Trajectories] Auto cache miss: {cache_reason}")
+        if cache_reason == "panorama cache mismatch" and render_root_existed and workspace.get("cache_action") != "panorama_unchanged":
             print("[HYWorld2 Trajectories] Source panorama changed; clearing stale render_results for full regeneration.")
             shutil.rmtree(render_root)
             render_root_existed = False
@@ -2164,6 +2309,8 @@ class HYWorld2Trajectories:
             workspace,
             scene_type=scene_type,
             apply_nav_traj=bool(apply_nav_traj),
+            apply_detail_traj=bool(apply_detail_traj),
+            detail_object_limit=int(detail_object_limit),
             force_vlm=bool(force_vlm),
             qwen_model_id=qwen_model_id,
             qwen_quantization=qwen_quantization,
@@ -2199,6 +2346,9 @@ class HYWorld2Trajectories:
             contract=float(contract),
             skip_exist=bool(skip_exist),
             apply_nav_traj=bool(apply_nav_traj),
+            apply_object_nav_traj=bool(apply_object_nav_traj),
+            apply_detail_traj=bool(apply_detail_traj),
+            detail_object_limit=int(detail_object_limit),
             wonder_topk=int(wonder_topk),
             recon_topk=int(recon_topk),
             move_dist=float(move_dist),
@@ -2284,7 +2434,7 @@ class HYWorld2Trajectories:
         _hyworld2_write_json_file(
             _hyworld2_trajectory_state_path(scene),
             {
-                "panorama": _hyworld2_file_sha256(scene / "panorama.png"),
+                "panorama": _hyworld2_image_file_pixel_fingerprint(scene / "panorama.png"),
                 "settings_signature": settings_signature,
                 "settings": settings_state,
                 "render_count": len(render_list),
@@ -2312,7 +2462,6 @@ class HYWorld2MemoryBank:
             "required": {
                 "workspace": ("HYWORLD2_WORKSPACE",),
                 "trajectory_set": ("HYWORLD2_TRAJECTORY_SET",),
-                "mode": (["initialize", "load_cached"], {"default": "initialize"}),
             },
             "optional": {
                 "image_width": ("INT", {"default": 0, "min": 0, "max": 8192}),
@@ -2330,8 +2479,51 @@ class HYWorld2MemoryBank:
     FUNCTION = "run"
     CATEGORY = "VNCCS/HYWorld2"
 
-    def run(self, workspace, trajectory_set, mode, image_width=0, image_height=0, nframe=0, max_reference=8, align_nframe=8, downsampled_pts=2_000_000, kb_anomaly_percentile=90.0):
-        _hy_log("Memory Bank", f"Stage 1/3: initializing memory bank (mode={mode})")
+    @classmethod
+    def IS_CHANGED(cls, workspace, trajectory_set, **kwargs):
+        scene = Path(workspace["scene_dir"])
+        watched = [
+            scene / "panorama.png",
+            scene / "hyworld2_workspace_state.json",
+            scene / "hyworld2_trajectories_state.json",
+            scene / "meta_info.json",
+            scene / "render_results" / "global_pcd.ply",
+            scene / "render_results" / "global_normal.npy",
+            scene / "render_results" / "sky_mask.png",
+            scene / "render_results" / "full_depth_prediction.pt",
+            scene / "render_results" / "pano_bank" / "cameras.json",
+        ]
+        state = [
+            str(scene),
+            _safe_json_dumps({key: kwargs[key] for key in sorted(kwargs)}),
+            _safe_json_dumps(
+                {
+                    "trajectory_count": int(trajectory_set.get("count", 0)) if isinstance(trajectory_set, dict) else 0,
+                    "trajectory_generated": bool(trajectory_set.get("generated", False)) if isinstance(trajectory_set, dict) else False,
+                    "workspace_cache_action": workspace.get("cache_action"),
+                    "result_name": workspace.get("result_name"),
+                }
+            ),
+        ]
+        for path in watched:
+            if path.exists():
+                stat = path.stat()
+                state.append(f"{path}:{stat.st_mtime_ns}:{stat.st_size}")
+            else:
+                state.append(f"{path}:missing")
+        pano_bank = scene / "render_results" / "pano_bank"
+        for subdir in ("images", "depths"):
+            files = sorted((pano_bank / subdir).glob("*.png"))
+            state.append(f"{subdir}_count:{len(files)}")
+            if files:
+                first = files[0].stat()
+                last = files[-1].stat()
+                state.append(f"{subdir}_first:{files[0].name}:{first.st_mtime_ns}:{first.st_size}")
+                state.append(f"{subdir}_last:{files[-1].name}:{last.st_mtime_ns}:{last.st_size}")
+        return "|".join(state)
+
+    def run(self, workspace, trajectory_set, image_width=0, image_height=0, nframe=0, max_reference=8, align_nframe=8, downsampled_pts=2_000_000, kb_anomaly_percentile=90.0):
+        _hy_log("Memory Bank", "Stage 1/3: initializing memory bank")
         _ensure_worldgen_path()
         from hyworld2.worldgen.src.retrieval_wm import PanoramaMemoryBank
 
@@ -2415,7 +2607,6 @@ class HYWorld2WorldExpansion:
                 "model": ("WORLDSTEREO_MODEL",),
             },
             "optional": {
-                "caption_mode": (["qwenvl_missing", "qwenvl_overwrite", "existing_files_only"], {"default": "qwenvl_missing"}),
                 "qwen_model_id": (_qwenvl_model_names(), {"default": HYWORLD2_QWENVL_DEFAULT}),
                 "qwen_quantization": (HYWORLD2_QWENVL_QUANTIZATION, {"default": HYWORLD2_QWENVL_DEFAULT_QUANTIZATION}),
                 "qwen_attention_mode": (HYWORLD2_QWENVL_ATTENTION, {"default": "auto"}),
@@ -2423,8 +2614,7 @@ class HYWorld2WorldExpansion:
                 "qwen_max_new_tokens": ("INT", {"default": 192, "min": 16, "max": 2048, "step": 16}),
                 "qwen_keep_model_loaded": ("BOOLEAN", {"default": True}),
                 "qwen_frame_count": ("INT", {"default": 4, "min": 1, "max": 16}),
-                "seed": ("INT", {"default": 1024, "min": 0, "max": 2**31 - 1}),
-                "skip_existing": ("BOOLEAN", {"default": True}),
+                "seed": ("INT", {"default": 1, "min": 0, "max": 2**31 - 1, "control_after_generate": "fixed"}),
                 "max_trajectories": ("INT", {"default": 0, "min": 0, "max": 100000}),
             },
         }
@@ -2516,7 +2706,6 @@ class HYWorld2WorldExpansion:
         memory_bank,
         trajectory_set,
         model,
-        caption_mode="qwenvl_missing",
         qwen_model_id=HYWORLD2_QWENVL_DEFAULT,
         qwen_quantization=HYWORLD2_QWENVL_DEFAULT_QUANTIZATION,
         qwen_attention_mode="auto",
@@ -2526,12 +2715,12 @@ class HYWorld2WorldExpansion:
         qwen_max_new_tokens=192,
         qwen_keep_model_loaded=True,
         qwen_frame_count=4,
-        seed=1024,
-        skip_existing=True,
+        seed=1,
         max_trajectories=0,
     ):
         qwen_device = "auto"
         qwen_cpu_offload = False
+        caption_mode = "qwenvl_missing"
         _hy_log("World Expansion", "Stage 1/6: preparing WorldStereo memory expansion")
         _ensure_worldgen_path()
         from hyworld2.worldgen.src.data_utils import load_mutli_traj_dataset
@@ -2546,6 +2735,18 @@ class HYWorld2WorldExpansion:
         render_list = list(trajectory_set.get("render_list", []))
         if int(max_trajectories) > 0:
             render_list = render_list[: int(max_trajectories)]
+        state_path = _hyworld2_world_expansion_state_path(workspace["scene_dir"])
+        expansion_state = _hyworld2_read_json_file(state_path, default={}) or {}
+        legacy_seed = 1
+        state_seed = expansion_state.get("seed", legacy_seed)
+        seed_matches = int(state_seed) == int(seed)
+        if not expansion_state:
+            _hy_log("World Expansion", f"No expansion seed state found; treating existing result videos as legacy seed={legacy_seed}")
+            seed_matches = int(seed) == legacy_seed
+        elif seed_matches:
+            _hy_log("World Expansion", f"Expansion cache seed matches: seed={int(seed)}")
+        else:
+            _hy_log("World Expansion", f"Expansion cache seed changed: cached={state_seed}, requested={int(seed)}; result videos will be regenerated")
         render_items = []
         pending_render_list = []
         existing_result_count = 0
@@ -2555,6 +2756,7 @@ class HYWorld2WorldExpansion:
             traj_dir = Path(workspace["scene_dir"]) / "render_results" / view_id / traj_id
             result_path = traj_dir / f"{model_type}_result.mp4"
             has_result = result_path.is_file() and result_path.stat().st_size > 0
+            can_reuse_result = bool(has_result and seed_matches)
             render_items.append(
                 {
                     "render_path": render_path,
@@ -2563,19 +2765,19 @@ class HYWorld2WorldExpansion:
                     "traj_dir": traj_dir,
                     "result_path": result_path,
                     "has_result": bool(has_result),
+                    "can_reuse_result": bool(can_reuse_result),
                 }
             )
-            if bool(skip_existing) and has_result:
+            if can_reuse_result:
                 existing_result_count += 1
             else:
                 pending_render_list.append(render_path)
         _hy_log("World Expansion", f"Stage 2/6: trajectory count={len(render_list)}, device={device}, model_type={model_type}")
-        if bool(skip_existing):
-            _hy_log(
-                "World Expansion",
-                f"Existing WorldStereo result videos: {existing_result_count}/{len(render_list)}; "
-                f"pending generation: {len(pending_render_list)}",
-            )
+        _hy_log(
+            "World Expansion",
+            f"Seed-valid WorldStereo result videos: {existing_result_count}/{len(render_list)}; "
+            f"pending generation: {len(pending_render_list)}",
+        )
         _hy_log("World Expansion", "Stage 3/6: ensuring trajectory captions")
         captions_written = []
         if pending_render_list:
@@ -2613,7 +2815,7 @@ class HYWorld2WorldExpansion:
             camera_data = json.load(open(traj_dir / "camera.json", "r", encoding="utf-8"))
             tar_w2cs = torch.from_numpy(np.asarray(camera_data["extrinsic"], dtype=np.float32)).to(device)
             tar_Ks = torch.from_numpy(np.asarray(camera_data["intrinsic"], dtype=np.float32)).to(device)
-            if skip_existing and item["has_result"]:
+            if item["can_reuse_result"]:
                 _hy_log("World Expansion", f"Trajectory {view_id}/{traj_id}: reusing existing result {result_path}")
                 frames = _load_video_frames(result_path)
                 update_w2cs, update_Ks = _sample_camera_tensors_to_frame_count(tar_w2cs, tar_Ks, len(frames))
@@ -2673,8 +2875,30 @@ class HYWorld2WorldExpansion:
         del pipeline
         _hy_log("World Expansion", "Stage 6/6: releasing model memory")
         _release_model_memory("HYWorld2 World Expansion")
+        _hyworld2_write_json_file(
+            state_path,
+            {
+                "seed": int(seed),
+                "model_type": str(model_type),
+                "render_count": len(render_list),
+                "completed_count": len(completed),
+                "result_paths": completed,
+            },
+        )
         _hy_log("World Expansion", f"World expansion complete: completed={len(completed)}")
-        return (memory_bank, _safe_json_dumps({"completed": completed, "count": len(completed), "captions_written": captions_written}))
+        return (
+            memory_bank,
+            _safe_json_dumps(
+                {
+                    "completed": completed,
+                    "count": len(completed),
+                    "captions_written": captions_written,
+                    "seed": int(seed),
+                    "seed_cache_action": "reuse_existing" if not pending_render_list else "generated_pending",
+                    "state_path": str(state_path),
+                }
+            ),
+        )
 
 
 class HYWorld2PrepareWorldMirrorBatch:

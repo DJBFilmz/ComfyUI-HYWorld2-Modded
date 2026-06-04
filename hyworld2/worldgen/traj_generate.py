@@ -110,6 +110,10 @@ SAM3_REPO_ID = "MIUProject/sam3"
 MOGE_ID = "Ruicheng/moge-2-vitl-normal"
 
 
+def normalize_object_key(item):
+    return " ".join(str(item or "").replace("-", "_").lower().strip().split())
+
+
 def resolve_hf_checkpoint(repo_id, allow_patterns=None, subfolder=None, required_files=None):
     """Download a Hugging Face model to the local cache and return its usable path."""
     from huggingface_hub import snapshot_download
@@ -209,6 +213,8 @@ def build_arg_parser():
 
     # navigation params
     parser.add_argument("--apply_nav_traj", action="store_true", help="apply navigation trajectory")
+    parser.add_argument("--apply_detail_traj", action="store_true", help="apply extra protruding-detail navigation targets")
+    parser.add_argument("--detail_object_limit", type=int, default=6)
     parser.add_argument("--wonder_topk", type=int, default=3)
     parser.add_argument("--recon_topk", type=int, default=5)
     parser.add_argument("--move_dist", type=float, default=8.0)
@@ -719,6 +725,34 @@ def run_traj_generate(args):
             if not isinstance(unique_objects, list):
                 raise ValueError(f"{objects_json} must contain a JSON list of object names.")
             unique_objects = deduplicate_ordered([str(item).replace("-", "_").strip() for item in unique_objects if str(item).strip()])
+            apply_object_nav_traj = bool(getattr(args, "apply_object_nav_traj", True))
+            navigation_objects = unique_objects if apply_object_nav_traj else []
+            detail_objects = []
+            if bool(getattr(args, "apply_detail_traj", False)):
+                detail_json = os.path.join(scene_path, "detail_objects.json")
+                if not os.path.exists(detail_json):
+                    raise FileNotFoundError(
+                        f"Missing {detail_json}. HYWorld2Trajectories must prepare detail objects before traj_generate when apply_detail_traj=True."
+                    )
+                with open(detail_json, "r", encoding="utf-8") as f:
+                    detail_objects = load_repaired(f)
+                if not isinstance(detail_objects, list):
+                    raise ValueError(f"{detail_json} must contain a JSON list of object names.")
+                detail_limit = max(1, int(getattr(args, "detail_object_limit", 6)))
+                excluded = {normalize_object_key(item) for item in unique_objects if str(item).strip()}
+                detail_objects = deduplicate_ordered(
+                    [
+                        str(item).replace("-", "_").strip()
+                        for item in detail_objects
+                        if normalize_object_key(item) and normalize_object_key(item) not in excluded
+                    ]
+                )[:detail_limit]
+            detail_object_keys = {normalize_object_key(item) for item in detail_objects}
+            unique_objects = deduplicate_ordered(navigation_objects + detail_objects)
+            print(
+                f"[HYWorld2 TrajGenerate] Navigation target prompts: "
+                f"objects={len(navigation_objects)}, extreme_details={len(detail_objects)}"
+            )
 
             # processing object segmentation and masking
             if unique_objects:
@@ -767,6 +801,7 @@ def run_traj_generate(args):
                         batch_candidates = []
                         for j, res in enumerate(results):
                             current_obj_name = batch_objects[j]
+                            is_detail_pass = normalize_object_key(current_obj_name) in detail_object_keys
                             masks = res.get("masks", None)
                             scores = res.get("scores", None)
                             if masks is None or len(masks) == 0:
@@ -867,6 +902,8 @@ def run_traj_generate(args):
                             segmentation_data.append({
                                 "id": len(segmentation_data),
                                 "label": label,
+                                "detail_pass": bool(is_detail_pass),
+                                "target_source": "extreme_detail" if is_detail_pass else "navigation_object",
                                 "score": float(cand['score']),
                                 "scale_3d": float(bbox_scale),
                                 "center_point_2d": center_2d.tolist() if isinstance(center_2d, np.ndarray) else center_2d,

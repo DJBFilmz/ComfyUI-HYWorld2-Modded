@@ -2918,6 +2918,27 @@ def get_navigation_instruction(force_vlm=False):
     return instruction
 
 
+def get_detail_navigation_instruction(excluded_objects=None, max_items=6, force_vlm=False):
+    excluded_objects = [str(item).strip() for item in (excluded_objects or []) if str(item).strip()]
+    excluded_text = ", ".join(excluded_objects[:32]) if excluded_objects else "none"
+    instruction = (
+        "You are a scene-detail scouting assistant for a ground-based walking robot. "
+        "From this panoramic image, identify a small number of distinctive attached or protruding environment details "
+        "that deserve close orbit/reconstruction views. Focus on details that physically stick out from walls, ceilings, "
+        "floors, machinery, or built-in structures, not ordinary standalone navigation objects.\n\n"
+        f"Already selected navigation objects to exclude: {excluded_text}\n\n"
+        "Include only visually important 3D details such as exposed pipes, wall-mounted monitors, control panels, vents, "
+        "cable conduits, handles, hatches, brackets, protruding lights, mechanical boxes, valves, wall consoles, or relief panels.\n"
+        "Do NOT include whole walls, floors, ceilings, corridors, rooms, sky, flat textures, paintings, posters, generic panels, "
+        "or broad background regions. Do NOT repeat or rename anything from the exclusion list. "
+        "Prefer compact nouns or noun phrases that SAM can segment. Each item must be at most 4 words.\n\n"
+        f"Return at most {int(max_items)} items. Output strictly as a JSON list of strings."
+    )
+    if force_vlm:
+        instruction += " If a clearly protruding detail is visible but uncertain, include it, but still respect the item limit."
+    return instruction
+
+
 def get_topk_seg_data(seg_data, topk):
     """
     Sort seg_data by the specified rule and select the top-k elements with the smallest combined rank.
