@@ -201,6 +201,7 @@ if __name__ == '__main__':
     parser.add_argument("--llm_name", type=str, default=MODEL_NAME, help="VLM model name served by vLLM")
     parser.add_argument("--sam3_path", type=str, default=SAM3_REPO_ID, help="SAM3 repo id or local checkpoint path")
     parser.add_argument("--local_files_only", action="store_true", help="Do not download Hugging Face files; use local cache/paths only")
+    parser.add_argument("--reuse_objects_json", action="store_true", help="Use existing objects.json for navigation objects instead of querying the VLM server")
 
     args = parser.parse_args()
 
@@ -685,7 +686,9 @@ if __name__ == '__main__':
             # VLM & SAM3
             segmentation_data = []
             unique_objects = []
-            if not (args.skip_exist and os.path.exists(os.path.join(scene_path, "objects.json"))):
+            objects_json = os.path.join(scene_path, "objects.json")
+            reuse_objects_json = os.path.exists(objects_json) and (args.reuse_objects_json or args.skip_exist)
+            if not reuse_objects_json:
                 try:
                     base64_image = pil_image_to_base64(full_img)
                     messages = [
@@ -700,12 +703,12 @@ if __name__ == '__main__':
                         response = client.chat.completions.create(model=MODEL_NAME, messages=messages, max_tokens=1024, temperature=0.0, seed=1024)
                         clean_text = response.choices[0].message.content.strip().replace('[', '').replace(']', '').replace('"', '').replace("'", "").replace("```json", "").replace("```", "").replace("-", "_")
                         unique_objects = deduplicate_ordered([item.strip() for item in clean_text.split(',') if item.strip()])
-                    with open(os.path.join(scene_path, "objects.json"), "w") as f:
+                    with open(objects_json, "w") as f:
                         json.dump(unique_objects, f, indent=4)
                 except Exception as e:
                     rank0_log(f"  VLM Error: {e}", "ERROR")
             else:
-                unique_objects = json.load(open(os.path.join(scene_path, "objects.json"), "r"))
+                unique_objects = json.load(open(objects_json, "r"))
 
             # processing object segmentation and masking
             if unique_objects:

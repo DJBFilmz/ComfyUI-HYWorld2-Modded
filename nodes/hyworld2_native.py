@@ -2,6 +2,7 @@ import contextlib
 import gc
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -25,6 +26,31 @@ except ImportError:
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 WORLDGEN_DIR = PROJECT_ROOT / "hyworld2" / "worldgen"
 
+HYWORLD2_QWENVL_MODELS = {
+    "Qwen3-VL-2B-Instruct": {"repo_id": "Qwen/Qwen3-VL-2B-Instruct", "quantized": False},
+    "Qwen3-VL-2B-Thinking": {"repo_id": "Qwen/Qwen3-VL-2B-Thinking", "quantized": False},
+    "Qwen3-VL-2B-Instruct-FP8": {"repo_id": "Qwen/Qwen3-VL-2B-Instruct-FP8", "quantized": True},
+    "Qwen3-VL-2B-Thinking-FP8": {"repo_id": "Qwen/Qwen3-VL-2B-Thinking-FP8", "quantized": True},
+    "Qwen3-VL-4B-Instruct": {"repo_id": "Qwen/Qwen3-VL-4B-Instruct", "quantized": False},
+    "Qwen3-VL-4B-Thinking": {"repo_id": "Qwen/Qwen3-VL-4B-Thinking", "quantized": False},
+    "Qwen3-VL-4B-Instruct-FP8": {"repo_id": "Qwen/Qwen3-VL-4B-Instruct-FP8", "quantized": True},
+    "Qwen3-VL-4B-Thinking-FP8": {"repo_id": "Qwen/Qwen3-VL-4B-Thinking-FP8", "quantized": True},
+    "Qwen3-VL-8B-Instruct": {"repo_id": "Qwen/Qwen3-VL-8B-Instruct", "quantized": False},
+    "Qwen3-VL-8B-Thinking": {"repo_id": "Qwen/Qwen3-VL-8B-Thinking", "quantized": False},
+    "Qwen3-VL-8B-Instruct-FP8": {"repo_id": "Qwen/Qwen3-VL-8B-Instruct-FP8", "quantized": True},
+    "Qwen3-VL-8B-Thinking-FP8": {"repo_id": "Qwen/Qwen3-VL-8B-Thinking-FP8", "quantized": True},
+    "Qwen3-VL-32B-Instruct": {"repo_id": "Qwen/Qwen3-VL-32B-Instruct", "quantized": False},
+    "Qwen3-VL-32B-Thinking": {"repo_id": "Qwen/Qwen3-VL-32B-Thinking", "quantized": False},
+    "Qwen3-VL-32B-Instruct-FP8": {"repo_id": "Qwen/Qwen3-VL-32B-Instruct-FP8", "quantized": True},
+    "Qwen3-VL-32B-Thinking-FP8": {"repo_id": "Qwen/Qwen3-VL-32B-Thinking-FP8", "quantized": True},
+    "Qwen2.5-VL-3B-Instruct": {"repo_id": "Qwen/Qwen2.5-VL-3B-Instruct", "quantized": False},
+    "Qwen2.5-VL-7B-Instruct": {"repo_id": "Qwen/Qwen2.5-VL-7B-Instruct", "quantized": False},
+}
+HYWORLD2_QWENVL_DEFAULT = "Qwen3-VL-8B-Instruct"
+HYWORLD2_QWENVL_QUANTIZATION = ["None (FP16)", "8-bit (Balanced)", "4-bit (VRAM-friendly)"]
+HYWORLD2_QWENVL_ATTENTION = ["auto", "sage", "flash_attention_2", "sdpa"]
+HYWORLD2_SAM3_REPO_ID = "MIUProject/sam3"
+
 
 def _ensure_worldgen_path():
     for path in (str(PROJECT_ROOT), str(WORLDGEN_DIR)):
@@ -36,6 +62,151 @@ def _output_root() -> Path:
     if folder_paths is not None:
         return Path(folder_paths.get_output_directory())
     return PROJECT_ROOT / "output"
+
+
+def _qwenvl_model_names():
+    return list(HYWORLD2_QWENVL_MODELS.keys())
+
+
+def _qwenvl_repo_id(model_name):
+    name = str(model_name or "").strip()
+    if name in HYWORLD2_QWENVL_MODELS:
+        return HYWORLD2_QWENVL_MODELS[name]["repo_id"]
+    if "/" in name:
+        return name
+    raise ValueError(f"Unsupported QwenVL model: {model_name}")
+
+
+def _qwenvl_is_fp8(model_name):
+    name = str(model_name or "")
+    info = HYWORLD2_QWENVL_MODELS.get(name, {})
+    return bool(info.get("quantized")) or "-fp8" in name.lower() or "_fp8" in name.lower()
+
+
+def _qwenvl_models_dir():
+    if folder_paths is not None:
+        try:
+            llm_paths = folder_paths.get_folder_paths("LLM") if "LLM" in folder_paths.folder_names_and_paths else []
+            if llm_paths:
+                return Path(llm_paths[0]) / "Qwen-VL"
+        except Exception:
+            pass
+        try:
+            return Path(folder_paths.models_dir) / "LLM" / "Qwen-VL"
+        except Exception:
+            pass
+    return PROJECT_ROOT / "models" / "LLM" / "Qwen-VL"
+
+
+def _qwenvl_ensure_model(model_name):
+    repo_id = _qwenvl_repo_id(model_name)
+    target = _qwenvl_models_dir() / repo_id.split("/")[-1]
+    if target.exists() and target.is_dir():
+        if any(target.glob("*.safetensors")) or any(target.glob("*.bin")):
+            return str(target)
+    target.mkdir(parents=True, exist_ok=True)
+    try:
+        from huggingface_hub import snapshot_download
+    except Exception as exc:
+        raise ImportError("QwenVL auto-download requires huggingface_hub.") from exc
+    snapshot_download(
+        repo_id=repo_id,
+        local_dir=str(target),
+        local_dir_use_symlinks=False,
+        ignore_patterns=["*.md", ".git*"],
+    )
+    return str(target)
+
+
+def _qwenvl_normalize_device(device):
+    device = str(device or "auto").strip()
+    if device == "auto":
+        if torch.cuda.is_available():
+            return "cuda:0"
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+    if device.isdigit():
+        device = f"cuda:{int(device)}"
+    if device == "cuda":
+        return "cuda:0" if torch.cuda.is_available() else "cpu"
+    if device.startswith("cuda"):
+        if not torch.cuda.is_available():
+            return "cpu"
+        try:
+            idx = int(device.split(":", 1)[1]) if ":" in device else 0
+        except Exception:
+            idx = 0
+        if idx >= torch.cuda.device_count():
+            idx = 0
+        return f"cuda:{idx}"
+    if device == "mps" and not (getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()):
+        return "cpu"
+    return device
+
+
+def _qwenvl_flash_attn_available():
+    if not torch.cuda.is_available():
+        return False
+    try:
+        major, _ = torch.cuda.get_device_capability()
+        if major < 8:
+            return False
+        import flash_attn  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _qwenvl_sage_attn_available():
+    if not torch.cuda.is_available():
+        return False
+    try:
+        major, _ = torch.cuda.get_device_capability()
+        if major < 8:
+            return False
+        import sageattention  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _qwenvl_resolve_attention(attention_mode, force_sdpa=False):
+    mode = str(attention_mode or "auto")
+    if force_sdpa or mode == "sdpa":
+        return "sdpa"
+    if mode == "flash_attention_2":
+        return "flash_attention_2" if _qwenvl_flash_attn_available() else "sdpa"
+    if mode == "sage":
+        # We expose the selector, but only use kernels when the installed transformers stack supports it.
+        return "sdpa" if not _qwenvl_sage_attn_available() else "sdpa"
+    if _qwenvl_flash_attn_available():
+        return "flash_attention_2"
+    return "sdpa"
+
+
+def _qwenvl_quantization_config(model_name, quantization):
+    if _qwenvl_is_fp8(model_name):
+        return None, None, True
+    quant = str(quantization or "None (FP16)")
+    if quant == "4-bit (VRAM-friendly)":
+        try:
+            from transformers import BitsAndBytesConfig
+        except Exception as exc:
+            raise ImportError("QwenVL 4-bit quantization requires transformers BitsAndBytesConfig and bitsandbytes.") from exc
+        return BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+        ), None, False
+    if quant == "8-bit (Balanced)":
+        try:
+            from transformers import BitsAndBytesConfig
+        except Exception as exc:
+            raise ImportError("QwenVL 8-bit quantization requires transformers BitsAndBytesConfig and bitsandbytes.") from exc
+        return BitsAndBytesConfig(load_in_8bit=True), None, False
+    return None, torch.float16 if torch.cuda.is_available() else torch.float32, False
 
 
 def _sanitize_name(value, fallback="scene"):
@@ -853,6 +1024,321 @@ def _safe_json_dumps(value):
     return json.dumps(value, indent=2, default=default)
 
 
+def _worldgen_env():
+    env = os.environ.copy()
+    pythonpath_parts = [str(PROJECT_ROOT), str(WORLDGEN_DIR)]
+    if env.get("PYTHONPATH"):
+        pythonpath_parts.append(env["PYTHONPATH"])
+    env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    env.setdefault("TOKENIZERS_PARALLELISM", "false")
+    return env
+
+
+def _run_worldgen_command(command, log_path, label):
+    log_path = Path(log_path)
+    _ensure_dir(log_path.parent)
+    lines = []
+    print(f"[HYWorld2 Trajectories] Running {label}: {' '.join(map(str, command))}")
+    with open(log_path, "a", encoding="utf-8", errors="replace") as log:
+        log.write(f"\n===== {label} =====\n")
+        log.write(" ".join(map(str, command)) + "\n")
+        process = subprocess.Popen(
+            [str(part) for part in command],
+            cwd=str(WORLDGEN_DIR),
+            env=_worldgen_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            print(line, end="")
+            log.write(line)
+            lines.append(line.rstrip())
+            if len(lines) > 80:
+                lines.pop(0)
+        return_code = process.wait()
+        log.write(f"===== exit {return_code} =====\n")
+    if return_code != 0:
+        tail = "\n".join(lines[-40:])
+        raise RuntimeError(f"{label} failed with exit code {return_code}. Log: {log_path}\n{tail}")
+    return str(log_path)
+
+
+def _add_cli_arg(command, name, value):
+    command.extend([name, str(value)])
+
+
+def _add_cli_flag(command, name, enabled):
+    if bool(enabled):
+        command.append(name)
+
+
+def _load_workspace_panorama(scene):
+    image_path = scene / "panorama_sr.png"
+    if not image_path.exists():
+        image_path = scene / "panorama.png"
+    if not image_path.exists():
+        raise FileNotFoundError(f"HYWorld2 Trajectories requires panorama.png in workspace: {scene}")
+    return Image.open(image_path).convert("RGB")
+
+
+def _parse_scene_type(text):
+    lowered = str(text or "").lower()
+    if "outdoor" in lowered and "indoor" not in lowered:
+        return "outdoor"
+    if "indoor" in lowered:
+        return "indoor"
+    if "outdoor" in lowered:
+        return "outdoor"
+    return "indoor"
+
+
+def _parse_qwenvl_objects(text):
+    raw = str(text or "").strip()
+    try:
+        parsed = json.loads(raw.replace("```json", "").replace("```", "").strip())
+        if isinstance(parsed, list):
+            items = parsed
+        elif isinstance(parsed, dict):
+            items = parsed.get("objects") or parsed.get("items") or []
+        else:
+            items = []
+    except Exception:
+        cleaned = raw.replace("[", "").replace("]", "").replace('"', "").replace("'", "").replace("```json", "").replace("```", "")
+        items = []
+        for line in cleaned.replace("\n", ",").split(","):
+            item = line.strip(" -\t\r")
+            if item:
+                items.append(item)
+    result = []
+    seen = set()
+    for item in items:
+        item = str(item).strip().replace("-", "_")
+        item = " ".join(item.split())
+        if not item or len(item.split()) > 8:
+            continue
+        key = item.lower()
+        if key not in seen:
+            seen.add(key)
+            result.append(item)
+    return result
+
+
+def _ensure_trajectory_planner_context(
+    workspace,
+    apply_nav_traj,
+    force_vlm,
+    qwen_model_id,
+    qwen_quantization,
+    qwen_attention_mode,
+    qwen_device,
+    qwen_max_new_tokens,
+    qwen_keep_model_loaded,
+):
+    _ensure_worldgen_path()
+    from hyworld2.worldgen.src.vlm_utils import get_qwen_caption_format
+    from hyworld2.worldgen.src.navi_utils import get_navigation_instruction
+
+    scene = Path(workspace["scene_dir"])
+    panorama = _load_workspace_panorama(scene)
+    pano_tensor = _pil_list_to_image_tensor([panorama])
+    qwen = HYWorld2QwenVL()
+    written = {}
+
+    meta_path = scene / "meta_info.json"
+    meta = {}
+    if meta_path.exists():
+        with open(meta_path, "r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+        if isinstance(loaded, dict):
+            meta.update(loaded)
+    if str(meta.get("scene_type", "unknown")).lower() not in ("indoor", "outdoor"):
+        text = qwen._generate(
+            qwen_model_id,
+            get_qwen_caption_format("env_cls"),
+            images=pano_tensor,
+            device=qwen_device,
+            max_new_tokens=min(int(qwen_max_new_tokens), 64),
+            quantization=qwen_quantization,
+            attention_mode=qwen_attention_mode,
+            temperature=0.2,
+            top_p=0.9,
+            num_beams=1,
+            repetition_penalty=1.0,
+            keep_model_loaded=qwen_keep_model_loaded,
+            seed=1024,
+        )
+        meta["scene_type"] = _parse_scene_type(text)
+        with open(meta_path, "w", encoding="utf-8") as handle:
+            json.dump(meta, handle, indent=2)
+        written["meta_info"] = str(meta_path)
+
+    objects_path = scene / "objects.json"
+    if apply_nav_traj and not objects_path.exists():
+        text = qwen._generate(
+            qwen_model_id,
+            get_navigation_instruction(bool(force_vlm)),
+            images=pano_tensor,
+            device=qwen_device,
+            max_new_tokens=int(qwen_max_new_tokens),
+            quantization=qwen_quantization,
+            attention_mode=qwen_attention_mode,
+            temperature=0.2,
+            top_p=0.9,
+            num_beams=1,
+            repetition_penalty=1.1,
+            keep_model_loaded=qwen_keep_model_loaded,
+            seed=1024,
+        )
+        objects = _parse_qwenvl_objects(text)
+        with open(objects_path, "w", encoding="utf-8") as handle:
+            json.dump(objects, handle, indent=2)
+        written["objects"] = str(objects_path)
+    if not qwen_keep_model_loaded:
+        HYWorld2QwenVL._clear_cache()
+    return written
+
+
+def _trajectory_scene_median_depth(scene):
+    path = Path(scene) / "render_results" / "full_depth_prediction.pt"
+    if not path.exists():
+        return 1.0
+    try:
+        full_depth = torch.load(path, weights_only=False, map_location="cpu")
+        distance = full_depth.get("distance") if isinstance(full_depth, dict) else None
+        if distance is None:
+            return 1.0
+        values = distance.detach().float()
+        values = values[torch.isfinite(values) & (values > 0)]
+        if values.numel() == 0:
+            return 1.0
+        return float(torch.median(values).item())
+    except Exception as exc:
+        print(f"[HYWorld2 Trajectories] Could not read median depth: {exc}")
+        return 1.0
+
+
+def _anchor_camera_candidates(scene):
+    render_root = Path(scene) / "render_results"
+    paths = []
+    for pattern in ("wonder*/traj*/camera.json", "reconstruct*/traj*/camera.json"):
+        paths.extend(render_root.glob(pattern))
+    result = []
+    for path in sorted(paths):
+        if path.parts[-3].startswith("wonder_scan_"):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            w2cs = np.asarray(data.get("extrinsic", []), dtype=np.float64)
+            if w2cs.ndim != 3 or w2cs.shape[1:] != (4, 4) or len(w2cs) == 0:
+                continue
+            c2ws = np.linalg.inv(w2cs)
+            position = c2ws[-1, :3, 3].astype(np.float64)
+            result.append({"path": path, "data": data, "c2w": c2ws[-1], "position": position})
+        except Exception as exc:
+            print(f"[HYWorld2 Trajectories] Skipping anchor candidate {path}: {exc}")
+    return result
+
+
+def _make_anchor_scan_c2ws(anchor_c2w, nframe, yaw_degrees):
+    position = anchor_c2w[:3, 3].astype(np.float64)
+    base_forward = anchor_c2w[:3, 2].astype(np.float64)
+    base_forward[2] = 0.0
+    if np.linalg.norm(base_forward) < 1e-6:
+        base_forward = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    base_forward = base_forward / np.linalg.norm(base_forward)
+    up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    frames = max(2, int(nframe))
+    angles = np.linspace(0.0, np.deg2rad(float(yaw_degrees)), frames, endpoint=False)
+    c2ws = []
+    for angle in angles:
+        c, s = np.cos(angle), np.sin(angle)
+        forward = np.array([
+            base_forward[0] * c - base_forward[1] * s,
+            base_forward[0] * s + base_forward[1] * c,
+            0.0,
+        ], dtype=np.float64)
+        forward = forward / max(np.linalg.norm(forward), 1e-8)
+        right = np.cross(forward, up)
+        right = right / max(np.linalg.norm(right), 1e-8)
+        cam_up = np.cross(right, forward)
+        cam_up = cam_up / max(np.linalg.norm(cam_up), 1e-8)
+        c2w = np.eye(4, dtype=np.float64)
+        c2w[:3, 0] = right
+        c2w[:3, 1] = cam_up
+        c2w[:3, 2] = forward
+        c2w[:3, 3] = position
+        c2ws.append(c2w)
+    return np.asarray(c2ws, dtype=np.float64)
+
+
+def _write_anchor_scans(scene, topk, min_distance, min_separation, yaw_degrees, nframe):
+    _ensure_worldgen_path()
+    import cv2
+    from hyworld2.worldgen.src.panorama_utils import split_panorama_image
+
+    scene = Path(scene)
+    candidates = _anchor_camera_candidates(scene)
+    if not candidates:
+        return []
+    median_depth = max(_trajectory_scene_median_depth(scene), 1e-6)
+    min_distance_abs = float(min_distance) * median_depth
+    min_separation_abs = float(min_separation) * median_depth
+    candidates.sort(key=lambda item: float(np.linalg.norm(item["position"][:2])), reverse=True)
+    selected = []
+    for candidate in candidates:
+        pos = candidate["position"]
+        if np.linalg.norm(pos[:2]) < min_distance_abs:
+            continue
+        if any(np.linalg.norm(pos[:2] - other["position"][:2]) < min_separation_abs for other in selected):
+            continue
+        selected.append(candidate)
+        if len(selected) >= int(topk):
+            break
+    if not selected:
+        return []
+
+    full_img = _load_workspace_panorama(scene)
+    written = []
+    for index, candidate in enumerate(selected):
+        data = candidate["data"]
+        image_w = int(data["width"])
+        image_h = int(data["height"])
+        K = np.asarray(data["intrinsic"][0], dtype=np.float64)
+        c2ws = _make_anchor_scan_c2ws(candidate["c2w"], nframe, yaw_degrees)
+        w2cs = np.linalg.inv(c2ws)
+        K_pano = K.copy()
+        K_pano[0, :] /= image_w
+        K_pano[1, :] /= image_h
+        start = split_panorama_image(np.array(full_img), w2cs[0:1], np.array([K_pano]), h=image_h, w=image_w, interp=cv2.INTER_AREA)[0]
+        view_dir = scene / "render_results" / f"wonder_scan_{index}"
+        traj_dir = view_dir / "traj0"
+        _ensure_dir(traj_dir)
+        Image.fromarray(start).save(view_dir / "start_frame.png")
+        camera_info = {
+            "id": index,
+            "type": "anchor_scan",
+            "source_camera": str(candidate["path"]),
+            "width": image_w,
+            "height": image_h,
+            "intrinsic": [K.tolist()] * len(w2cs),
+            "extrinsic": w2cs.tolist(),
+            "anchor_position": candidate["position"].tolist(),
+            "yaw_degrees": float(yaw_degrees),
+        }
+        with open(traj_dir / "camera.json", "w", encoding="utf-8") as handle:
+            json.dump(camera_info, handle, indent=2)
+        written.append(str(traj_dir / "camera.json"))
+    return written
+
+
 class HYWorld2Workspace:
     @classmethod
     def INPUT_TYPES(cls):
@@ -909,20 +1395,31 @@ class HYWorld2Workspace:
 
 
 class HYWorld2QwenVL:
+    _model_cache = {}
+
     @classmethod
     def INPUT_TYPES(cls):
+        device_options = ["auto", "cpu", "mps"] + [f"cuda:{i}" for i in range(torch.cuda.device_count())]
         return {
             "required": {
                 "workspace": ("HYWORLD2_WORKSPACE",),
                 "mode": (["scene_objects", "trajectory_caption", "prompt_refine"], {"default": "trajectory_caption"}),
-                "model_id": ("STRING", {"default": "Qwen/Qwen2.5-VL-3B-Instruct"}),
+                "model_id": (_qwenvl_model_names(), {"default": HYWORLD2_QWENVL_DEFAULT}),
+                "quantization": (HYWORLD2_QWENVL_QUANTIZATION, {"default": "None (FP16)"}),
+                "attention_mode": (HYWORLD2_QWENVL_ATTENTION, {"default": "auto"}),
                 "prompt": ("STRING", {"default": "", "multiline": True}),
             },
             "optional": {
                 "images": ("IMAGE",),
                 "trajectory_set": ("HYWORLD2_TRAJECTORY_SET",),
-                "device": ("STRING", {"default": "cuda"}),
+                "device": (device_options, {"default": "auto"}),
                 "max_new_tokens": ("INT", {"default": 256, "min": 16, "max": 4096, "step": 16}),
+                "temperature": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.5, "step": 0.05}),
+                "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "num_beams": ("INT", {"default": 1, "min": 1, "max": 8}),
+                "repetition_penalty": ("FLOAT", {"default": 1.2, "min": 0.5, "max": 2.0, "step": 0.05}),
+                "keep_model_loaded": ("BOOLEAN", {"default": True}),
+                "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1}),
                 "write_results": ("BOOLEAN", {"default": True}),
             },
         }
@@ -932,25 +1429,94 @@ class HYWorld2QwenVL:
     FUNCTION = "run"
     CATEGORY = "VNCCS/HYWorld2"
 
-    def _generate(self, model_id, prompt, images=None, device="cuda", max_new_tokens=256):
+    @classmethod
+    def _clear_cache(cls, keep_signature=None):
+        for signature, bundle in list(cls._model_cache.items()):
+            if keep_signature is not None and signature == keep_signature:
+                continue
+            try:
+                model = bundle.get("model")
+                if model is not None:
+                    model.cpu()
+            except Exception:
+                pass
+            cls._model_cache.pop(signature, None)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _load_bundle(self, model_id, quantization="None (FP16)", attention_mode="auto", device="auto", keep_model_loaded=True):
         try:
-            from transformers import AutoProcessor
+            from transformers import AutoProcessor, AutoTokenizer
             try:
                 from transformers import AutoModelForImageTextToText as AutoModel
             except ImportError:
                 from transformers import AutoModelForVision2Seq as AutoModel
         except Exception as exc:
             raise ImportError("QwenVL requires transformers with vision-language model support. Install project requirements.") from exc
-        selected_device = device if torch.cuda.is_available() and str(device).startswith("cuda") else "cpu"
-        processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-        model = AutoModel.from_pretrained(
-            model_id,
-            torch_dtype=torch.bfloat16 if selected_device.startswith("cuda") else torch.float32,
-            device_map=selected_device if selected_device.startswith("cuda") else None,
-            trust_remote_code=True,
-        )
-        if not selected_device.startswith("cuda"):
+
+        selected_device = _qwenvl_normalize_device(device)
+        quant_cfg, dtype, is_fp8 = _qwenvl_quantization_config(model_id, quantization)
+        force_sdpa = is_fp8 or quant_cfg is not None
+        attn_impl = _qwenvl_resolve_attention(attention_mode, force_sdpa=force_sdpa)
+        signature = (str(model_id), str(quantization), attn_impl, selected_device)
+        if keep_model_loaded and signature in self._model_cache:
+            return self._model_cache[signature], signature
+
+        self._clear_cache()
+        model_path = _qwenvl_ensure_model(model_id)
+        load_kwargs = {
+            "attn_implementation": attn_impl,
+            "use_safetensors": True,
+            "trust_remote_code": True,
+        }
+        if is_fp8:
+            load_kwargs["device_map"] = None
+            load_kwargs["torch_dtype"] = "auto"
+        else:
+            load_kwargs["device_map"] = selected_device if selected_device not in ("cpu", "mps") else None
+            if dtype is not None:
+                load_kwargs["torch_dtype"] = dtype
+            if quant_cfg is not None:
+                load_kwargs["quantization_config"] = quant_cfg
+        print(f"[HYWorld2 QwenVL] Loading {model_id} ({quantization}, attn={attn_impl}, device={selected_device})")
+        model = AutoModel.from_pretrained(model_path, **load_kwargs).eval()
+        if selected_device in ("cpu", "mps") or is_fp8:
             model = model.to(selected_device)
+        processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        bundle = {"model": model, "processor": processor, "tokenizer": tokenizer}
+        if keep_model_loaded:
+            self._model_cache[signature] = bundle
+        return bundle, signature
+
+    def _generate(
+        self,
+        model_id,
+        prompt,
+        images=None,
+        device="auto",
+        max_new_tokens=256,
+        quantization="None (FP16)",
+        attention_mode="auto",
+        temperature=0.6,
+        top_p=0.9,
+        num_beams=1,
+        repetition_penalty=1.2,
+        keep_model_loaded=True,
+        seed=1,
+    ):
+        torch.manual_seed(int(seed))
+        bundle, signature = self._load_bundle(
+            model_id,
+            quantization=quantization,
+            attention_mode=attention_mode,
+            device=device,
+            keep_model_loaded=keep_model_loaded,
+        )
+        model = bundle["model"]
+        processor = bundle["processor"]
+        tokenizer = bundle["tokenizer"]
         pil_images = _image_tensor_to_pil_list(images) if images is not None else []
         content = []
         for image in pil_images[:8]:
@@ -959,18 +1525,52 @@ class HYWorld2QwenVL:
         messages = [{"role": "user", "content": content}]
         text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = processor(text=[text], images=pil_images[:8] or None, return_tensors="pt")
-        inputs = {k: v.to(model.device) if hasattr(v, "to") else v for k, v in inputs.items()}
+        model_device = next(model.parameters()).device
+        inputs = {k: v.to(model_device) if hasattr(v, "to") else v for k, v in inputs.items()}
+        stop_tokens = [tokenizer.eos_token_id]
+        if getattr(tokenizer, "eot_id", None) is not None:
+            stop_tokens.append(tokenizer.eot_id)
+        generate_kwargs = {
+            "max_new_tokens": int(max_new_tokens),
+            "repetition_penalty": float(repetition_penalty),
+            "num_beams": int(num_beams),
+            "eos_token_id": stop_tokens,
+            "pad_token_id": tokenizer.pad_token_id,
+        }
+        if int(num_beams) == 1:
+            generate_kwargs.update({"do_sample": True, "temperature": float(temperature), "top_p": float(top_p)})
+        else:
+            generate_kwargs["do_sample"] = False
         with torch.no_grad():
-            generated = model.generate(**inputs, max_new_tokens=int(max_new_tokens), do_sample=False)
+            generated = model.generate(**inputs, **generate_kwargs)
         generated = generated[:, inputs["input_ids"].shape[1]:]
-        result = processor.batch_decode(generated, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0].strip()
-        del model
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        result = tokenizer.decode(generated[0], skip_special_tokens=True).strip()
+        if not keep_model_loaded:
+            self._clear_cache(keep_signature=None)
+        else:
+            self._clear_cache(keep_signature=signature)
         return result
 
-    def run(self, workspace, mode, model_id, prompt, images=None, trajectory_set=None, device="cuda", max_new_tokens=256, write_results=True):
+    def run(
+        self,
+        workspace,
+        mode,
+        model_id,
+        quantization,
+        attention_mode,
+        prompt,
+        images=None,
+        trajectory_set=None,
+        device="auto",
+        max_new_tokens=256,
+        temperature=0.6,
+        top_p=0.9,
+        num_beams=1,
+        repetition_penalty=1.2,
+        keep_model_loaded=True,
+        seed=1,
+        write_results=True,
+    ):
         scene = Path(workspace["scene_dir"])
         if not prompt.strip():
             if mode == "scene_objects":
@@ -979,8 +1579,22 @@ class HYWorld2QwenVL:
                 prompt = "Describe the visible trajectory render as a concise image generation prompt. Return only the prompt text."
             else:
                 raise ValueError("prompt_refine requires a non-empty prompt; fallback prompts are disabled.")
-        text = self._generate(model_id, prompt, images=images, device=device, max_new_tokens=max_new_tokens)
-        context = {"mode": mode, "text": text, "model_id": model_id}
+        text = self._generate(
+            model_id,
+            prompt,
+            images=images,
+            device=device,
+            max_new_tokens=max_new_tokens,
+            quantization=quantization,
+            attention_mode=attention_mode,
+            temperature=temperature,
+            top_p=top_p,
+            num_beams=num_beams,
+            repetition_penalty=repetition_penalty,
+            keep_model_loaded=keep_model_loaded,
+            seed=seed,
+        )
+        context = {"mode": mode, "text": text, "model_id": model_id, "quantization": quantization, "attention_mode": attention_mode}
         if write_results:
             if mode == "scene_objects":
                 out_path = scene / "hyworld2_qwenvl_scene.json"
@@ -1005,14 +1619,21 @@ class HYWorld2QwenVL:
 class HYWorld2Trajectories:
     @classmethod
     def INPUT_TYPES(cls):
+        device_options = ["auto", "cpu", "mps"] + [f"cuda:{i}" for i in range(torch.cuda.device_count())]
         return {
             "required": {
                 "workspace": ("HYWORLD2_WORKSPACE",),
-                "mode": (["sort_existing", "generate_from_plan", "select_range", "debug_single"], {"default": "sort_existing"}),
+                "mode": (["generate_and_render_official", "reuse_existing"], {"default": "generate_and_render_official"}),
             },
             "optional": {
-                "start_index": ("INT", {"default": 0, "min": 0, "max": 100000}),
-                "max_count": ("INT", {"default": 0, "min": 0, "max": 100000}),
+                "skip_existing": ("BOOLEAN", {"default": True}),
+                "seed": ("INT", {"default": 1024, "min": 0, "max": 2**31 - 1}),
+                "apply_nav_traj": ("BOOLEAN", {"default": False}),
+                "qwen_model_id": (_qwenvl_model_names(), {"default": HYWORLD2_QWENVL_DEFAULT}),
+                "qwen_quantization": (HYWORLD2_QWENVL_QUANTIZATION, {"default": "None (FP16)"}),
+                "qwen_device": (device_options, {"default": "auto"}),
+                "apply_anchor_scan": ("BOOLEAN", {"default": False}),
+                "anchor_scan_topk": ("INT", {"default": 2, "min": 0, "max": 32}),
             },
         }
 
@@ -1021,20 +1642,202 @@ class HYWorld2Trajectories:
     FUNCTION = "run"
     CATEGORY = "VNCCS/HYWorld2"
 
-    def run(self, workspace, mode, start_index=0, max_count=0):
-        if mode == "generate_from_plan":
-            raise NotImplementedError("Native trajectory generation from Qwen plan is not implemented yet; use sort_existing after HYWorld2 trajectory render data exists.")
+    def _sort(self, workspace, generated=False, captions_written=None, anchor_scans_written=None, logs=None):
         _ensure_worldgen_path()
         from hyworld2.worldgen.src.data_utils import sort_trajs
 
         render_root = Path(workspace["scene_dir"]) / "render_results"
         render_list = sort_trajs(str(render_root))
-        if mode == "debug_single" and render_list:
-            render_list = [render_list[int(start_index)]]
-        elif mode == "select_range":
-            end = None if int(max_count) <= 0 else int(start_index) + int(max_count)
-            render_list = render_list[int(start_index):end]
-        data = {"workspace": workspace, "render_list": render_list, "count": len(render_list)}
+        data = {
+            "workspace": workspace,
+            "render_list": render_list,
+            "count": len(render_list),
+            "generated": bool(generated),
+            "captions_written": captions_written or [],
+            "anchor_scans_written": anchor_scans_written or [],
+            "logs": logs or [],
+        }
+        return (data, _safe_json_dumps(data))
+
+    def run(
+        self,
+        workspace,
+        mode,
+        skip_existing=True,
+        seed=1024,
+        fov_x=120.0,
+        fov_y=90.0,
+        split_view_num=3,
+        splitted_resolution=480,
+        nframe=21,
+        distance_threshold=0.1,
+        obs_iteration_limit=3,
+        rotation_deg=120.0,
+        rotation_up=45.0,
+        up_right=60.0,
+        obs_decay=2 / 3,
+        contract=8.0,
+        skip_exist=True,
+        apply_nav_traj=False,
+        wonder_topk=3,
+        recon_topk=5,
+        move_dist=8.0,
+        radius_threshold=4.0,
+        min_angle_threshold=40.0,
+        traj_sim_threshold=0.7,
+        traj_sim_threshold_recon=0.7,
+        apply_up_route=False,
+        apply_recon_iteration=False,
+        eloop_dist=0.25,
+        force_vlm=False,
+        cellSize=0.1,
+        cellHeight=0.1,
+        agentHeight=0.2,
+        agentRadius=0.1,
+        agentMaxClimb=0.1,
+        maxSlope=30.0,
+        roof_height_threshold=0.1,
+        sam3_path=HYWORLD2_SAM3_REPO_ID,
+        local_files_only=False,
+        render_processes=0,
+        caption_mode="qwenvl_missing",
+        qwen_model_id=HYWORLD2_QWENVL_DEFAULT,
+        qwen_quantization="None (FP16)",
+        qwen_attention_mode="auto",
+        qwen_device="auto",
+        qwen_max_new_tokens=256,
+        qwen_keep_model_loaded=True,
+        qwen_frame_count=4,
+        apply_anchor_scan=False,
+        anchor_scan_topk=2,
+        anchor_scan_min_distance=1.0,
+        anchor_scan_min_separation=0.75,
+        anchor_scan_yaw_degrees=360.0,
+    ):
+        if mode == "reuse_existing":
+            return self._sort(workspace, generated=False)
+        if mode != "generate_and_render_official":
+            raise ValueError(f"Unsupported HYWorld2 Trajectories mode: {mode}")
+        skip_exist = bool(skip_existing)
+
+        _ensure_worldgen_path()
+        scene = Path(workspace["scene_dir"])
+        render_root = scene / "render_results"
+        _ensure_dir(render_root)
+        logs = []
+
+        planner_written = _ensure_trajectory_planner_context(
+            workspace,
+            apply_nav_traj=bool(apply_nav_traj),
+            force_vlm=bool(force_vlm),
+            qwen_model_id=qwen_model_id,
+            qwen_quantization=qwen_quantization,
+            qwen_attention_mode=qwen_attention_mode,
+            qwen_device=qwen_device,
+            qwen_max_new_tokens=int(qwen_max_new_tokens),
+            qwen_keep_model_loaded=bool(qwen_keep_model_loaded),
+        )
+        HYWorld2QwenVL._clear_cache()
+        _release_model_memory("HYWorld2 Trajectories")
+
+        generate_cmd = [sys.executable, str(WORLDGEN_DIR / "traj_generate.py"), "--target_path", str(scene)]
+        for name, value in (
+            ("--fov_x", fov_x),
+            ("--fov_y", fov_y),
+            ("--seed", seed),
+            ("--split_view_num", split_view_num),
+            ("--splitted_resolution", splitted_resolution),
+            ("--nframe", nframe),
+            ("--distance_threshold", distance_threshold),
+            ("--obs_iteration_limit", obs_iteration_limit),
+            ("--rotation_deg", rotation_deg),
+            ("--rotation_up", rotation_up),
+            ("--up_right", up_right),
+            ("--obs_decay", obs_decay),
+            ("--contract", contract),
+            ("--wonder_topk", wonder_topk),
+            ("--recon_topk", recon_topk),
+            ("--move_dist", move_dist),
+            ("--radius_threshold", radius_threshold),
+            ("--min_angle_threshold", min_angle_threshold),
+            ("--traj_sim_threshold", traj_sim_threshold),
+            ("--traj_sim_threshold_recon", traj_sim_threshold_recon),
+            ("--eloop_dist", eloop_dist),
+            ("--cellSize", cellSize),
+            ("--cellHeight", cellHeight),
+            ("--agentHeight", agentHeight),
+            ("--agentRadius", agentRadius),
+            ("--agentMaxClimb", agentMaxClimb),
+            ("--maxSlope", maxSlope),
+            ("--roof_height_threshold", roof_height_threshold),
+        ):
+            _add_cli_arg(generate_cmd, name, value)
+        _add_cli_arg(generate_cmd, "--sam3_path", sam3_path or HYWORLD2_SAM3_REPO_ID)
+        _add_cli_flag(generate_cmd, "--skip_exist", skip_exist)
+        _add_cli_flag(generate_cmd, "--apply_nav_traj", apply_nav_traj)
+        _add_cli_flag(generate_cmd, "--apply_up_route", apply_up_route)
+        _add_cli_flag(generate_cmd, "--apply_recon_iteration", apply_recon_iteration)
+        _add_cli_flag(generate_cmd, "--force_vlm", force_vlm)
+        _add_cli_flag(generate_cmd, "--local_files_only", local_files_only)
+        _add_cli_flag(generate_cmd, "--reuse_objects_json", apply_nav_traj)
+        logs.append(_run_worldgen_command(generate_cmd, render_root / "hyworld2_traj_generate.log", "traj_generate.py"))
+
+        anchor_scans_written = []
+        if bool(apply_anchor_scan) and int(anchor_scan_topk) > 0:
+            anchor_scans_written = _write_anchor_scans(
+                scene,
+                topk=int(anchor_scan_topk),
+                min_distance=float(anchor_scan_min_distance),
+                min_separation=float(anchor_scan_min_separation),
+                yaw_degrees=float(anchor_scan_yaw_degrees),
+                nframe=int(nframe),
+            )
+
+        nproc = int(render_processes)
+        if nproc <= 0:
+            nproc = max(1, torch.cuda.device_count())
+        render_cmd = [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nnodes=1",
+            f"--nproc_per_node={nproc}",
+            str(WORLDGEN_DIR / "traj_render.py"),
+            "--target_path",
+            str(scene),
+            "--seed",
+            str(int(seed)),
+            "--disable_vlm_caption",
+        ]
+        logs.append(_run_worldgen_command(render_cmd, render_root / "hyworld2_traj_render.log", "traj_render.py"))
+
+        from hyworld2.worldgen.src.data_utils import sort_trajs
+
+        render_list = sort_trajs(str(render_root))
+        captions_written = HYWorld2WorldExpansion()._ensure_captions(
+            workspace,
+            render_list,
+            caption_mode,
+            qwen_model_id,
+            qwen_device,
+            int(qwen_max_new_tokens),
+            qwen_quantization,
+            qwen_attention_mode,
+            bool(qwen_keep_model_loaded),
+            int(qwen_frame_count),
+        )
+        HYWorld2QwenVL._clear_cache()
+        data = {
+            "workspace": workspace,
+            "render_list": render_list,
+            "count": len(render_list),
+            "generated": True,
+            "planner_context_written": planner_written,
+            "captions_written": captions_written,
+            "anchor_scans_written": anchor_scans_written,
+            "logs": logs,
+        }
         return (data, _safe_json_dumps(data))
 
 
@@ -1105,6 +1908,7 @@ class HYWorld2MemoryBank:
 class HYWorld2WorldExpansion:
     @classmethod
     def INPUT_TYPES(cls):
+        device_options = ["auto", "cpu", "mps"] + [f"cuda:{i}" for i in range(torch.cuda.device_count())]
         return {
             "required": {
                 "workspace": ("HYWORLD2_WORKSPACE",),
@@ -1114,9 +1918,13 @@ class HYWorld2WorldExpansion:
             },
             "optional": {
                 "caption_mode": (["qwenvl_missing", "qwenvl_overwrite", "existing_files_only"], {"default": "qwenvl_missing"}),
-                "qwen_model_id": ("STRING", {"default": "Qwen/Qwen2.5-VL-3B-Instruct"}),
-                "qwen_device": ("STRING", {"default": "cuda"}),
+                "qwen_model_id": (_qwenvl_model_names(), {"default": HYWORLD2_QWENVL_DEFAULT}),
+                "qwen_quantization": (HYWORLD2_QWENVL_QUANTIZATION, {"default": "None (FP16)"}),
+                "qwen_attention_mode": (HYWORLD2_QWENVL_ATTENTION, {"default": "auto"}),
+                "qwen_device": (device_options, {"default": "auto"}),
                 "qwen_max_new_tokens": ("INT", {"default": 192, "min": 16, "max": 2048, "step": 16}),
+                "qwen_keep_model_loaded": ("BOOLEAN", {"default": True}),
+                "qwen_frame_count": ("INT", {"default": 4, "min": 1, "max": 16}),
                 "seed": ("INT", {"default": 1024, "min": 0, "max": 2**31 - 1}),
                 "skip_existing": ("BOOLEAN", {"default": True}),
                 "max_trajectories": ("INT", {"default": 0, "min": 0, "max": 100000}),
@@ -1128,7 +1936,19 @@ class HYWorld2WorldExpansion:
     FUNCTION = "run"
     CATEGORY = "VNCCS/HYWorld2"
 
-    def _ensure_captions(self, workspace, render_list, caption_mode, qwen_model_id, qwen_device, qwen_max_new_tokens):
+    def _ensure_captions(
+        self,
+        workspace,
+        render_list,
+        caption_mode,
+        qwen_model_id,
+        qwen_device,
+        qwen_max_new_tokens,
+        qwen_quantization="None (FP16)",
+        qwen_attention_mode="auto",
+        qwen_keep_model_loaded=True,
+        qwen_frame_count=4,
+    ):
         if caption_mode == "existing_files_only":
             return []
         qwen = HYWorld2QwenVL()
@@ -1146,6 +1966,9 @@ class HYWorld2WorldExpansion:
                     sample.append(frames[len(frames) // 2])
                 if len(frames) > 1:
                     sample.append(frames[-1])
+                if int(qwen_frame_count) > len(sample):
+                    idx = np.linspace(0, len(frames) - 1, min(int(qwen_frame_count), len(frames)), dtype=int)
+                    sample = [frames[i] for i in idx]
             start_frame = traj_dir.parent / "start_frame.png"
             if start_frame.exists():
                 sample.insert(0, Image.open(start_frame).convert("RGB"))
@@ -1159,9 +1982,17 @@ class HYWorld2WorldExpansion:
             text = qwen._generate(
                 qwen_model_id,
                 prompt,
-                images=_pil_list_to_image_tensor(sample[:4]),
+                images=_pil_list_to_image_tensor(sample[: max(1, int(qwen_frame_count))]),
                 device=qwen_device,
                 max_new_tokens=qwen_max_new_tokens,
+                quantization=qwen_quantization,
+                attention_mode=qwen_attention_mode,
+                temperature=0.6,
+                top_p=0.9,
+                num_beams=1,
+                repetition_penalty=1.2,
+                keep_model_loaded=qwen_keep_model_loaded,
+                seed=1,
             )
             if not text.strip():
                 raise RuntimeError(f"QwenVL returned an empty caption for {render_path}")
@@ -1177,9 +2008,13 @@ class HYWorld2WorldExpansion:
         trajectory_set,
         model,
         caption_mode="qwenvl_missing",
-        qwen_model_id="Qwen/Qwen2.5-VL-3B-Instruct",
-        qwen_device="cuda",
+        qwen_model_id=HYWORLD2_QWENVL_DEFAULT,
+        qwen_quantization="None (FP16)",
+        qwen_attention_mode="auto",
+        qwen_device="auto",
         qwen_max_new_tokens=192,
+        qwen_keep_model_loaded=True,
+        qwen_frame_count=4,
         seed=1024,
         skip_existing=True,
         max_trajectories=0,
@@ -1204,6 +2039,10 @@ class HYWorld2WorldExpansion:
             qwen_model_id,
             qwen_device,
             int(qwen_max_new_tokens),
+            qwen_quantization,
+            qwen_attention_mode,
+            bool(qwen_keep_model_loaded),
+            int(qwen_frame_count),
         )
         prompt_cache = _build_prompt_cache(model, workspace, render_list, model_type, device)
         generator = torch.Generator(device=device).manual_seed(int(seed))
