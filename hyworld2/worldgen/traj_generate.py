@@ -4,6 +4,7 @@ import json
 import math
 import os
 import shutil
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from glob import glob
 
@@ -149,10 +150,14 @@ def resolve_gd_checkpoint():
 
 def load_sam3_model(model_path, device, local_files_only=False):
     try:
-        print(f"[HYWorld2 TrajGenerate] Loading SAM3: path={model_path}, device={device}, local_files_only={local_files_only}")
-        model = Sam3Model.from_pretrained(model_path, local_files_only=local_files_only).to(device)
+        started = time.perf_counter()
+        print(f"[HYWorld2 TrajGenerate] Loading SAM3 model: path={model_path}, device={device}, local_files_only={local_files_only}")
+        model = Sam3Model.from_pretrained(model_path, local_files_only=local_files_only)
+        print(f"[HYWorld2 TrajGenerate] SAM3 model weights loaded in {time.perf_counter() - started:.1f}s; moving to {device}")
+        model = model.to(device)
+        print(f"[HYWorld2 TrajGenerate] SAM3 model moved to {device} in {time.perf_counter() - started:.1f}s; loading processor")
         processor = Sam3Processor.from_pretrained(model_path, local_files_only=local_files_only)
-        print("[HYWorld2 TrajGenerate] SAM3 loaded")
+        print(f"[HYWorld2 TrajGenerate] SAM3 loaded in {time.perf_counter() - started:.1f}s")
         return model, processor
     except Exception as exc:
         raise RuntimeError(
@@ -688,7 +693,7 @@ def run_traj_generate(args):
 
                     with open(f"{scene_path}/render_results/view{view_i}/traj{trajectory_i}/camera.json", "w") as write:
                         json.dump(camera_info, write, indent=2)
-            print(f"Total trajectory tasks: {total_trajectories}")
+            print(f"\n[HYWorld2 TrajGenerate] Total trajectory tasks: {total_trajectories}", flush=True)
 
         point = trimesh.PointCloud(vertices=np.array([0, 0, 0]).reshape(1, 3),
                                    colors=np.array([255, 255, 255]).reshape(1, 3))
@@ -697,7 +702,7 @@ def run_traj_generate(args):
 
         # ======================================== Stage2: Navmesh Trajectory Generation ========================================
         if args.apply_nav_traj:
-            print(f"Stage2: Start navigation trajectory generation for scene: {scene_path.split('/')[-1]}")
+            print(f"[HYWorld2 TrajGenerate] Stage2: Start navigation trajectory generation for scene: {scene_path.split('/')[-1]}", flush=True)
             camera_dir = f"{scene_path}/camera_trajectory"
             os.makedirs(camera_dir, exist_ok=True)
 
@@ -724,24 +729,38 @@ def run_traj_generate(args):
                 valid_directions_vis = []
                 seen_pairs = set()
 
-                print(f"SAM3 process for {scene_path}...")
+                sam_batches = [
+                    [obj for obj in unique_objects[i: i + SAM_BATCH_SIZE] if len(obj.split()) < 8 and obj.lower() not in ("sun")]
+                    for i in range(0, len(unique_objects), SAM_BATCH_SIZE)
+                ]
+                sam_batches = [batch for batch in sam_batches if batch]
+                print(
+                    f"[HYWorld2 TrajGenerate] SAM3 segmentation start: scene={scene_path}, "
+                    f"objects={len(unique_objects)}, batches={len(sam_batches)}, image={img_w}x{img_h}"
+                )
                 if sam3_model is None or sam3_processor is None:
                     sam3_model, sam3_processor = load_sam3_model(
                         args.sam3_path,
                         device,
                         local_files_only=args.local_files_only,
                     )
-                for i in range(0, len(unique_objects), SAM_BATCH_SIZE):
-                    batch_objects = unique_objects[i: i + SAM_BATCH_SIZE]
-                    batch_objects = [obj for obj in batch_objects if len(obj.split()) < 8 and obj.lower() not in ("sun")]
+                for batch_index, batch_objects in enumerate(sam_batches, start=1):
                     batch_images = [full_img] * len(batch_objects)
-                    if len(batch_objects) == 0:
-                        continue
+                    print(
+                        f"[HYWorld2 TrajGenerate] SAM3 batch {batch_index}/{len(sam_batches)}: "
+                        f"{batch_objects}"
+                    )
+                    batch_started = time.perf_counter()
                     with timer.track("SAM3 segmentation"):
                         inputs = sam3_processor(images=batch_images, text=batch_objects, return_tensors="pt").to(device)
                         with torch.no_grad():
                             outputs = sam3_model(**inputs)
                         results = sam3_processor.post_process_instance_segmentation(outputs, threshold=0.4, mask_threshold=0.5, target_sizes=[full_img.size[::-1]] * len(batch_objects))
+                    raw_masks = sum(len(res.get("masks", [])) for res in results)
+                    print(
+                        f"[HYWorld2 TrajGenerate] SAM3 batch {batch_index}/{len(sam_batches)} complete: "
+                        f"raw_masks={raw_masks}, elapsed={time.perf_counter() - batch_started:.1f}s"
+                    )
 
                     no_cluster_num = 0
                     with timer.track("Processing object masks (filtering)"):
