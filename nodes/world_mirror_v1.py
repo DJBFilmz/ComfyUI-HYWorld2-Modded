@@ -1686,7 +1686,7 @@ class VNCCS_BackgroundPreview:
                 "camera_intrinsics": ("TENSOR", {
                     "tooltip": "Optional: camera intrinsics tensor from WorldMirror V2. Used for viewer FOV."
                 }),
-                "coordinate_basis": (["auto", "worldmirror", "hyworld2_worldgen", ""], {
+                "coordinate_basis": (["auto", "worldmirror", "hyworld2_worldgen"], {
                     "default": "auto",
                     "tooltip": "Coordinate basis of the PLY/camera tensors. Use hyworld2_worldgen for official HYWorld2 trainer outputs."
                 }),

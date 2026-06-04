@@ -14,6 +14,61 @@ const EXTENSION_FOLDER = (() => {
 
 console.log("[VNCCS.GaussianPreview] Loading extension...");
 
+const COORDINATE_BASIS_VALUES = new Set(["auto", "worldmirror", "hyworld2_worldgen"]);
+
+function normalizeCoordinateBasis(value) {
+    return COORDINATE_BASIS_VALUES.has(value) ? value : "auto";
+}
+
+function getCoordinateBasisWidget(node) {
+    return node.widgets?.find((w) => w.name === "coordinate_basis");
+}
+
+function getConfiguredCoordinateBasis(node, data) {
+    const widget = getCoordinateBasisWidget(node);
+    const widgetIndex = widget && node.widgets ? node.widgets.indexOf(widget) : -1;
+    const widgetValue = widgetIndex >= 0 ? data?.widgets_values?.[widgetIndex] : undefined;
+    const propertyValue = data?.properties?.coordinate_basis ?? node.properties?.coordinate_basis;
+    if (COORDINATE_BASIS_VALUES.has(widgetValue)) {
+        return widgetValue;
+    }
+    if (COORDINATE_BASIS_VALUES.has(propertyValue)) {
+        return propertyValue;
+    }
+    if (COORDINATE_BASIS_VALUES.has(widget?.value)) {
+        return widget.value;
+    }
+    return "auto";
+}
+
+function ensureCoordinateBasisWidget(node, value) {
+    const widget = getCoordinateBasisWidget(node);
+    if (!widget) {
+        return;
+    }
+    widget.serialize = true;
+    widget.options = widget.options || {};
+    widget.options.serialize = true;
+    node.properties = node.properties || {};
+    const nextValue = normalizeCoordinateBasis(value ?? node.properties.coordinate_basis ?? widget.value);
+    widget.value = nextValue;
+    node.properties.coordinate_basis = nextValue;
+
+    if (!widget._vnccsCoordinateBasisPersistent) {
+        const originalCallback = widget.callback;
+        widget.callback = function (newValue, ...args) {
+            const normalized = normalizeCoordinateBasis(newValue);
+            widget.value = normalized;
+            node.properties = node.properties || {};
+            node.properties.coordinate_basis = normalized;
+            if (originalCallback) {
+                return originalCallback.call(this, normalized, ...args);
+            }
+        };
+        widget._vnccsCoordinateBasisPersistent = true;
+    }
+}
+
 app.registerExtension({
     name: "vnccs.gaussianpreview",
 
@@ -24,6 +79,7 @@ app.registerExtension({
             const onNodeCreated = nodeType.prototype.onNodeCreated;
             nodeType.prototype.onNodeCreated = function () {
                 const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
+                ensureCoordinateBasisWidget(this);
 
                 // Create container for viewer + info panel
                 const container = document.createElement("div");
@@ -173,7 +229,7 @@ app.registerExtension({
                         const previewType = message.preview_type?.[0] || type;
                         const previewSizeMb = message.preview_file_size_mb?.[0] || fileSizeMb;
                         const previewFormat = message.preview_format?.[0] || "ply";
-                        const coordinateBasis = message.coordinate_basis?.[0] || "worldmirror";
+                        const coordinateBasis = normalizeCoordinateBasis(message.coordinate_basis?.[0]);
 
                         // Extract camera parameters if provided
                         const extrinsics = message.extrinsics?.[0] || null;
@@ -235,6 +291,29 @@ app.registerExtension({
                     }
                 };
 
+                return r;
+            };
+
+            const onConfigure = nodeType.prototype.onConfigure;
+            nodeType.prototype.onConfigure = function (data) {
+                const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
+                ensureCoordinateBasisWidget(this, getConfiguredCoordinateBasis(this, data));
+                return r;
+            };
+
+            const onSerialize = nodeType.prototype.onSerialize;
+            nodeType.prototype.onSerialize = function (data) {
+                const r = onSerialize ? onSerialize.apply(this, arguments) : undefined;
+                ensureCoordinateBasisWidget(this);
+                const widget = this.widgets?.find((w) => w.name === "coordinate_basis");
+                if (widget && data?.widgets_values) {
+                    const widgetIndex = this.widgets.indexOf(widget);
+                    if (widgetIndex >= 0) {
+                        data.widgets_values[widgetIndex] = widget.value || "auto";
+                    }
+                }
+                data.properties = data.properties || {};
+                data.properties.coordinate_basis = widget?.value || "auto";
                 return r;
             };
         }
