@@ -179,6 +179,12 @@ def multi_gpu_point_rendering(image, Ks, w2cs, render_points, render_colors, ima
     pcd_renders = torch.cat(pcd_renders, dim=0).to(torch.float32)  # [f,3,h,w]
     pcd_mask = torch.cat(pcd_mask, dim=0).to(torch.float32)  # [f,1,h,w]
 
+    if int(device_num) <= 1 or not dist.is_available() or not dist.is_initialized():
+        if replace_first_frame:
+            pcd_renders[0:1] = image_tensor.to(device=pcd_renders.device, dtype=pcd_renders.dtype)
+            pcd_mask[0:1] = 0
+        return pcd_renders, pcd_mask
+
     dist.barrier()
     dist.all_gather(gather_pcd_renders_r, pcd_renders[:, 0:1].contiguous())
     dist.all_gather(gather_pcd_renders_g, pcd_renders[:, 1:2].contiguous())

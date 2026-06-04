@@ -1112,6 +1112,7 @@ def _parse_qwenvl_objects(text):
 
 def _ensure_trajectory_planner_context(
     workspace,
+    scene_type,
     apply_nav_traj,
     force_vlm,
     qwen_model_id,
@@ -1131,6 +1132,9 @@ def _ensure_trajectory_planner_context(
     pano_tensor = _pil_list_to_image_tensor([panorama])
     qwen = HYWorld2QwenVL()
     written = {}
+    requested_scene_type = str(scene_type or "auto").lower()
+    if requested_scene_type not in ("auto", "indoor", "outdoor"):
+        requested_scene_type = "auto"
     print(f"[HYWorld2 Trajectories] Planner context: scene={scene}")
     print(f"[HYWorld2 Trajectories] Planner context: QwenVL model={qwen_model_id}, quantization={qwen_quantization}, device={qwen_device}, cpu_offload={bool(qwen_cpu_offload)}")
 
@@ -1141,15 +1145,23 @@ def _ensure_trajectory_planner_context(
             loaded = json.load(handle)
         if isinstance(loaded, dict):
             meta.update(loaded)
-    if str(meta.get("scene_type", "unknown")).lower() not in ("indoor", "outdoor"):
-        print(f"[HYWorld2 Trajectories] Planner context: classifying scene_type -> {meta_path}")
+    if requested_scene_type in ("indoor", "outdoor"):
+        if str(meta.get("scene_type", "")).lower() != requested_scene_type:
+            meta["scene_type"] = requested_scene_type
+            with open(meta_path, "w", encoding="utf-8") as handle:
+                json.dump(meta, handle, indent=2)
+            written["meta_info"] = str(meta_path)
+        print(f"[HYWorld2 Trajectories] Planner context: using manual scene_type={requested_scene_type}")
+    elif str(meta.get("scene_type", "unknown")).lower() not in ("indoor", "outdoor"):
+        print(f"[HYWorld2 Trajectories] Planner context: classifying scene_type from 480px preview -> {meta_path}")
+        scene_type_tensor = _pil_list_to_image_tensor([_qwenvl_preview_image(panorama, max_image_edge=480)])
         text = qwen._generate(
             qwen_model_id,
             get_qwen_caption_format("env_cls"),
-            images=pano_tensor,
+            images=scene_type_tensor,
             device=qwen_device,
             max_new_tokens=min(int(qwen_max_new_tokens), 64),
-            max_image_edge=int(qwen_max_image_edge),
+            max_image_edge=480,
             quantization=qwen_quantization,
             attention_mode=qwen_attention_mode,
             temperature=0.2,
@@ -1167,6 +1179,7 @@ def _ensure_trajectory_planner_context(
         print(f"[HYWorld2 Trajectories] Planner context: scene_type={meta['scene_type']}")
     else:
         print(f"[HYWorld2 Trajectories] Planner context: reusing scene_type={meta.get('scene_type')} from {meta_path}")
+    workspace["scene_type"] = str(meta.get("scene_type", workspace.get("scene_type", "unknown"))).lower()
 
     objects_path = scene / "objects.json"
     if apply_nav_traj and not objects_path.exists():
@@ -1674,6 +1687,7 @@ class HYWorld2Trajectories:
             "optional": {
                 "skip_existing": ("BOOLEAN", {"default": True}),
                 "seed": ("INT", {"default": 1024, "min": 0, "max": 2**31 - 1}),
+                "scene_type": (["auto", "indoor", "outdoor"], {"default": "auto"}),
                 "apply_nav_traj": ("BOOLEAN", {"default": False}),
                 "qwen_model_id": (_qwenvl_model_names(), {"default": HYWORLD2_QWENVL_DEFAULT}),
                 "qwen_quantization": (HYWORLD2_QWENVL_QUANTIZATION, {"default": "None (FP16)"}),
@@ -1712,6 +1726,7 @@ class HYWorld2Trajectories:
         mode,
         skip_existing=True,
         seed=1024,
+        scene_type="auto",
         fov_x=120.0,
         fov_y=90.0,
         split_view_num=3,
@@ -1783,6 +1798,7 @@ class HYWorld2Trajectories:
         print("[HYWorld2 Trajectories] Stage 1/5: preparing local QwenVL planner context")
         planner_written = _ensure_trajectory_planner_context(
             workspace,
+            scene_type=scene_type,
             apply_nav_traj=bool(apply_nav_traj),
             force_vlm=bool(force_vlm),
             qwen_model_id=qwen_model_id,
