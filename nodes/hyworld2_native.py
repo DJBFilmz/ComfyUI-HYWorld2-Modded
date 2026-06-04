@@ -2,6 +2,7 @@ import contextlib
 import gc
 import json
 import os
+import shutil
 import sys
 from argparse import Namespace
 from pathlib import Path
@@ -253,6 +254,26 @@ def _ensure_dir(path):
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _hyworld2_missing_memory_prerequisites(scene):
+    scene = Path(scene)
+    render_root = scene / "render_results"
+    required_files = [
+        scene / "meta_info.json",
+        render_root / "global_pcd.ply",
+        render_root / "sky_mask.png",
+        render_root / "full_depth_prediction.pt",
+        render_root / "pano_bank" / "cameras.json",
+    ]
+    missing = [str(path) for path in required_files if not path.is_file()]
+    pano_images = sorted((render_root / "pano_bank" / "images").glob("*.png"))
+    pano_depths = sorted((render_root / "pano_bank" / "depths").glob("*.png"))
+    if not pano_images:
+        missing.append(str(render_root / "pano_bank" / "images" / "*.png"))
+    if not pano_depths:
+        missing.append(str(render_root / "pano_bank" / "depths" / "*.png"))
+    return missing
 
 
 def _release_model_memory(label="HYWorld2"):
@@ -1289,9 +1310,10 @@ def _make_anchor_scan_c2ws(anchor_c2w, nframe, yaw_degrees):
             0.0,
         ], dtype=np.float64)
         forward = forward / max(np.linalg.norm(forward), 1e-8)
-        right = np.cross(forward, up)
+        cam_up = -up
+        right = np.cross(cam_up, forward)
         right = right / max(np.linalg.norm(right), 1e-8)
-        cam_up = np.cross(right, forward)
+        cam_up = np.cross(forward, right)
         cam_up = cam_up / max(np.linalg.norm(cam_up), 1e-8)
         c2w = np.eye(4, dtype=np.float64)
         c2w[:3, 0] = right
@@ -1343,6 +1365,14 @@ def _write_anchor_scans(scene, topk, min_distance, min_separation, yaw_degrees, 
         K = np.asarray(data["intrinsic"][0], dtype=np.float64)
         c2ws = _make_anchor_scan_c2ws(candidate["c2w"], nframe, yaw_degrees)
         w2cs = np.linalg.inv(c2ws)
+        dets = np.linalg.det(w2cs[:, :3, :3])
+        up_z = c2ws[:, 2, 1]
+        if np.any(dets < 0.9) or np.any(dets > 1.1) or np.any(up_z > -0.5):
+            raise RuntimeError(
+                "HYWorld2 anchor scan generated invalid camera orientation "
+                f"for {candidate['path']}: det_range=({float(dets.min()):.4f}, {float(dets.max()):.4f}), "
+                f"up_z_range=({float(up_z.min()):.4f}, {float(up_z.max()):.4f})."
+            )
         K_pano = K.copy()
         K_pano[0, :] /= image_w
         K_pano[1, :] /= image_h
@@ -1721,6 +1751,27 @@ class HYWorld2Trajectories:
     FUNCTION = "run"
     CATEGORY = "VNCCS/HYWorld2"
 
+    @classmethod
+    def IS_CHANGED(cls, workspace, mode, **kwargs):
+        scene = Path(workspace["scene_dir"])
+        watched = [
+            scene / "panorama.png",
+            scene / "meta_info.json",
+            scene / "objects.json",
+            scene / "render_results" / "global_pcd.ply",
+            scene / "render_results" / "full_depth_prediction.pt",
+            scene / "render_results" / "sky_mask.png",
+            scene / "render_results" / "pano_bank" / "cameras.json",
+        ]
+        state = [str(scene), str(mode)]
+        for path in watched:
+            if path.exists():
+                stat = path.stat()
+                state.append(f"{path}:{stat.st_mtime_ns}:{stat.st_size}")
+            else:
+                state.append(f"{path}:missing")
+        return "|".join(state)
+
     def _sort(self, workspace, generated=False, captions_written=None, anchor_scans_written=None, logs=None):
         from hyworld2.worldgen.src.data_utils import sort_trajs
 
@@ -1796,7 +1847,15 @@ class HYWorld2Trajectories:
         anchor_scan_yaw_degrees=360.0,
     ):
         if mode == "reuse_existing":
-            print(f"[HYWorld2 Trajectories] Reusing existing trajectory renders from {Path(workspace['scene_dir']) / 'render_results'}")
+            scene = Path(workspace["scene_dir"])
+            missing = _hyworld2_missing_memory_prerequisites(scene)
+            if missing:
+                raise FileNotFoundError(
+                    "HYWorld2 Trajectories cannot reuse this workspace because required base geometry is missing. "
+                    "Run HYWorld2 Trajectories in generate_and_render_official mode first. Missing:\n"
+                    + "\n".join(f"- {path}" for path in missing)
+                )
+            print(f"[HYWorld2 Trajectories] Reusing existing trajectory renders from {scene / 'render_results'}")
             return self._sort(workspace, generated=False)
         if mode != "generate_and_render_official":
             raise ValueError(f"Unsupported HYWorld2 Trajectories mode: {mode}")
@@ -1804,8 +1863,15 @@ class HYWorld2Trajectories:
 
         scene = Path(workspace["scene_dir"])
         render_root = scene / "render_results"
+        render_root_existed = render_root.exists()
         _ensure_dir(render_root)
         logs = []
+        missing_geometry = _hyworld2_missing_memory_prerequisites(scene)
+        if skip_exist and missing_geometry and render_root_existed:
+            print("[HYWorld2 Trajectories] Existing render_results is incomplete; forcing geometry/trajectory rebuild.")
+            for path in missing_geometry:
+                print(f"[HYWorld2 Trajectories] Missing prerequisite: {path}")
+            skip_exist = False
         print("[HYWorld2 Trajectories] Stage 0/5: official trajectory pipeline")
         print(f"[HYWorld2 Trajectories] Workspace: {scene}")
         print(f"[HYWorld2 Trajectories] SAM3 repo/path: {sam3_path or HYWORLD2_SAM3_REPO_ID}")
@@ -1953,6 +2019,7 @@ class HYWorld2MemoryBank:
         return {
             "required": {
                 "workspace": ("HYWORLD2_WORKSPACE",),
+                "trajectory_set": ("HYWORLD2_TRAJECTORY_SET",),
                 "mode": (["initialize", "load_cached"], {"default": "initialize"}),
             },
             "optional": {
@@ -1966,17 +2033,38 @@ class HYWorld2MemoryBank:
             },
         }
 
-    RETURN_TYPES = ("HYWORLD2_MEMORY_BANK", "STRING")
-    RETURN_NAMES = ("memory_bank", "info")
+    RETURN_TYPES = ("HYWORLD2_MEMORY_BANK", "STRING", "IMAGE")
+    RETURN_NAMES = ("memory_bank", "info", "memory_images")
     FUNCTION = "run"
     CATEGORY = "VNCCS/HYWorld2"
 
-    def run(self, workspace, mode, image_width=0, image_height=0, nframe=0, max_reference=8, align_nframe=8, downsampled_pts=2_000_000, kb_anomaly_percentile=90.0):
+    def run(self, workspace, trajectory_set, mode, image_width=0, image_height=0, nframe=0, max_reference=8, align_nframe=8, downsampled_pts=2_000_000, kb_anomaly_percentile=90.0):
         _hy_log("Memory Bank", f"Stage 1/3: initializing memory bank (mode={mode})")
         _ensure_worldgen_path()
         from hyworld2.worldgen.src.retrieval_wm import PanoramaMemoryBank
 
         scene = Path(workspace["scene_dir"])
+        traj_workspace = trajectory_set.get("workspace", {}) if isinstance(trajectory_set, dict) else {}
+        traj_scene = Path(traj_workspace.get("scene_dir", scene))
+        if traj_scene.resolve() != scene.resolve():
+            raise ValueError(
+                "HYWorld2 Memory Bank got workspace and trajectory_set from different scene directories:\n"
+                f"- workspace: {scene}\n"
+                f"- trajectory_set: {traj_scene}"
+            )
+        if int(trajectory_set.get("count", 0)) <= 0:
+            raise ValueError(
+                "HYWorld2 Memory Bank requires a non-empty HYWorld2 Trajectories output. "
+                "Connect HYWorld2 Trajectories.trajectory_set and run generate_and_render_official first."
+            )
+        missing = _hyworld2_missing_memory_prerequisites(scene)
+        if missing:
+            raise FileNotFoundError(
+                "HYWorld2 Memory Bank requires completed HYWorld2 Trajectories base geometry before initialization. "
+                "Connect HYWorld2 Trajectories.trajectory_set to this node so Comfy executes trajectories before Memory Bank. "
+                "Missing:\n"
+                + "\n".join(f"- {path}" for path in missing)
+            )
         if image_width <= 0 or image_height <= 0:
             _hy_log("Memory Bank", "Stage 2/3: resolving image size from trajectory start frame or panorama")
             from imagesize import get as image_size
@@ -2009,14 +2097,19 @@ class HYWorld2MemoryBank:
             kb_anomaly_percentile=float(kb_anomaly_percentile),
         )
         state = {"workspace": workspace, "bank": bank, "device": str(device), "image_width": int(image_width), "image_height": int(image_height)}
+        memory_images = _pil_list_to_image_tensor(getattr(bank, "ref_frames", []))
+        if memory_images.numel() == 0:
+            memory_images = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
         info = {
             "scene_dir": str(scene),
             "device": str(device),
             "memory_size": int(bank.mem_size),
             "results_path": bank.results_path,
+            "memory_image_count": int(memory_images.shape[0]),
+            "memory_frame_names_preview": list(getattr(bank, "fnames", []))[:16],
         }
         _hy_log("Memory Bank", f"Memory bank ready: memory_size={int(bank.mem_size)}, results_path={bank.results_path}")
-        return (state, _safe_json_dumps(info))
+        return (state, _safe_json_dumps(info), memory_images)
 
 
 class HYWorld2WorldExpansion:
@@ -2271,6 +2364,12 @@ class HYWorld2PrepareWorldMirrorBatch:
         _hy_log("Prepare WorldMirror Batch", "Stage 1/4: preparing WorldMirror export batch")
         bank = memory_bank["bank"]
         world_mirror_dir = Path(bank.root_path) / "render_results" / bank.results_path / "world_mirror_data"
+        render_root = (Path(bank.root_path) / "render_results" / bank.results_path).resolve()
+        world_mirror_resolved = world_mirror_dir.resolve()
+        if world_mirror_dir.exists():
+            if render_root not in world_mirror_resolved.parents:
+                raise RuntimeError(f"Refusing to clear unexpected WorldMirror directory: {world_mirror_dir}")
+            shutil.rmtree(world_mirror_dir)
         images_dir = _ensure_dir(world_mirror_dir / "images")
         _hy_log("Prepare WorldMirror Batch", f"WorldMirror directory: {world_mirror_dir}")
         cameras = {"num_cameras": 0, "extrinsics": [], "intrinsics": []}
