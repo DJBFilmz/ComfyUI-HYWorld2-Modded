@@ -15,25 +15,33 @@ except ImportError:
     from src.sp_utils.parallel_states import get_parallel_state
     from src.general_utils import rank0_log
 import einops
+import importlib
 
-# Auto-detect Flash Attention availability; priority: flash3 > flash2 > SDPA
-try:
-    from flash_attn_interface import flash_attn_func as flash_attn_3_func
 
-    flash_attn_func = flash_attn_3_func
-    FLASH_ATTN_AVAILABLE = True
-    rank0_log("********************Using Flash Attention 3********************")
-except ImportError:
-    try:
-        from flash_attn import flash_attn_func as flash_attn_2_func
+def _load_flash_attn_backend():
+    for label, module_name in (("3", "flash_attn_interface"), ("2", "flash_attn")):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        func = getattr(module, "flash_attn_func", None)
+        origin = getattr(module, "__file__", None) or "<unknown origin>"
+        if callable(func):
+            rank0_log(f"********************Using Flash Attention {label} ({origin})********************")
+            return True, func
+        rank0_log(
+            f"********************Flash Attention {label} module found but flash_attn_func is not callable ({origin}); using SDPA********************",
+            "WARNING",
+        )
+    rank0_log("********************Flash Attention NOT available, using SDPA********************")
+    return False, None
 
-        flash_attn_func = flash_attn_2_func
-        FLASH_ATTN_AVAILABLE = True
-        rank0_log("********************Using Flash Attention 2********************")
-    except ImportError:
-        FLASH_ATTN_AVAILABLE = False
-        flash_attn_func = None
-        rank0_log("********************Flash Attention NOT available, using SDPA********************")
+
+FLASH_ATTN_AVAILABLE, flash_attn_func = _load_flash_attn_backend()
+
+
+def _can_use_flash_attn():
+    return FLASH_ATTN_AVAILABLE and callable(flash_attn_func)
 
 
 class WanAttnProcessorSP:
@@ -110,7 +118,7 @@ class WanAttnProcessorSP:
             # Apply backend-specific preprocess_qkv
             query, key, value = qkv.chunk(3, dim=0)
 
-        if FLASH_ATTN_AVAILABLE:
+        if _can_use_flash_attn():
             hidden_states = flash_attn_func(
                 query,
                 key,
@@ -203,7 +211,7 @@ class SimpleAttnProcessor2_0:
             # Apply backend-specific preprocess_qkv
             query, key, value = qkv.chunk(3, dim=0)  # [1,l,head/sp,c]
 
-        if FLASH_ATTN_AVAILABLE:
+        if _can_use_flash_attn():
             hidden_states = flash_attn_func(
                 query.to(torch.bfloat16),
                 key.to(torch.bfloat16),
@@ -429,7 +437,7 @@ class RefAttnProcessor2_0:
             combine_key = einops.rearrange(combine_key, "b f h w n c -> (b f) (h w) n c")
             combine_value = einops.rearrange(combine_value, "b f h w n c -> (b f) (h w) n c")
 
-            if FLASH_ATTN_AVAILABLE:
+            if _can_use_flash_attn():
                 hidden_states = flash_attn_func(
                     combine_query,
                     combine_key,
@@ -437,11 +445,11 @@ class RefAttnProcessor2_0:
                     softmax_scale=head_dim ** -0.5,
                     causal=False)
             else:
-                query = query.transpose(1, 2)  # [b,head,l,c]
-                key = key.transpose(1, 2)
-                value = value.transpose(1, 2)
+                combine_query = combine_query.transpose(1, 2)  # [b,head,l,c]
+                combine_key = combine_key.transpose(1, 2)
+                combine_value = combine_value.transpose(1, 2)
                 hidden_states = F.scaled_dot_product_attention(
-                    query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+                    combine_query, combine_key, combine_value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
                 )
                 hidden_states = hidden_states.transpose(1, 2)
 
@@ -456,21 +464,27 @@ class RefAttnProcessor2_0:
             hidden_states = all_to_all_4D(hidden_states, group=parallel_dims.sp_group, scatter_dim=1, gather_dim=2)  # [1, seq_len_per_sp_rank, num_heads, head_dim]
             ref_states = all_to_all_4D(ref_states, group=parallel_dims.sp_group, scatter_dim=1, gather_dim=2)  # [1, seq_len_per_sp_rank, num_heads, head_dim]
         else:
-            if FLASH_ATTN_AVAILABLE:
+            ref_f = ref_query.shape[1]
+            combine_query = torch.cat([ref_query, query], dim=1)
+            combine_key = torch.cat([ref_key, key], dim=1)
+            combine_value = torch.cat([ref_value, value], dim=1)
+            if _can_use_flash_attn():
                 hidden_states = flash_attn_func(
-                    query,
-                    key,
-                    value,
+                    combine_query,
+                    combine_key,
+                    combine_value,
                     softmax_scale=head_dim ** -0.5,
                     causal=False)
             else:
-                query = query.transpose(1, 2)  # [b,head,l,c]
-                key = key.transpose(1, 2)
-                value = value.transpose(1, 2)
+                combine_query = combine_query.transpose(1, 2)  # [b,head,l,c]
+                combine_key = combine_key.transpose(1, 2)
+                combine_value = combine_value.transpose(1, 2)
                 hidden_states = F.scaled_dot_product_attention(
-                    query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+                    combine_query, combine_key, combine_value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
                 )
                 hidden_states = hidden_states.transpose(1, 2)
+            ref_states = hidden_states[:, :ref_f]
+            hidden_states = hidden_states[:, ref_f:]
 
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
@@ -649,7 +663,7 @@ class WanAttnProcessorSparseSpatialSP:
         combine_key = torch.cat([ref_key, key], dim=1)
         combine_value = torch.cat([ref_value, value], dim=1)
 
-        if FLASH_ATTN_AVAILABLE:
+        if _can_use_flash_attn():
             hidden_states = flash_attn_func(
                 combine_query,
                 combine_key,

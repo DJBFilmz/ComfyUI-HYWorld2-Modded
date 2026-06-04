@@ -6,13 +6,14 @@ import numpy as np
 from openai import OpenAI
 
 from .general_utils import load_video
+from .json_utils import loads_repaired
 
 negative_prompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走，阳光，明亮"
 
 
 def parse_selected_indices_and_reasons(text):
     try:
-        data = json.loads(text)
+        data = loads_repaired(text)
         if "selected_images" in data:
             selected = data.get("selected_images", [])
         elif "sorted_images" in data:
@@ -29,7 +30,7 @@ def parse_selected_indices_and_reasons(text):
 
 def parse_image_descriptions(text):
     try:
-        data = json.loads(text)
+        data = loads_repaired(text)
         descriptions = data.get("image_descriptions", [])
         return descriptions
     except Exception as e:

@@ -35,6 +35,7 @@ dependencies = [
     "cupy-cuda13x",
     "zim-anything",
     "openai",
+    "json-repair",
     "utils3d",
 ]
 

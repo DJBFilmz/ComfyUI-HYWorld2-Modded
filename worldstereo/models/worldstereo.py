@@ -617,13 +617,22 @@ class WorldStereoRefSModel(WanTransformer3DModel):
         ]
 
         ref_index = ref_index if ref_index is not None else 0
+        if isinstance(ref_index, torch.Tensor):
+            ref_index = int(ref_index.flatten()[0].detach().cpu().item()) if ref_index.numel() > 0 else 0
+        elif isinstance(ref_index, (list, tuple)):
+            ref_index = int(ref_index[0]) if ref_index else 0
+        else:
+            ref_index = int(ref_index)
+        reference_frame_count = int(reference_latent.shape[2]) if isinstance(reference_latent, torch.Tensor) and reference_latent.ndim >= 3 else 1
         # Use ref_index to select specific frames from ref_rotary_emb
         ref_rotary_emb_0 = tmp_rotary_emb_0[:, :, :, post_patch_width:]  # b f h w n c
         ref_rotary_emb_1 = tmp_rotary_emb_1[:, :, :, post_patch_width:]  # b f h w n c
-        # Use ref_index to select specific frames from ref_rotary_emb
+        ref_start = max(0, min(ref_index + 1, int(ref_rotary_emb_0.shape[1]) - 1))
+        ref_indices = torch.arange(ref_start, ref_start + max(1, reference_frame_count), device=ref_rotary_emb_0.device)
+        ref_indices = ref_indices.clamp_(0, int(ref_rotary_emb_0.shape[1]) - 1).long()
         ref_rotary_emb = [
-            einops.rearrange(ref_rotary_emb_0[:, ref_index + 1 : ref_index + 2], "b f h w n c -> b (f h w) n c"),  # ref_index + 1, 0~19-->1~20
-            einops.rearrange(ref_rotary_emb_1[:, ref_index + 1 : ref_index + 2], "b f h w n c -> b (f h w) n c")
+            einops.rearrange(ref_rotary_emb_0.index_select(1, ref_indices), "b f h w n c -> b (f h w) n c"),
+            einops.rearrange(ref_rotary_emb_1.index_select(1, ref_indices), "b f h w n c -> b (f h w) n c")
         ]
 
         hidden_states = self.patch_embedding(hidden_states)

@@ -16,7 +16,6 @@ import torchvision.transforms as transforms
 import trimesh
 from PIL import Image
 from moge.model.v2 import MoGeModel
-from openai import OpenAI
 from scipy.spatial import cKDTree
 from tqdm import tqdm
 from transformers import Sam3Processor, Sam3Model
@@ -30,8 +29,6 @@ try:
         project_center_to_3d,
         get_max_size_center,
         save_visualization,
-        pil_image_to_base64,
-        get_navigation_instruction,
         deduplicate_ordered,
         get_bearing_and_direction,
         get_topk_seg_data,
@@ -57,7 +54,7 @@ try:
     )
     from .src.pointcloud import point_rendering
     from .src.seg_utils import get_zim_mask, build_gd_model, build_zim_model
-    from .src.vlm_utils import get_qwen_caption_format
+    from .src.json_utils import load_repaired
 except ImportError:
     from src.camera_utils import add_scene_cam, get_c2w, CAM_COLORS, interpolate_poses, compute_lookat_xy_angle
     from src.general_utils import save_16bit_png_depth, set_seed, adjust_image_size, Timer, rank0_log
@@ -67,8 +64,6 @@ except ImportError:
         project_center_to_3d,
         get_max_size_center,
         save_visualization,
-        pil_image_to_base64,
-        get_navigation_instruction,
         deduplicate_ordered,
         get_bearing_and_direction,
         get_topk_seg_data,
@@ -94,7 +89,7 @@ except ImportError:
     )
     from src.pointcloud import point_rendering
     from src.seg_utils import get_zim_mask, build_gd_model, build_zim_model
-    from src.vlm_utils import get_qwen_caption_format
+    from src.json_utils import load_repaired
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 timer = Timer()
@@ -103,11 +98,6 @@ timer = Timer()
 os.environ["no_proxy"] = "localhost,127.0.0.1,0.0.0.0"
 os.environ["NO_PROXY"] = "localhost,127.0.0.1,0.0.0.0"
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
-
-LLM_ADDR = "localhost"
-MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct"
-
-LLM_PORT = 8000
 
 SAM_BATCH_SIZE = 4
 MAX_MASK_COUNT = 5
@@ -239,23 +229,14 @@ def build_arg_parser():
     parser.add_argument("--node_rank", type=int, default=0, help="local rank for multi-node")
     parser.add_argument("--node_size", type=int, default=1, help="world size for multi-node")
 
-    # VLM server params
-    parser.add_argument("--llm_addr", type=str, default=LLM_ADDR, help="vLLM server address")
-    parser.add_argument("--llm_port", type=int, default=LLM_PORT, help="vLLM server port")
-    parser.add_argument("--llm_name", type=str, default=MODEL_NAME, help="VLM model name served by vLLM")
     parser.add_argument("--sam3_path", type=str, default=SAM3_REPO_ID, help="SAM3 repo id or local checkpoint path")
     parser.add_argument("--local_files_only", action="store_true", help="Do not download Hugging Face files; use local cache/paths only")
-    parser.add_argument("--reuse_objects_json", action="store_true", help="Use existing objects.json for navigation objects instead of querying the VLM server")
     return parser
 
 
 def run_traj_generate(args):
-    global LLM_ADDR, LLM_PORT, MODEL_NAME, timer
+    global timer
 
-    # Override globals with argparse values
-    LLM_ADDR = args.llm_addr
-    LLM_PORT = args.llm_port
-    MODEL_NAME = args.llm_name
     timer = Timer()
 
     device = torch.device("cuda")
@@ -267,8 +248,6 @@ def run_traj_generate(args):
 
     depth_model = MoGeModel.from_pretrained(MOGE_ID).to(device).eval()
 
-    # VLM client. SAM3 is gated and only needed for object segmentation, so load it lazily.
-    client = OpenAI(api_key="EMPTY", base_url=f"http://{LLM_ADDR}:{LLM_PORT}/v1")
     sam3_model = None
     sam3_processor = None
     print("Models Initializing over.")
@@ -314,27 +293,18 @@ def run_traj_generate(args):
             full_img = full_img.resize((3840, 1920), resample=Image.Resampling.BICUBIC)
         width_origin, height_origin = full_img.size
 
-        # get meta info
-        if os.path.exists(f"{scene_path}/meta_info.json"):
-            with open(f"{scene_path}/meta_info.json", "r") as f:
-                meta_info = json.load(f)
-        else:
-            meta_info = {}
-            base64_image = pil_image_to_base64(full_img)
-            messages = [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": [
-                    {"type": "text", "text": get_qwen_caption_format("env_cls")},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}},
-                ]}
-            ]
-            print(f"Qwen3-VL labeling meta information for {scene_path}...")
-            with timer.track("Qwen3-VL labeling meta information"):
-                response = client.chat.completions.create(model=MODEL_NAME, messages=messages, max_tokens=1024, temperature=0.0, seed=1024)
-                clean_text = response.choices[0].message.content.strip().replace('[', '').replace(']', '').replace('"', '').replace("'", "").replace("```json", "").replace("```", "")
-            meta_info["scene_type"] = clean_text
-            with open(f"{scene_path}/meta_info.json", "w") as write:
-                json.dump(meta_info, write, indent=2)
+        # get meta info prepared by HYWorld2Trajectories. No direct OpenAI/vLLM calls are allowed here.
+        meta_path = f"{scene_path}/meta_info.json"
+        if not os.path.exists(meta_path):
+            raise FileNotFoundError(
+                f"Missing {meta_path}. HYWorld2Trajectories must prepare scene_type via the local QwenVL module before traj_generate."
+            )
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta_info = load_repaired(f)
+        if str(meta_info.get("scene_type", "")).lower() not in ("indoor", "outdoor"):
+            raise ValueError(
+                f"{meta_path} must contain scene_type='indoor' or 'outdoor'; got {meta_info.get('scene_type')!r}."
+            )
 
         os.makedirs(f"{scene_path}/render_results", exist_ok=True)
 
@@ -731,32 +701,19 @@ def run_traj_generate(args):
             camera_dir = f"{scene_path}/camera_trajectory"
             os.makedirs(camera_dir, exist_ok=True)
 
-            # VLM & SAM3
+            # SAM3 segmentation uses objects prepared by HYWorld2Trajectories. No direct OpenAI/vLLM calls are allowed here.
             segmentation_data = []
             unique_objects = []
             objects_json = os.path.join(scene_path, "objects.json")
-            reuse_objects_json = os.path.exists(objects_json) and (args.reuse_objects_json or args.skip_exist)
-            if not reuse_objects_json:
-                try:
-                    base64_image = pil_image_to_base64(full_img)
-                    messages = [
-                        {"role": "system", "content": "You are a robot navigation assistant."},
-                        {"role": "user", "content": [
-                            {"type": "text", "text": get_navigation_instruction(args.force_vlm)},
-                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}},
-                        ]}
-                    ]
-                    print(f"Qwen3-VL labeling for {scene_path}...")
-                    with timer.track("Qwen3-VL labeling objects"):
-                        response = client.chat.completions.create(model=MODEL_NAME, messages=messages, max_tokens=1024, temperature=0.0, seed=1024)
-                        clean_text = response.choices[0].message.content.strip().replace('[', '').replace(']', '').replace('"', '').replace("'", "").replace("```json", "").replace("```", "").replace("-", "_")
-                        unique_objects = deduplicate_ordered([item.strip() for item in clean_text.split(',') if item.strip()])
-                    with open(objects_json, "w") as f:
-                        json.dump(unique_objects, f, indent=4)
-                except Exception as e:
-                    rank0_log(f"  VLM Error: {e}", "ERROR")
-            else:
-                unique_objects = json.load(open(objects_json, "r"))
+            if not os.path.exists(objects_json):
+                raise FileNotFoundError(
+                    f"Missing {objects_json}. HYWorld2Trajectories must prepare navigation objects via the local QwenVL module before traj_generate when apply_nav_traj=True."
+                )
+            with open(objects_json, "r", encoding="utf-8") as f:
+                unique_objects = load_repaired(f)
+            if not isinstance(unique_objects, list):
+                raise ValueError(f"{objects_json} must contain a JSON list of object names.")
+            unique_objects = deduplicate_ordered([str(item).replace("-", "_").strip() for item in unique_objects if str(item).strip()])
 
             # processing object segmentation and masking
             if unique_objects:

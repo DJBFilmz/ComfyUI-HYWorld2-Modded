@@ -928,6 +928,21 @@ def _worldstereo_keyframe_indices(num_frames, device=None):
     return torch.unique_consecutive(indices.clamp(0, int(num_frames) - 1))
 
 
+def _coerce_worldstereo_ref_index(ref_index, max_ref_index):
+    if ref_index is None:
+        value = 0
+    elif isinstance(ref_index, torch.Tensor):
+        value = int(ref_index.flatten()[0].detach().cpu().item()) if ref_index.numel() > 0 else 0
+    elif isinstance(ref_index, (list, tuple)):
+        value = int(ref_index[0]) if ref_index else 0
+    else:
+        value = int(ref_index)
+    max_ref_index = max(0, int(max_ref_index))
+    if max_ref_index < 19:
+        value = int(round(float(value) * (float(max_ref_index) / 19.0)))
+    return max(0, min(value, max_ref_index))
+
+
 def _slice_render_conditioning_to_keyframes(pipeline_kwargs):
     render_video = pipeline_kwargs.get("render_video")
     num_frames = int(pipeline_kwargs.get("num_frames") or 0)
@@ -945,10 +960,8 @@ def _slice_render_conditioning_to_keyframes(pipeline_kwargs):
     camera_qt = pipeline_kwargs.get("camera_qt")
     if isinstance(camera_qt, torch.Tensor) and camera_qt.shape[1] == old_frames:
         pipeline_kwargs["camera_qt"] = camera_qt.index_select(1, keyframe_indices.to(camera_qt.device)).contiguous()
-    ref_index = pipeline_kwargs.get("ref_index")
     max_ref_index = max(0, keyframe_indices.numel() - 2)
-    if isinstance(ref_index, torch.Tensor) and ref_index.numel() > 0 and max_ref_index < 19:
-        pipeline_kwargs["ref_index"] = torch.round(ref_index.float() * (float(max_ref_index) / 19.0)).long().clamp_(0, max_ref_index)
+    pipeline_kwargs["ref_index"] = _coerce_worldstereo_ref_index(pipeline_kwargs.get("ref_index"), max_ref_index)
     print(f"[HYWorld2] Render VAE conditioning sliced to keyframes: {old_frames} -> {pipeline_kwargs['render_video'].shape[2]}")
 
 
@@ -1080,9 +1093,11 @@ def _parse_scene_type(text):
 
 
 def _parse_qwenvl_objects(text):
+    from hyworld2.worldgen.src.json_utils import loads_repaired
+
     raw = str(text or "").strip()
     try:
-        parsed = json.loads(raw.replace("```json", "").replace("```", "").strip())
+        parsed = loads_repaired(raw)
         if isinstance(parsed, list):
             items = parsed
         elif isinstance(parsed, dict):
@@ -1653,7 +1668,9 @@ class HYWorld2QwenVL:
             if mode == "scene_objects":
                 out_path = scene / "hyworld2_qwenvl_scene.json"
                 try:
-                    parsed = json.loads(text)
+                    from hyworld2.worldgen.src.json_utils import loads_repaired
+
+                    parsed = loads_repaired(text)
                 except Exception:
                     parsed = {"raw": text}
                 with open(out_path, "w", encoding="utf-8") as handle:
@@ -1855,12 +1872,8 @@ class HYWorld2Trajectories:
             roof_height_threshold=float(roof_height_threshold),
             node_rank=0,
             node_size=1,
-            llm_addr="localhost",
-            llm_port=8000,
-            llm_name=HYWORLD2_QWENVL_MODELS.get(qwen_model_id, {}).get("repo_id", qwen_model_id),
             sam3_path=sam3_path or HYWORLD2_SAM3_REPO_ID,
             local_files_only=bool(local_files_only),
-            reuse_objects_json=bool(apply_nav_traj),
         )
         traj_generate.run_traj_generate(generate_config)
         logs.append({"stage": "traj_generate", "mode": "native_api"})
