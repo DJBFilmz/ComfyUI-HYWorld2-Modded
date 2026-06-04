@@ -6,19 +6,25 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from glob import glob
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 import torch.distributed as dist
 import torchvision.transforms as transforms
 import trimesh
 from PIL import Image
-from diffusers.utils import export_to_video
 from tqdm import tqdm
 
-from src.general_utils import set_seed, Timer, rank0_log
-from src.distributed_compat import distributed_backend
-from src.pointcloud import multi_gpu_point_rendering
-from src.vlm_utils import get_traj_caption
+try:
+    from .src.general_utils import set_seed, Timer, rank0_log
+    from .src.distributed_compat import distributed_backend
+    from .src.pointcloud import multi_gpu_point_rendering
+    from .src.vlm_utils import get_traj_caption
+except ImportError:
+    from src.general_utils import set_seed, Timer, rank0_log
+    from src.distributed_compat import distributed_backend
+    from src.pointcloud import multi_gpu_point_rendering
+    from src.vlm_utils import get_traj_caption
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 timer = Timer()
@@ -49,7 +55,37 @@ def caption_single_video(args):
         return render_path, False, str(e)
 
 
-if __name__ == '__main__':
+def save_video_cv2(frames, output_path, fps=16):
+    frames = list(frames)
+    if not frames:
+        raise ValueError(f"Cannot save empty video: {output_path}")
+    first = frames[0].convert("RGB")
+    width, height = first.size
+    writer = cv2.VideoWriter(
+        str(output_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(fps),
+        (width, height),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"OpenCV VideoWriter failed to open: {output_path}")
+    try:
+        for frame in frames:
+            image = frame.convert("RGB")
+            if image.size != (width, height):
+                image = image.resize((width, height), Image.Resampling.BICUBIC)
+            arr = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
+            writer.write(arr)
+    finally:
+        writer.release()
+
+
+def _render_barrier(world_size):
+    if int(world_size) > 1 and dist.is_initialized():
+        dist.barrier()
+
+
+def build_arg_parser():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--target_path", default=None, type=str, help="target path")
@@ -70,25 +106,32 @@ if __name__ == '__main__':
         action="store_true",
         help="Skip VLM/LLM trajectory captioning. Re-enable VLM captions for final production prompts.",
     )
+    return parser
 
-    args = parser.parse_args()
+
+def run_traj_render(args, rank=0, world_size=1, local_rank=0):
+    global LLM_ADDR, LLM_PORT, MODEL_NAME, timer
 
     # Override globals with argparse values
     LLM_ADDR = args.llm_addr
     LLM_PORT = args.llm_port
     MODEL_NAME = args.llm_name
+    timer = Timer()
 
-    rank = int(os.getenv("RANK", 0))
-    world_size = int(os.getenv("WORLD_SIZE", 1))
-    local_rank = int(os.getenv("LOCAL_RANK", 0))
+    rank = int(rank)
+    world_size = int(world_size)
+    local_rank = int(local_rank)
     device = torch.device(f"cuda:{local_rank}")
-    device_num = torch.cuda.device_count()
+    device_num = max(1, world_size)
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(
-        backend=distributed_backend(),
-        rank=rank,
-        world_size=world_size,
-    )
+    initialized_dist = False
+    if world_size > 1 and not dist.is_initialized():
+        dist.init_process_group(
+            backend=distributed_backend(),
+            rank=rank,
+            world_size=world_size,
+        )
+        initialized_dist = True
     set_seed(args.seed)
 
     scene_list = [args.target_path] if os.path.exists(f"{args.target_path}/panorama.png") else glob(f"{args.target_path}/*")
@@ -125,7 +168,7 @@ if __name__ == '__main__':
             Ks = torch.tensor(np.array(camera_info["intrinsic"]), dtype=torch.float32)
             w2cs = torch.tensor(np.array(camera_info["extrinsic"]), dtype=torch.float32)
 
-            dist.barrier()
+            _render_barrier(world_size)
 
             # Render the trajectory with multi-GPU point splatting.
             with timer.track("Multi-GPU point rendering"):
@@ -138,7 +181,7 @@ if __name__ == '__main__':
                                                                   render_radius=0.008, points_per_pixel=20,
                                                                   slice_size=4, local_rank=local_rank, replace_first_frame=replace_first_frame)
 
-            dist.barrier()
+            _render_barrier(world_size)
 
             pcd_renders = pcd_renders.to(torch.float32)
             to_pil = transforms.ToPILImage()
@@ -147,10 +190,10 @@ if __name__ == '__main__':
 
             if rank == 0:
                 with timer.track("[IO] Save rendered results"):
-                    export_to_video(render_video, str(traj_dir / "render.mp4"), fps=16)
-                    export_to_video(mask_video, str(traj_dir / "render_mask.mp4"), fps=16)
+                    save_video_cv2(render_video, traj_dir / "render.mp4", fps=16)
+                    save_video_cv2(mask_video, traj_dir / "render_mask.mp4", fps=16)
 
-            dist.barrier()
+            _render_barrier(world_size)
 
         # Caption rendered trajectories with concurrent vLLM requests.
         if rank == 0:
@@ -158,7 +201,7 @@ if __name__ == '__main__':
                 # TEMPORARY TEST MODE: VLM/LLM captions are disabled here.
                 # Re-enable VLM captions for production runs so each trajectory gets a real prompt.
                 rank0_log("VLM trajectory captioning is disabled; WorldStereo must receive manual traj prompts.", "WARNING")
-                dist.barrier()
+                _render_barrier(world_size)
                 if rank == 0:
                     timer.summary()
                 continue
@@ -192,7 +235,22 @@ if __name__ == '__main__':
                 shutil.copy(render_path.replace("traj1", "traj0").replace("render.mp4", "traj_caption.json"),
                             render_path.replace("render.mp4", "traj_caption.json"))
 
-        dist.barrier()
+        _render_barrier(world_size)
 
         if rank == 0:
             timer.summary()
+
+    if initialized_dist:
+        dist.destroy_process_group()
+
+
+def main(argv=None):
+    args = build_arg_parser().parse_args(argv)
+    rank = int(os.getenv("RANK", 0))
+    world_size = int(os.getenv("WORLD_SIZE", 1))
+    local_rank = int(os.getenv("LOCAL_RANK", 0))
+    return run_traj_render(args, rank=rank, world_size=world_size, local_rank=local_rank)
+
+
+if __name__ == '__main__':
+    main()

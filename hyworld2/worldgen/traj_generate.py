@@ -21,42 +21,80 @@ from scipy.spatial import cKDTree
 from tqdm import tqdm
 from transformers import Sam3Processor, Sam3Model
 
-from src.camera_utils import add_scene_cam, get_c2w, CAM_COLORS, interpolate_poses, compute_lookat_xy_angle
-from src.general_utils import save_16bit_png_depth, set_seed, adjust_image_size, Timer, rank0_log
-from src import utils3d_compat as u3d
-from src.navi_utils import (
-    find_robust_center,
-    project_center_to_3d,
-    get_max_size_center,
-    save_visualization,
-    pil_image_to_base64,
-    get_navigation_instruction,
-    deduplicate_ordered,
-    get_bearing_and_direction,
-    get_topk_seg_data,
-    get_mask_edge_points_3d,
-    create_and_save_combined_pcd,
-    process_single_scene,
-    process_trajectories,
-    select_reconstruct_via_fps,
-    filter_and_select_diverse_trajectories,
-    compute_trajectory_similarity_matrix,
-    visualize_comparison
-)
-from src.panorama_utils import (
-    split_panorama_image,
-    split_panorama_depth,
-    rotate_around_z_axis,
-    pred_pano_depth,
-    get_view_point_from_panorama_point,
-    convert_rgbd2pcd_panorama,
-    convert_rgbd2mesh_panorama,
-    smooth_sky_depth_boundary,
-    erp_distance_ray_to_normal
-)
-from src.pointcloud import point_rendering
-from src.seg_utils import get_zim_mask, build_gd_model, build_zim_model
-from src.vlm_utils import get_qwen_caption_format
+try:
+    from .src.camera_utils import add_scene_cam, get_c2w, CAM_COLORS, interpolate_poses, compute_lookat_xy_angle
+    from .src.general_utils import save_16bit_png_depth, set_seed, adjust_image_size, Timer, rank0_log
+    from .src import utils3d_compat as u3d
+    from .src.navi_utils import (
+        find_robust_center,
+        project_center_to_3d,
+        get_max_size_center,
+        save_visualization,
+        pil_image_to_base64,
+        get_navigation_instruction,
+        deduplicate_ordered,
+        get_bearing_and_direction,
+        get_topk_seg_data,
+        get_mask_edge_points_3d,
+        create_and_save_combined_pcd,
+        process_single_scene,
+        process_trajectories,
+        select_reconstruct_via_fps,
+        filter_and_select_diverse_trajectories,
+        compute_trajectory_similarity_matrix,
+        visualize_comparison,
+    )
+    from .src.panorama_utils import (
+        split_panorama_image,
+        split_panorama_depth,
+        rotate_around_z_axis,
+        pred_pano_depth,
+        get_view_point_from_panorama_point,
+        convert_rgbd2pcd_panorama,
+        convert_rgbd2mesh_panorama,
+        smooth_sky_depth_boundary,
+        erp_distance_ray_to_normal,
+    )
+    from .src.pointcloud import point_rendering
+    from .src.seg_utils import get_zim_mask, build_gd_model, build_zim_model
+    from .src.vlm_utils import get_qwen_caption_format
+except ImportError:
+    from src.camera_utils import add_scene_cam, get_c2w, CAM_COLORS, interpolate_poses, compute_lookat_xy_angle
+    from src.general_utils import save_16bit_png_depth, set_seed, adjust_image_size, Timer, rank0_log
+    from src import utils3d_compat as u3d
+    from src.navi_utils import (
+        find_robust_center,
+        project_center_to_3d,
+        get_max_size_center,
+        save_visualization,
+        pil_image_to_base64,
+        get_navigation_instruction,
+        deduplicate_ordered,
+        get_bearing_and_direction,
+        get_topk_seg_data,
+        get_mask_edge_points_3d,
+        create_and_save_combined_pcd,
+        process_single_scene,
+        process_trajectories,
+        select_reconstruct_via_fps,
+        filter_and_select_diverse_trajectories,
+        compute_trajectory_similarity_matrix,
+        visualize_comparison,
+    )
+    from src.panorama_utils import (
+        split_panorama_image,
+        split_panorama_depth,
+        rotate_around_z_axis,
+        pred_pano_depth,
+        get_view_point_from_panorama_point,
+        convert_rgbd2pcd_panorama,
+        convert_rgbd2mesh_panorama,
+        smooth_sky_depth_boundary,
+        erp_distance_ray_to_normal,
+    )
+    from src.pointcloud import point_rendering
+    from src.seg_utils import get_zim_mask, build_gd_model, build_zim_model
+    from src.vlm_utils import get_qwen_caption_format
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 timer = Timer()
@@ -85,12 +123,16 @@ def resolve_hf_checkpoint(repo_id, allow_patterns=None, subfolder=None, required
     """Download a Hugging Face model to the local cache and return its usable path."""
     from huggingface_hub import snapshot_download
 
+    print(f"[HYWorld2 TrajGenerate] Resolving Hugging Face checkpoint: repo={repo_id}, cache_dir={HF_CACHE_DIR}")
+    if allow_patterns:
+        print(f"[HYWorld2 TrajGenerate]   allow_patterns={allow_patterns}")
     repo_root = snapshot_download(
         repo_id=repo_id,
         allow_patterns=allow_patterns,
         cache_dir=HF_CACHE_DIR,
     )
     checkpoint_dir = os.path.join(repo_root, subfolder) if subfolder else repo_root
+    print(f"[HYWorld2 TrajGenerate]   local_path={checkpoint_dir}")
     required_files = required_files or []
     missing_files = [filename for filename in required_files if not os.path.exists(os.path.join(checkpoint_dir, filename))]
     if missing_files:
@@ -117,8 +159,10 @@ def resolve_gd_checkpoint():
 
 def load_sam3_model(model_path, device, local_files_only=False):
     try:
+        print(f"[HYWorld2 TrajGenerate] Loading SAM3: path={model_path}, device={device}, local_files_only={local_files_only}")
         model = Sam3Model.from_pretrained(model_path, local_files_only=local_files_only).to(device)
         processor = Sam3Processor.from_pretrained(model_path, local_files_only=local_files_only)
+        print("[HYWorld2 TrajGenerate] SAM3 loaded")
         return model, processor
     except Exception as exc:
         raise RuntimeError(
@@ -149,7 +193,7 @@ def save_view_initial_data(args_tuple):
     return view_i
 
 
-if __name__ == '__main__':
+def build_arg_parser():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--target_path", default=None, type=str, help="target path")
@@ -202,13 +246,17 @@ if __name__ == '__main__':
     parser.add_argument("--sam3_path", type=str, default=SAM3_REPO_ID, help="SAM3 repo id or local checkpoint path")
     parser.add_argument("--local_files_only", action="store_true", help="Do not download Hugging Face files; use local cache/paths only")
     parser.add_argument("--reuse_objects_json", action="store_true", help="Use existing objects.json for navigation objects instead of querying the VLM server")
+    return parser
 
-    args = parser.parse_args()
+
+def run_traj_generate(args):
+    global LLM_ADDR, LLM_PORT, MODEL_NAME, timer
 
     # Override globals with argparse values
     LLM_ADDR = args.llm_addr
     LLM_PORT = args.llm_port
     MODEL_NAME = args.llm_name
+    timer = Timer()
 
     device = torch.device("cuda")
     set_seed(args.seed)
@@ -1295,3 +1343,12 @@ if __name__ == '__main__':
             scene.export(f"{scene_path}/render_results/cameras_navi.glb")
 
         timer.summary()
+
+
+def main(argv=None):
+    args = build_arg_parser().parse_args(argv)
+    return run_traj_generate(args)
+
+
+if __name__ == '__main__':
+    main()

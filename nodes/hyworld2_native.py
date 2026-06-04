@@ -2,8 +2,8 @@ import contextlib
 import gc
 import json
 import os
-import subprocess
 import sys
+from argparse import Namespace
 from pathlib import Path
 
 import numpy as np
@@ -49,6 +49,7 @@ HYWORLD2_QWENVL_MODELS = {
 HYWORLD2_QWENVL_DEFAULT = "Qwen3-VL-8B-Instruct"
 HYWORLD2_QWENVL_QUANTIZATION = ["None (FP16)", "8-bit (Balanced)", "4-bit (VRAM-friendly)"]
 HYWORLD2_QWENVL_ATTENTION = ["auto", "sage", "flash_attention_2", "sdpa"]
+HYWORLD2_QWENVL_MAX_IMAGE_EDGE = 768
 HYWORLD2_SAM3_REPO_ID = "MIUProject/sam3"
 
 
@@ -103,18 +104,20 @@ def _qwenvl_ensure_model(model_name):
     target = _qwenvl_models_dir() / repo_id.split("/")[-1]
     if target.exists() and target.is_dir():
         if any(target.glob("*.safetensors")) or any(target.glob("*.bin")):
+            print(f"[HYWorld2 QwenVL] Using local model '{model_name}' from {target}")
             return str(target)
     target.mkdir(parents=True, exist_ok=True)
     try:
         from huggingface_hub import snapshot_download
     except Exception as exc:
         raise ImportError("QwenVL auto-download requires huggingface_hub.") from exc
+    print(f"[HYWorld2 QwenVL] Downloading model '{model_name}' from {repo_id} to {target}")
     snapshot_download(
         repo_id=repo_id,
         local_dir=str(target),
-        local_dir_use_symlinks=False,
         ignore_patterns=["*.md", ".git*"],
     )
+    print(f"[HYWorld2 QwenVL] Model ready: {target}")
     return str(target)
 
 
@@ -185,7 +188,7 @@ def _qwenvl_resolve_attention(attention_mode, force_sdpa=False):
     return "sdpa"
 
 
-def _qwenvl_quantization_config(model_name, quantization):
+def _qwenvl_quantization_config(model_name, quantization, cpu_offload=False):
     if _qwenvl_is_fp8(model_name):
         return None, None, True
     quant = str(quantization or "None (FP16)")
@@ -205,8 +208,36 @@ def _qwenvl_quantization_config(model_name, quantization):
             from transformers import BitsAndBytesConfig
         except Exception as exc:
             raise ImportError("QwenVL 8-bit quantization requires transformers BitsAndBytesConfig and bitsandbytes.") from exc
-        return BitsAndBytesConfig(load_in_8bit=True), None, False
+        return BitsAndBytesConfig(load_in_8bit=True, llm_int8_enable_fp32_cpu_offload=bool(cpu_offload)), None, False
     return None, torch.float16 if torch.cuda.is_available() else torch.float32, False
+
+
+def _qwenvl_auto_max_memory():
+    if not torch.cuda.is_available():
+        return None
+    max_memory = {}
+    for idx in range(torch.cuda.device_count()):
+        total_gib = torch.cuda.get_device_properties(idx).total_memory / (1024 ** 3)
+        gpu_limit = max(1, int(max(1.0, total_gib - 3.0)))
+        max_memory[idx] = f"{gpu_limit}GiB"
+    max_memory["cpu"] = "64GiB"
+    return max_memory
+
+
+def _qwenvl_preview_image(image, max_image_edge=HYWORLD2_QWENVL_MAX_IMAGE_EDGE):
+    if not isinstance(image, Image.Image):
+        return image
+    width, height = image.size
+    max_edge = max(width, height)
+    limit = max(64, int(max_image_edge or HYWORLD2_QWENVL_MAX_IMAGE_EDGE))
+    if max_edge <= limit:
+        return image.convert("RGB")
+    scale = limit / float(max_edge)
+    new_size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+    resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.BICUBIC)
+    resized = image.convert("RGB").resize(new_size, resampling)
+    print(f"[HYWorld2 QwenVL] Resized VLM preview {width}x{height} -> {new_size[0]}x{new_size[1]}")
+    return resized
 
 
 def _sanitize_name(value, fallback="scene"):
@@ -1024,59 +1055,8 @@ def _safe_json_dumps(value):
     return json.dumps(value, indent=2, default=default)
 
 
-def _worldgen_env():
-    env = os.environ.copy()
-    pythonpath_parts = [str(PROJECT_ROOT), str(WORLDGEN_DIR)]
-    if env.get("PYTHONPATH"):
-        pythonpath_parts.append(env["PYTHONPATH"])
-    env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONUTF8"] = "1"
-    env.setdefault("TOKENIZERS_PARALLELISM", "false")
-    return env
-
-
-def _run_worldgen_command(command, log_path, label):
-    log_path = Path(log_path)
-    _ensure_dir(log_path.parent)
-    lines = []
-    print(f"[HYWorld2 Trajectories] Running {label}: {' '.join(map(str, command))}")
-    with open(log_path, "a", encoding="utf-8", errors="replace") as log:
-        log.write(f"\n===== {label} =====\n")
-        log.write(" ".join(map(str, command)) + "\n")
-        process = subprocess.Popen(
-            [str(part) for part in command],
-            cwd=str(WORLDGEN_DIR),
-            env=_worldgen_env(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
-        assert process.stdout is not None
-        for line in process.stdout:
-            print(line, end="")
-            log.write(line)
-            lines.append(line.rstrip())
-            if len(lines) > 80:
-                lines.pop(0)
-        return_code = process.wait()
-        log.write(f"===== exit {return_code} =====\n")
-    if return_code != 0:
-        tail = "\n".join(lines[-40:])
-        raise RuntimeError(f"{label} failed with exit code {return_code}. Log: {log_path}\n{tail}")
-    return str(log_path)
-
-
-def _add_cli_arg(command, name, value):
-    command.extend([name, str(value)])
-
-
-def _add_cli_flag(command, name, enabled):
-    if bool(enabled):
-        command.append(name)
+def _hy_log(node, message):
+    print(f"[HYWorld2 {node}] {message}")
 
 
 def _load_workspace_panorama(scene):
@@ -1139,9 +1119,10 @@ def _ensure_trajectory_planner_context(
     qwen_attention_mode,
     qwen_device,
     qwen_max_new_tokens,
+    qwen_max_image_edge,
     qwen_keep_model_loaded,
+    qwen_cpu_offload,
 ):
-    _ensure_worldgen_path()
     from hyworld2.worldgen.src.vlm_utils import get_qwen_caption_format
     from hyworld2.worldgen.src.navi_utils import get_navigation_instruction
 
@@ -1150,6 +1131,8 @@ def _ensure_trajectory_planner_context(
     pano_tensor = _pil_list_to_image_tensor([panorama])
     qwen = HYWorld2QwenVL()
     written = {}
+    print(f"[HYWorld2 Trajectories] Planner context: scene={scene}")
+    print(f"[HYWorld2 Trajectories] Planner context: QwenVL model={qwen_model_id}, quantization={qwen_quantization}, device={qwen_device}, cpu_offload={bool(qwen_cpu_offload)}")
 
     meta_path = scene / "meta_info.json"
     meta = {}
@@ -1159,12 +1142,14 @@ def _ensure_trajectory_planner_context(
         if isinstance(loaded, dict):
             meta.update(loaded)
     if str(meta.get("scene_type", "unknown")).lower() not in ("indoor", "outdoor"):
+        print(f"[HYWorld2 Trajectories] Planner context: classifying scene_type -> {meta_path}")
         text = qwen._generate(
             qwen_model_id,
             get_qwen_caption_format("env_cls"),
             images=pano_tensor,
             device=qwen_device,
             max_new_tokens=min(int(qwen_max_new_tokens), 64),
+            max_image_edge=int(qwen_max_image_edge),
             quantization=qwen_quantization,
             attention_mode=qwen_attention_mode,
             temperature=0.2,
@@ -1172,21 +1157,27 @@ def _ensure_trajectory_planner_context(
             num_beams=1,
             repetition_penalty=1.0,
             keep_model_loaded=qwen_keep_model_loaded,
+            cpu_offload=qwen_cpu_offload,
             seed=1024,
         )
         meta["scene_type"] = _parse_scene_type(text)
         with open(meta_path, "w", encoding="utf-8") as handle:
             json.dump(meta, handle, indent=2)
         written["meta_info"] = str(meta_path)
+        print(f"[HYWorld2 Trajectories] Planner context: scene_type={meta['scene_type']}")
+    else:
+        print(f"[HYWorld2 Trajectories] Planner context: reusing scene_type={meta.get('scene_type')} from {meta_path}")
 
     objects_path = scene / "objects.json"
     if apply_nav_traj and not objects_path.exists():
+        print(f"[HYWorld2 Trajectories] Planner context: extracting navigation objects -> {objects_path}")
         text = qwen._generate(
             qwen_model_id,
             get_navigation_instruction(bool(force_vlm)),
             images=pano_tensor,
             device=qwen_device,
             max_new_tokens=int(qwen_max_new_tokens),
+            max_image_edge=int(qwen_max_image_edge),
             quantization=qwen_quantization,
             attention_mode=qwen_attention_mode,
             temperature=0.2,
@@ -1194,12 +1185,16 @@ def _ensure_trajectory_planner_context(
             num_beams=1,
             repetition_penalty=1.1,
             keep_model_loaded=qwen_keep_model_loaded,
+            cpu_offload=qwen_cpu_offload,
             seed=1024,
         )
         objects = _parse_qwenvl_objects(text)
         with open(objects_path, "w", encoding="utf-8") as handle:
             json.dump(objects, handle, indent=2)
         written["objects"] = str(objects_path)
+        print(f"[HYWorld2 Trajectories] Planner context: wrote {len(objects)} navigation object(s)")
+    elif apply_nav_traj:
+        print(f"[HYWorld2 Trajectories] Planner context: reusing navigation objects from {objects_path}")
     if not qwen_keep_model_loaded:
         HYWorld2QwenVL._clear_cache()
     return written
@@ -1280,15 +1275,20 @@ def _make_anchor_scan_c2ws(anchor_c2w, nframe, yaw_degrees):
 
 
 def _write_anchor_scans(scene, topk, min_distance, min_separation, yaw_degrees, nframe):
-    _ensure_worldgen_path()
     import cv2
     from hyworld2.worldgen.src.panorama_utils import split_panorama_image
 
     scene = Path(scene)
     candidates = _anchor_camera_candidates(scene)
     if not candidates:
+        print("[HYWorld2 Trajectories] Anchor scan: no wonder/reconstruct camera candidates found")
         return []
     median_depth = max(_trajectory_scene_median_depth(scene), 1e-6)
+    print(
+        "[HYWorld2 Trajectories] Anchor scan: "
+        f"candidates={len(candidates)}, topk={int(topk)}, median_depth={median_depth:.4f}, "
+        f"min_distance={float(min_distance)}x, min_separation={float(min_separation)}x"
+    )
     min_distance_abs = float(min_distance) * median_depth
     min_separation_abs = float(min_separation) * median_depth
     candidates.sort(key=lambda item: float(np.linalg.norm(item["position"][:2])), reverse=True)
@@ -1303,6 +1303,7 @@ def _write_anchor_scans(scene, topk, min_distance, min_separation, yaw_degrees, 
         if len(selected) >= int(topk):
             break
     if not selected:
+        print("[HYWorld2 Trajectories] Anchor scan: no candidates passed distance/separation filters")
         return []
 
     full_img = _load_workspace_panorama(scene)
@@ -1336,6 +1337,7 @@ def _write_anchor_scans(scene, topk, min_distance, min_separation, yaw_degrees, 
         with open(traj_dir / "camera.json", "w", encoding="utf-8") as handle:
             json.dump(camera_info, handle, indent=2)
         written.append(str(traj_dir / "camera.json"))
+        print(f"[HYWorld2 Trajectories] Anchor scan: wrote {traj_dir / 'camera.json'}")
     return written
 
 
@@ -1362,17 +1364,23 @@ class HYWorld2Workspace:
     CATEGORY = "VNCCS/HYWorld2"
 
     def build(self, mode, workspace_name, root_dir="", scene_dir="", panorama=None, scene_type="unknown", result_name="worldstereo-memory-dmd"):
+        _hy_log("Workspace", f"Stage 1/3: resolving workspace (mode={mode}, name={workspace_name})")
         if mode in ("load_existing", "resume") and str(scene_dir).strip():
             scene = Path(scene_dir)
         else:
             root = Path(root_dir) if str(root_dir).strip() else _output_root() / "hyworld2_worldgen"
             scene = root / _sanitize_name(workspace_name, "comfy_worldgen")
+        _hy_log("Workspace", f"Workspace directory: {scene}")
         _ensure_dir(scene)
         _ensure_dir(scene / "render_results")
         if panorama is not None:
+            _hy_log("Workspace", "Stage 2/3: saving input panorama")
             frames = _image_tensor_to_pil_list(panorama)
             if frames:
                 frames[0].save(scene / "panorama.png")
+                _hy_log("Workspace", f"Saved panorama: {scene / 'panorama.png'}")
+        else:
+            _hy_log("Workspace", "Stage 2/3: no panorama input connected; reusing workspace files")
         meta_path = scene / "meta_info.json"
         meta = {}
         if meta_path.exists():
@@ -1382,6 +1390,7 @@ class HYWorld2Workspace:
                 meta.update(loaded)
         if scene_type != "unknown" or "scene_type" not in meta:
             meta["scene_type"] = scene_type
+        _hy_log("Workspace", f"Stage 3/3: writing metadata scene_type={meta.get('scene_type', 'unknown')}")
         with open(meta_path, "w", encoding="utf-8") as handle:
             json.dump(meta, handle, indent=2)
         workspace = {
@@ -1391,6 +1400,7 @@ class HYWorld2Workspace:
             "result_name": result_name,
             "scene_type": meta.get("scene_type", "unknown"),
         }
+        _hy_log("Workspace", "Workspace ready")
         return (workspace, _safe_json_dumps(workspace))
 
 
@@ -1414,10 +1424,12 @@ class HYWorld2QwenVL:
                 "trajectory_set": ("HYWORLD2_TRAJECTORY_SET",),
                 "device": (device_options, {"default": "auto"}),
                 "max_new_tokens": ("INT", {"default": 256, "min": 16, "max": 4096, "step": 16}),
+                "max_image_edge": ("INT", {"default": HYWORLD2_QWENVL_MAX_IMAGE_EDGE, "min": 128, "max": 4096, "step": 64}),
                 "temperature": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.5, "step": 0.05}),
                 "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "num_beams": ("INT", {"default": 1, "min": 1, "max": 8}),
                 "repetition_penalty": ("FLOAT", {"default": 1.2, "min": 0.5, "max": 2.0, "step": 0.05}),
+                "cpu_offload": ("BOOLEAN", {"default": True}),
                 "keep_model_loaded": ("BOOLEAN", {"default": True}),
                 "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1}),
                 "write_results": ("BOOLEAN", {"default": True}),
@@ -1445,7 +1457,7 @@ class HYWorld2QwenVL:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def _load_bundle(self, model_id, quantization="None (FP16)", attention_mode="auto", device="auto", keep_model_loaded=True):
+    def _load_bundle(self, model_id, quantization="None (FP16)", attention_mode="auto", device="auto", keep_model_loaded=True, cpu_offload=False):
         try:
             from transformers import AutoProcessor, AutoTokenizer
             try:
@@ -1455,11 +1467,13 @@ class HYWorld2QwenVL:
         except Exception as exc:
             raise ImportError("QwenVL requires transformers with vision-language model support. Install project requirements.") from exc
 
+        requested_device = str(device or "auto").strip()
         selected_device = _qwenvl_normalize_device(device)
-        quant_cfg, dtype, is_fp8 = _qwenvl_quantization_config(model_id, quantization)
+        allow_cpu_offload = bool(cpu_offload) and requested_device == "auto" and torch.cuda.is_available()
+        quant_cfg, dtype, is_fp8 = _qwenvl_quantization_config(model_id, quantization, cpu_offload=allow_cpu_offload)
         force_sdpa = is_fp8 or quant_cfg is not None
         attn_impl = _qwenvl_resolve_attention(attention_mode, force_sdpa=force_sdpa)
-        signature = (str(model_id), str(quantization), attn_impl, selected_device)
+        signature = (str(model_id), str(quantization), attn_impl, selected_device, allow_cpu_offload)
         if keep_model_loaded and signature in self._model_cache:
             return self._model_cache[signature], signature
 
@@ -1474,17 +1488,32 @@ class HYWorld2QwenVL:
             load_kwargs["device_map"] = None
             load_kwargs["torch_dtype"] = "auto"
         else:
-            load_kwargs["device_map"] = selected_device if selected_device not in ("cpu", "mps") else None
+            if allow_cpu_offload:
+                load_kwargs["device_map"] = "auto"
+                max_memory = _qwenvl_auto_max_memory()
+                if max_memory is not None:
+                    load_kwargs["max_memory"] = max_memory
+            else:
+                load_kwargs["device_map"] = selected_device if selected_device not in ("cpu", "mps") else None
             if dtype is not None:
                 load_kwargs["torch_dtype"] = dtype
             if quant_cfg is not None:
                 load_kwargs["quantization_config"] = quant_cfg
-        print(f"[HYWorld2 QwenVL] Loading {model_id} ({quantization}, attn={attn_impl}, device={selected_device})")
+        print(f"[HYWorld2 QwenVL] Loading {model_id} ({quantization}, attn={attn_impl}, device={selected_device}, cpu_offload={allow_cpu_offload})")
+        print(f"[HYWorld2 QwenVL] Local model path: {model_path}")
+        if "max_memory" in load_kwargs:
+            print(f"[HYWorld2 QwenVL] Accelerate max_memory: {load_kwargs['max_memory']}")
+        if quant_cfg is not None and str(quantization) == "8-bit (Balanced)" and allow_cpu_offload:
+            print("[HYWorld2 QwenVL] 8-bit CPU offload enabled (llm_int8_enable_fp32_cpu_offload=True)")
         model = AutoModel.from_pretrained(model_path, **load_kwargs).eval()
         if selected_device in ("cpu", "mps") or is_fp8:
             model = model.to(selected_device)
+        if hasattr(model, "hf_device_map"):
+            print(f"[HYWorld2 QwenVL] Device map: {model.hf_device_map}")
+        print("[HYWorld2 QwenVL] Loading processor/tokenizer")
         processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        print("[HYWorld2 QwenVL] Model ready")
         bundle = {"model": model, "processor": processor, "tokenizer": tokenizer}
         if keep_model_loaded:
             self._model_cache[signature] = bundle
@@ -1497,6 +1526,7 @@ class HYWorld2QwenVL:
         images=None,
         device="auto",
         max_new_tokens=256,
+        max_image_edge=HYWORLD2_QWENVL_MAX_IMAGE_EDGE,
         quantization="None (FP16)",
         attention_mode="auto",
         temperature=0.6,
@@ -1504,6 +1534,7 @@ class HYWorld2QwenVL:
         num_beams=1,
         repetition_penalty=1.2,
         keep_model_loaded=True,
+        cpu_offload=False,
         seed=1,
     ):
         torch.manual_seed(int(seed))
@@ -1513,18 +1544,19 @@ class HYWorld2QwenVL:
             attention_mode=attention_mode,
             device=device,
             keep_model_loaded=keep_model_loaded,
+            cpu_offload=cpu_offload,
         )
         model = bundle["model"]
         processor = bundle["processor"]
         tokenizer = bundle["tokenizer"]
-        pil_images = _image_tensor_to_pil_list(images) if images is not None else []
+        pil_images = [_qwenvl_preview_image(image, max_image_edge=max_image_edge) for image in (_image_tensor_to_pil_list(images)[:8] if images is not None else [])]
         content = []
-        for image in pil_images[:8]:
+        for image in pil_images:
             content.append({"type": "image", "image": image})
         content.append({"type": "text", "text": prompt})
         messages = [{"role": "user", "content": content}]
         text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = processor(text=[text], images=pil_images[:8] or None, return_tensors="pt")
+        inputs = processor(text=[text], images=pil_images or None, return_tensors="pt")
         model_device = next(model.parameters()).device
         inputs = {k: v.to(model_device) if hasattr(v, "to") else v for k, v in inputs.items()}
         stop_tokens = [tokenizer.eos_token_id]
@@ -1563,15 +1595,18 @@ class HYWorld2QwenVL:
         trajectory_set=None,
         device="auto",
         max_new_tokens=256,
+        max_image_edge=HYWORLD2_QWENVL_MAX_IMAGE_EDGE,
         temperature=0.6,
         top_p=0.9,
         num_beams=1,
         repetition_penalty=1.2,
+        cpu_offload=True,
         keep_model_loaded=True,
         seed=1,
         write_results=True,
     ):
         scene = Path(workspace["scene_dir"])
+        _hy_log("QwenVL", f"Stage 1/3: preparing prompt (mode={mode})")
         if not prompt.strip():
             if mode == "scene_objects":
                 prompt = "Analyze this panoramic scene. Return concise JSON with scene_type, objects, navigable_areas, and visual_style."
@@ -1579,23 +1614,29 @@ class HYWorld2QwenVL:
                 prompt = "Describe the visible trajectory render as a concise image generation prompt. Return only the prompt text."
             else:
                 raise ValueError("prompt_refine requires a non-empty prompt; fallback prompts are disabled.")
+        image_count = len(_image_tensor_to_pil_list(images)) if images is not None else 0
+        traj_count = len((trajectory_set or {}).get("render_list", [])) if trajectory_set else 0
+        _hy_log("QwenVL", f"Stage 2/3: generating text with model={model_id}, quantization={quantization}, device={device}, cpu_offload={bool(cpu_offload)}, images={image_count}, trajectories={traj_count}")
         text = self._generate(
             model_id,
             prompt,
             images=images,
             device=device,
             max_new_tokens=max_new_tokens,
+            max_image_edge=max_image_edge,
             quantization=quantization,
             attention_mode=attention_mode,
             temperature=temperature,
             top_p=top_p,
             num_beams=num_beams,
             repetition_penalty=repetition_penalty,
+            cpu_offload=bool(cpu_offload),
             keep_model_loaded=keep_model_loaded,
             seed=seed,
         )
         context = {"mode": mode, "text": text, "model_id": model_id, "quantization": quantization, "attention_mode": attention_mode}
         if write_results:
+            _hy_log("QwenVL", "Stage 3/3: writing QwenVL outputs")
             if mode == "scene_objects":
                 out_path = scene / "hyworld2_qwenvl_scene.json"
                 try:
@@ -1605,6 +1646,7 @@ class HYWorld2QwenVL:
                 with open(out_path, "w", encoding="utf-8") as handle:
                     json.dump(parsed, handle, indent=2)
                 context["scene_objects_path"] = str(out_path)
+                _hy_log("QwenVL", f"Wrote scene context: {out_path}")
             elif mode == "trajectory_caption" and trajectory_set:
                 render_list = trajectory_set.get("render_list", [])
                 for render_path in render_list:
@@ -1613,6 +1655,10 @@ class HYWorld2QwenVL:
                     with open(caption_path, "w", encoding="utf-8") as handle:
                         json.dump({"prompt": text, "source": "HYWorld2 QwenVL"}, handle, indent=2)
                 context["captions_written"] = len(render_list)
+                _hy_log("QwenVL", f"Wrote {len(render_list)} trajectory caption file(s)")
+        else:
+            _hy_log("QwenVL", "Stage 3/3: write_results disabled")
+        _hy_log("QwenVL", "QwenVL node complete")
         return (context, text)
 
 
@@ -1632,6 +1678,8 @@ class HYWorld2Trajectories:
                 "qwen_model_id": (_qwenvl_model_names(), {"default": HYWORLD2_QWENVL_DEFAULT}),
                 "qwen_quantization": (HYWORLD2_QWENVL_QUANTIZATION, {"default": "None (FP16)"}),
                 "qwen_device": (device_options, {"default": "auto"}),
+                "qwen_cpu_offload": ("BOOLEAN", {"default": True}),
+                "qwen_max_image_edge": ("INT", {"default": HYWORLD2_QWENVL_MAX_IMAGE_EDGE, "min": 128, "max": 4096, "step": 64}),
                 "apply_anchor_scan": ("BOOLEAN", {"default": False}),
                 "anchor_scan_topk": ("INT", {"default": 2, "min": 0, "max": 32}),
             },
@@ -1643,7 +1691,6 @@ class HYWorld2Trajectories:
     CATEGORY = "VNCCS/HYWorld2"
 
     def _sort(self, workspace, generated=False, captions_written=None, anchor_scans_written=None, logs=None):
-        _ensure_worldgen_path()
         from hyworld2.worldgen.src.data_utils import sort_trajs
 
         render_root = Path(workspace["scene_dir"]) / "render_results"
@@ -1705,6 +1752,8 @@ class HYWorld2Trajectories:
         qwen_quantization="None (FP16)",
         qwen_attention_mode="auto",
         qwen_device="auto",
+        qwen_cpu_offload=True,
+        qwen_max_image_edge=HYWORLD2_QWENVL_MAX_IMAGE_EDGE,
         qwen_max_new_tokens=256,
         qwen_keep_model_loaded=True,
         qwen_frame_count=4,
@@ -1715,17 +1764,23 @@ class HYWorld2Trajectories:
         anchor_scan_yaw_degrees=360.0,
     ):
         if mode == "reuse_existing":
+            print(f"[HYWorld2 Trajectories] Reusing existing trajectory renders from {Path(workspace['scene_dir']) / 'render_results'}")
             return self._sort(workspace, generated=False)
         if mode != "generate_and_render_official":
             raise ValueError(f"Unsupported HYWorld2 Trajectories mode: {mode}")
         skip_exist = bool(skip_existing)
 
-        _ensure_worldgen_path()
         scene = Path(workspace["scene_dir"])
         render_root = scene / "render_results"
         _ensure_dir(render_root)
         logs = []
+        print("[HYWorld2 Trajectories] Stage 0/5: official trajectory pipeline")
+        print(f"[HYWorld2 Trajectories] Workspace: {scene}")
+        print(f"[HYWorld2 Trajectories] SAM3 repo/path: {sam3_path or HYWORLD2_SAM3_REPO_ID}")
 
+        print("[HYWorld2 Trajectories] Releasing Comfy models before local QwenVL planner")
+        _release_model_memory("HYWorld2 Trajectories")
+        print("[HYWorld2 Trajectories] Stage 1/5: preparing local QwenVL planner context")
         planner_written = _ensure_trajectory_planner_context(
             workspace,
             apply_nav_traj=bool(apply_nav_traj),
@@ -1735,54 +1790,68 @@ class HYWorld2Trajectories:
             qwen_attention_mode=qwen_attention_mode,
             qwen_device=qwen_device,
             qwen_max_new_tokens=int(qwen_max_new_tokens),
+            qwen_max_image_edge=int(qwen_max_image_edge),
             qwen_keep_model_loaded=bool(qwen_keep_model_loaded),
+            qwen_cpu_offload=bool(qwen_cpu_offload),
         )
         HYWorld2QwenVL._clear_cache()
+        print("[HYWorld2 Trajectories] Stage 1/5 complete: planner context ready")
+        print("[HYWorld2 Trajectories] Releasing Comfy/Qwen models before geometry generation")
         _release_model_memory("HYWorld2 Trajectories")
 
-        generate_cmd = [sys.executable, str(WORLDGEN_DIR / "traj_generate.py"), "--target_path", str(scene)]
-        for name, value in (
-            ("--fov_x", fov_x),
-            ("--fov_y", fov_y),
-            ("--seed", seed),
-            ("--split_view_num", split_view_num),
-            ("--splitted_resolution", splitted_resolution),
-            ("--nframe", nframe),
-            ("--distance_threshold", distance_threshold),
-            ("--obs_iteration_limit", obs_iteration_limit),
-            ("--rotation_deg", rotation_deg),
-            ("--rotation_up", rotation_up),
-            ("--up_right", up_right),
-            ("--obs_decay", obs_decay),
-            ("--contract", contract),
-            ("--wonder_topk", wonder_topk),
-            ("--recon_topk", recon_topk),
-            ("--move_dist", move_dist),
-            ("--radius_threshold", radius_threshold),
-            ("--min_angle_threshold", min_angle_threshold),
-            ("--traj_sim_threshold", traj_sim_threshold),
-            ("--traj_sim_threshold_recon", traj_sim_threshold_recon),
-            ("--eloop_dist", eloop_dist),
-            ("--cellSize", cellSize),
-            ("--cellHeight", cellHeight),
-            ("--agentHeight", agentHeight),
-            ("--agentRadius", agentRadius),
-            ("--agentMaxClimb", agentMaxClimb),
-            ("--maxSlope", maxSlope),
-            ("--roof_height_threshold", roof_height_threshold),
-        ):
-            _add_cli_arg(generate_cmd, name, value)
-        _add_cli_arg(generate_cmd, "--sam3_path", sam3_path or HYWORLD2_SAM3_REPO_ID)
-        _add_cli_flag(generate_cmd, "--skip_exist", skip_exist)
-        _add_cli_flag(generate_cmd, "--apply_nav_traj", apply_nav_traj)
-        _add_cli_flag(generate_cmd, "--apply_up_route", apply_up_route)
-        _add_cli_flag(generate_cmd, "--apply_recon_iteration", apply_recon_iteration)
-        _add_cli_flag(generate_cmd, "--force_vlm", force_vlm)
-        _add_cli_flag(generate_cmd, "--local_files_only", local_files_only)
-        _add_cli_flag(generate_cmd, "--reuse_objects_json", apply_nav_traj)
-        logs.append(_run_worldgen_command(generate_cmd, render_root / "hyworld2_traj_generate.log", "traj_generate.py"))
+        print("[HYWorld2 Trajectories] Stage 2/5: generating official camera trajectories")
+        from hyworld2.worldgen import traj_generate, traj_render
+
+        generate_config = Namespace(
+            target_path=str(scene),
+            fov_x=float(fov_x),
+            fov_y=float(fov_y),
+            seed=int(seed),
+            split_view_num=int(split_view_num),
+            splitted_resolution=int(splitted_resolution),
+            nframe=int(nframe),
+            distance_threshold=float(distance_threshold),
+            obs_iteration_limit=int(obs_iteration_limit),
+            rotation_deg=float(rotation_deg),
+            rotation_up=float(rotation_up),
+            up_right=float(up_right),
+            obs_decay=float(obs_decay),
+            contract=float(contract),
+            skip_exist=bool(skip_exist),
+            apply_nav_traj=bool(apply_nav_traj),
+            wonder_topk=int(wonder_topk),
+            recon_topk=int(recon_topk),
+            move_dist=float(move_dist),
+            radius_threshold=float(radius_threshold),
+            min_angle_threshold=float(min_angle_threshold),
+            traj_sim_threshold=float(traj_sim_threshold),
+            traj_sim_threshold_recon=float(traj_sim_threshold_recon),
+            apply_up_route=bool(apply_up_route),
+            apply_recon_iteration=bool(apply_recon_iteration),
+            eloop_dist=float(eloop_dist),
+            force_vlm=bool(force_vlm),
+            cellSize=float(cellSize),
+            cellHeight=float(cellHeight),
+            agentHeight=float(agentHeight),
+            agentRadius=float(agentRadius),
+            agentMaxClimb=float(agentMaxClimb),
+            maxSlope=float(maxSlope),
+            roof_height_threshold=float(roof_height_threshold),
+            node_rank=0,
+            node_size=1,
+            llm_addr="localhost",
+            llm_port=8000,
+            llm_name=HYWORLD2_QWENVL_MODELS.get(qwen_model_id, {}).get("repo_id", qwen_model_id),
+            sam3_path=sam3_path or HYWORLD2_SAM3_REPO_ID,
+            local_files_only=bool(local_files_only),
+            reuse_objects_json=bool(apply_nav_traj),
+        )
+        traj_generate.run_traj_generate(generate_config)
+        logs.append({"stage": "traj_generate", "mode": "native_api"})
+        print("[HYWorld2 Trajectories] Stage 2/5 complete: camera trajectories generated")
 
         anchor_scans_written = []
+        print("[HYWorld2 Trajectories] Stage 3/5: optional anchor scan")
         if bool(apply_anchor_scan) and int(anchor_scan_topk) > 0:
             anchor_scans_written = _write_anchor_scans(
                 scene,
@@ -1792,29 +1861,34 @@ class HYWorld2Trajectories:
                 yaw_degrees=float(anchor_scan_yaw_degrees),
                 nframe=int(nframe),
             )
+        else:
+            print("[HYWorld2 Trajectories] Anchor scan disabled")
+        print(f"[HYWorld2 Trajectories] Stage 3/5 complete: {len(anchor_scans_written)} scan camera file(s)")
 
-        nproc = int(render_processes)
-        if nproc <= 0:
-            nproc = max(1, torch.cuda.device_count())
-        render_cmd = [
-            sys.executable,
-            "-m",
-            "torch.distributed.run",
-            "--standalone",
-            "--nnodes=1",
-            f"--nproc_per_node={nproc}",
-            str(WORLDGEN_DIR / "traj_render.py"),
-            "--target_path",
-            str(scene),
-            "--seed",
-            str(int(seed)),
-            "--disable_vlm_caption",
-        ]
-        logs.append(_run_worldgen_command(render_cmd, render_root / "hyworld2_traj_render.log", "traj_render.py"))
+        if int(render_processes) not in (0, 1):
+            print("[HYWorld2 Trajectories] render_processes is ignored in native mode; using one in-process renderer.")
+        print("[HYWorld2 Trajectories] Stage 4/5: rendering trajectories natively with 1 process")
+        render_config = Namespace(
+            target_path=str(scene),
+            seed=int(seed),
+            node_rank=0,
+            node_size=1,
+            llm_addr="localhost",
+            llm_port=8000,
+            llm_name=HYWORLD2_QWENVL_MODELS.get(qwen_model_id, {}).get("repo_id", qwen_model_id),
+            caption_workers=1,
+            caption_sample_count=4,
+            caption_max_tokens=256,
+            disable_vlm_caption=True,
+        )
+        traj_render.run_traj_render(render_config, rank=0, world_size=1, local_rank=0)
+        logs.append({"stage": "traj_render", "mode": "native_api", "world_size": 1})
+        print("[HYWorld2 Trajectories] Stage 4/5 complete: render.mp4/render_mask.mp4 generated")
 
         from hyworld2.worldgen.src.data_utils import sort_trajs
 
         render_list = sort_trajs(str(render_root))
+        print(f"[HYWorld2 Trajectories] Stage 5/5: local QwenVL captions for {len(render_list)} trajectory render(s)")
         captions_written = HYWorld2WorldExpansion()._ensure_captions(
             workspace,
             render_list,
@@ -1825,9 +1899,12 @@ class HYWorld2Trajectories:
             qwen_quantization,
             qwen_attention_mode,
             bool(qwen_keep_model_loaded),
+            bool(qwen_cpu_offload),
+            int(qwen_max_image_edge),
             int(qwen_frame_count),
         )
         HYWorld2QwenVL._clear_cache()
+        print(f"[HYWorld2 Trajectories] Stage 5/5 complete: wrote {len(captions_written)} caption file(s)")
         data = {
             "workspace": workspace,
             "render_list": render_list,
@@ -1866,20 +1943,27 @@ class HYWorld2MemoryBank:
     CATEGORY = "VNCCS/HYWorld2"
 
     def run(self, workspace, mode, image_width=0, image_height=0, nframe=0, max_reference=8, align_nframe=8, downsampled_pts=2_000_000, kb_anomaly_percentile=90.0):
+        _hy_log("Memory Bank", f"Stage 1/3: initializing memory bank (mode={mode})")
         _ensure_worldgen_path()
         from hyworld2.worldgen.src.retrieval_wm import PanoramaMemoryBank
 
         scene = Path(workspace["scene_dir"])
         if image_width <= 0 or image_height <= 0:
+            _hy_log("Memory Bank", "Stage 2/3: resolving image size from trajectory start frame or panorama")
             from imagesize import get as image_size
 
             start_frames = sorted((scene / "render_results").glob("*/start_frame.png"))
             if start_frames:
                 image_width, image_height = image_size(str(start_frames[0]))
+                _hy_log("Memory Bank", f"Using start frame size {image_width}x{image_height}: {start_frames[0]}")
             else:
                 pano = scene / "panorama.png"
                 image_width, image_height = image_size(str(pano))
+                _hy_log("Memory Bank", f"Using panorama size {image_width}x{image_height}: {pano}")
+        else:
+            _hy_log("Memory Bank", f"Stage 2/3: using explicit image size {image_width}x{image_height}")
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        _hy_log("Memory Bank", f"Stage 3/3: constructing PanoramaMemoryBank on {device} (pts_num={int(downsampled_pts)})")
         bank = PanoramaMemoryBank(
             root_path=str(scene),
             image_width=int(image_width),
@@ -1902,6 +1986,7 @@ class HYWorld2MemoryBank:
             "memory_size": int(bank.mem_size),
             "results_path": bank.results_path,
         }
+        _hy_log("Memory Bank", f"Memory bank ready: memory_size={int(bank.mem_size)}, results_path={bank.results_path}")
         return (state, _safe_json_dumps(info))
 
 
@@ -1922,6 +2007,8 @@ class HYWorld2WorldExpansion:
                 "qwen_quantization": (HYWORLD2_QWENVL_QUANTIZATION, {"default": "None (FP16)"}),
                 "qwen_attention_mode": (HYWORLD2_QWENVL_ATTENTION, {"default": "auto"}),
                 "qwen_device": (device_options, {"default": "auto"}),
+                "qwen_cpu_offload": ("BOOLEAN", {"default": True}),
+                "qwen_max_image_edge": ("INT", {"default": HYWORLD2_QWENVL_MAX_IMAGE_EDGE, "min": 128, "max": 4096, "step": 64}),
                 "qwen_max_new_tokens": ("INT", {"default": 192, "min": 16, "max": 2048, "step": 16}),
                 "qwen_keep_model_loaded": ("BOOLEAN", {"default": True}),
                 "qwen_frame_count": ("INT", {"default": 4, "min": 1, "max": 16}),
@@ -1947,17 +2034,23 @@ class HYWorld2WorldExpansion:
         qwen_quantization="None (FP16)",
         qwen_attention_mode="auto",
         qwen_keep_model_loaded=True,
+        qwen_cpu_offload=True,
+        qwen_max_image_edge=HYWORLD2_QWENVL_MAX_IMAGE_EDGE,
         qwen_frame_count=4,
     ):
         if caption_mode == "existing_files_only":
+            _hy_log("World Expansion", "Caption stage: existing_files_only, not generating captions")
             return []
         qwen = HYWorld2QwenVL()
         written = []
+        _hy_log("World Expansion", f"Caption stage: mode={caption_mode}, trajectories={len(render_list)}, model={qwen_model_id}, cpu_offload={bool(qwen_cpu_offload)}")
         for render_path in render_list:
             traj_dir = Path(render_path).parent
             caption_path = traj_dir / "traj_caption.json"
             if caption_path.exists() and caption_mode != "qwenvl_overwrite":
+                _hy_log("World Expansion", f"Caption stage: reusing {caption_path}")
                 continue
+            _hy_log("World Expansion", f"Caption stage: generating caption for {render_path}")
             frames = _load_video_frames(render_path)
             sample = []
             if frames:
@@ -1985,6 +2078,7 @@ class HYWorld2WorldExpansion:
                 images=_pil_list_to_image_tensor(sample[: max(1, int(qwen_frame_count))]),
                 device=qwen_device,
                 max_new_tokens=qwen_max_new_tokens,
+                max_image_edge=int(qwen_max_image_edge),
                 quantization=qwen_quantization,
                 attention_mode=qwen_attention_mode,
                 temperature=0.6,
@@ -1992,6 +2086,7 @@ class HYWorld2WorldExpansion:
                 num_beams=1,
                 repetition_penalty=1.2,
                 keep_model_loaded=qwen_keep_model_loaded,
+                cpu_offload=qwen_cpu_offload,
                 seed=1,
             )
             if not text.strip():
@@ -1999,6 +2094,7 @@ class HYWorld2WorldExpansion:
             with open(caption_path, "w", encoding="utf-8") as handle:
                 json.dump({"prompt": text.strip(), "source": "HYWorld2 World Expansion QwenVL"}, handle, indent=2)
             written.append(str(caption_path))
+            _hy_log("World Expansion", f"Caption stage: wrote {caption_path}")
         return written
 
     def run(
@@ -2012,6 +2108,8 @@ class HYWorld2WorldExpansion:
         qwen_quantization="None (FP16)",
         qwen_attention_mode="auto",
         qwen_device="auto",
+        qwen_cpu_offload=True,
+        qwen_max_image_edge=HYWORLD2_QWENVL_MAX_IMAGE_EDGE,
         qwen_max_new_tokens=192,
         qwen_keep_model_loaded=True,
         qwen_frame_count=4,
@@ -2019,6 +2117,7 @@ class HYWorld2WorldExpansion:
         skip_existing=True,
         max_trajectories=0,
     ):
+        _hy_log("World Expansion", "Stage 1/6: preparing WorldStereo memory expansion")
         _ensure_worldgen_path()
         from hyworld2.worldgen.src.data_utils import load_mutli_traj_dataset
 
@@ -2032,6 +2131,8 @@ class HYWorld2WorldExpansion:
         render_list = list(trajectory_set.get("render_list", []))
         if int(max_trajectories) > 0:
             render_list = render_list[: int(max_trajectories)]
+        _hy_log("World Expansion", f"Stage 2/6: trajectory count={len(render_list)}, device={device}, model_type={model_type}")
+        _hy_log("World Expansion", "Stage 3/6: ensuring trajectory captions")
         captions_written = self._ensure_captions(
             workspace,
             render_list,
@@ -2042,26 +2143,35 @@ class HYWorld2WorldExpansion:
             qwen_quantization,
             qwen_attention_mode,
             bool(qwen_keep_model_loaded),
+            bool(qwen_cpu_offload),
+            int(qwen_max_image_edge),
             int(qwen_frame_count),
         )
+        _hy_log("World Expansion", f"Stage 3/6 complete: captions_written={len(captions_written)}")
+        _hy_log("World Expansion", "Stage 4/6: encoding prompt cache")
         prompt_cache = _build_prompt_cache(model, workspace, render_list, model_type, device)
+        _hy_log("World Expansion", f"Stage 4/6 complete: cached {len(prompt_cache)} prompt embedding set(s)")
         generator = torch.Generator(device=device).manual_seed(int(seed))
         autocast_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
         completed = []
+        _hy_log("World Expansion", "Stage 5/6: generating trajectory videos and updating memory")
         for render_path in render_list:
             render_parts = Path(render_path).parts
             view_id, traj_id = render_parts[-3], render_parts[-2]
             traj_dir = Path(workspace["scene_dir"]) / "render_results" / view_id / traj_id
             result_path = traj_dir / f"{model_type}_result.mp4"
+            _hy_log("World Expansion", f"Trajectory {len(completed)+1}/{len(render_list)}: {view_id}/{traj_id}")
             camera_data = json.load(open(traj_dir / "camera.json", "r", encoding="utf-8"))
             tar_w2cs = torch.from_numpy(np.asarray(camera_data["extrinsic"], dtype=np.float32)).to(device)
             tar_Ks = torch.from_numpy(np.asarray(camera_data["intrinsic"], dtype=np.float32)).to(device)
             if skip_existing and result_path.exists():
+                _hy_log("World Expansion", f"Trajectory {view_id}/{traj_id}: reusing existing result {result_path}")
                 frames = _load_video_frames(result_path)
                 update_w2cs, update_Ks = _sample_camera_tensors_to_frame_count(tar_w2cs, tar_Ks, len(frames))
                 bank.update_memory(frames, update_w2cs, update_Ks, view_id=view_id, traj_id=traj_id)
                 completed.append(str(result_path))
                 continue
+            _hy_log("World Expansion", f"Trajectory {view_id}/{traj_id}: retrieving references from memory bank")
             retrieved_frames, ref_index, ref_index_dict, ref_w2cs, _ = bank.retrieval(tar_w2cs, tar_Ks, view_id=view_id, traj_id=traj_id)
             memory_dir = traj_dir / "memory_inputs"
             _ensure_dir(memory_dir)
@@ -2097,6 +2207,7 @@ class HYWorld2WorldExpansion:
             else:
                 pipeline_kwargs["guidance_scale"] = 5.0
             with torch.no_grad(), torch.autocast(device.type, dtype=autocast_dtype, enabled=device.type == "cuda"):
+                _hy_log("World Expansion", f"Trajectory {view_id}/{traj_id}: running WorldStereo generation")
                 output = pipeline(**pipeline_kwargs).frames[0].float()
             frames_np = output.permute(0, 2, 3, 1).detach().cpu().clamp(0, 1).numpy()
             _export_video(frames_np, result_path, fps=16)
@@ -2104,13 +2215,16 @@ class HYWorld2WorldExpansion:
             update_w2cs, update_Ks = _sample_camera_tensors_to_frame_count(tar_w2cs, tar_Ks, len(gen_frames))
             bank.update_memory(gen_frames, update_w2cs, update_Ks, view_id=view_id, traj_id=traj_id)
             completed.append(str(result_path))
+            _hy_log("World Expansion", f"Trajectory {view_id}/{traj_id}: wrote {result_path} and updated memory")
             del output, pipeline_kwargs, meta_data
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         memory_bank["bank"] = bank
         del pipeline
+        _hy_log("World Expansion", "Stage 6/6: releasing model memory")
         _release_model_memory("HYWorld2 World Expansion")
+        _hy_log("World Expansion", f"World expansion complete: completed={len(completed)}")
         return (memory_bank, _safe_json_dumps({"completed": completed, "count": len(completed), "captions_written": captions_written}))
 
 
@@ -2125,9 +2239,11 @@ class HYWorld2PrepareWorldMirrorBatch:
     CATEGORY = "VNCCS/HYWorld2"
 
     def run(self, memory_bank):
+        _hy_log("Prepare WorldMirror Batch", "Stage 1/4: preparing WorldMirror export batch")
         bank = memory_bank["bank"]
         world_mirror_dir = Path(bank.root_path) / "render_results" / bank.results_path / "world_mirror_data"
         images_dir = _ensure_dir(world_mirror_dir / "images")
+        _hy_log("Prepare WorldMirror Batch", f"WorldMirror directory: {world_mirror_dir}")
         cameras = {"num_cameras": 0, "extrinsics": [], "intrinsics": []}
         name_map = {}
         images = []
@@ -2141,6 +2257,7 @@ class HYWorld2PrepareWorldMirrorBatch:
 
         # WorldMirror writes depth_NNNN by sorted image/camera id. Keep the tensor
         # batch, cameras.json, files, and name_map in that exact same order.
+        _hy_log("Prepare WorldMirror Batch", f"Stage 2/4: exporting {len(entries)} reference frame(s)")
         entries.sort(key=lambda item: item[0])
         for index, (camera_id, fname, gi) in enumerate(entries):
             view_id, traj_id, frame_id = fname.split("/")
@@ -2154,14 +2271,26 @@ class HYWorld2PrepareWorldMirrorBatch:
             intrs.append(bank.ref_Ks[gi].detach().cpu())
             name_map[fname] = str(index).zfill(4)
         cameras["num_cameras"] = len(images)
+        _hy_log("Prepare WorldMirror Batch", "Stage 3/4: writing cameras.json and name_map.json")
         with open(world_mirror_dir / "cameras.json", "w", encoding="utf-8") as handle:
             json.dump(cameras, handle, indent=2)
         with open(world_mirror_dir / "name_map.json", "w", encoding="utf-8") as handle:
             json.dump(name_map, handle, indent=2)
         bank.world_mirror_dir = str(world_mirror_dir)
         bank.name_map = name_map
-        batch = {"memory_bank": memory_bank, "world_mirror_dir": str(world_mirror_dir), "name_map": name_map}
-        return (_pil_list_to_image_tensor(images), torch.stack(poses).float(), torch.stack(intrs).float(), batch, _safe_json_dumps({"frames": len(images), "world_mirror_dir": world_mirror_dir}))
+        image_tensor = _pil_list_to_image_tensor(images)
+        camera_poses = torch.stack(poses).float()
+        camera_intrinsics = torch.stack(intrs).float()
+        batch = {
+            "memory_bank": memory_bank,
+            "world_mirror_dir": str(world_mirror_dir),
+            "name_map": name_map,
+            "images": image_tensor,
+            "camera_poses": camera_poses,
+            "camera_intrinsics": camera_intrinsics,
+        }
+        _hy_log("Prepare WorldMirror Batch", f"Stage 4/4 complete: images={len(images)}, world_mirror_dir={world_mirror_dir}")
+        return (image_tensor, camera_poses, camera_intrinsics, batch, _safe_json_dumps({"frames": len(images), "world_mirror_dir": world_mirror_dir}))
 
 
 class HYWorld2MemoryAlignment:
@@ -2170,10 +2299,10 @@ class HYWorld2MemoryAlignment:
         return {
             "required": {
                 "worldmirror_batch": ("HYWORLD2_WORLDMIRROR_BATCH",),
-                "raw_splats": ("VNCCS_SPLAT",),
                 "mode": (["consume_worldmirror_depths", "align_and_export", "bypass"], {"default": "align_and_export"}),
             },
             "optional": {
+                "raw_splats": ("VNCCS_SPLAT",),
                 "ply_data": ("PLY_DATA",),
                 "downsampled_pts": ("INT", {"default": 2_000_000, "min": 1, "max": 50_000_000, "step": 100000}),
                 "debug_mode": ("BOOLEAN", {"default": False}),
@@ -2185,30 +2314,39 @@ class HYWorld2MemoryAlignment:
     FUNCTION = "run"
     CATEGORY = "VNCCS/HYWorld2"
 
-    def run(self, worldmirror_batch, raw_splats, mode, ply_data=None, downsampled_pts=2_000_000, debug_mode=False):
+    def run(self, worldmirror_batch, mode, raw_splats=None, ply_data=None, downsampled_pts=2_000_000, debug_mode=False):
+        _hy_log("Memory Alignment", f"Stage 1/4: consuming WorldMirror depths (mode={mode})")
         memory_bank = worldmirror_batch["memory_bank"]
         bank = memory_bank["bank"]
         world_mirror_dir = Path(worldmirror_batch["world_mirror_dir"])
         depth_dir = _ensure_dir(world_mirror_dir / "results" / "depth")
         depths, depth_source = _raw_worldmirror_depths_to_numpy(raw_splats)
         if not depths and mode != "bypass":
-            raise ValueError("HYWorld2 Memory Alignment requires raw_splats with metric float depth: raw_splats.gs_depth or raw_splats.depth.")
+            raise ValueError(
+                "HYWorld2 Memory Alignment requires connected raw_splats with metric depth: raw_splats.gs_depth or raw_splats.depth."
+            )
+        _hy_log("Memory Alignment", f"Writing {len(depths)} depth map(s) to {depth_dir} (source={depth_source})")
         for index, depth in enumerate(depths):
             np.save(depth_dir / f"depth_{index:04d}.npy", depth)
         if mode == "align_and_export":
+            _hy_log("Memory Alignment", "Stage 2/4: running memory bank alignment")
             _ensure_single_process_dist(bank)
             bank.alignment(debug_mode=bool(debug_mode))
+            _hy_log("Memory Alignment", "Stage 3/4: exporting aligned/global point clouds")
             export_dir = Path(bank.root_path) / "render_results" / bank.results_path
             _ensure_dir(export_dir)
             bank.export_pcd(str(export_dir), N_points=int(downsampled_pts))
             aligned = str(export_dir / "aligned_pcd.ply")
             bypass_source_points = 0
         elif mode == "bypass":
+            _hy_log("Memory Alignment", "Stage 2/4: bypassing alignment and exporting source point clouds")
             aligned, bypass_source_points = _export_bypass_memory_bank_pcds(bank, ply_data, raw_splats, downsampled_pts)
         else:
+            _hy_log("Memory Alignment", "Stage 2/4: consume depths only; alignment/export skipped")
             aligned = ""
             bypass_source_points = 0
         memory_bank["bank"] = bank
+        _hy_log("Memory Alignment", f"Stage 4/4 complete: aligned_ply={aligned or '<none>'}")
         return (
             memory_bank,
             aligned,
@@ -2249,25 +2387,35 @@ class HYWorld2GSData:
     CATEGORY = "VNCCS/HYWorld2"
 
     def run(self, workspace, mode, memory_bank=None, result_name="", out_name="gs_data", save_normal=True, split_sky=True, split_align=False):
+        _hy_log("GS Data", f"Stage 1/3: preparing GS dataset (mode={mode})")
         scene = Path(workspace["scene_dir"])
         gs_dir = scene / _sanitize_name(out_name, "gs_data")
+        _hy_log("GS Data", f"Scene: {scene}")
+        _hy_log("GS Data", f"GS data directory: {gs_dir}")
         if mode == "validate":
+            _hy_log("GS Data", "Stage 2/3: validating required files")
             required = [gs_dir / "cameras.json", gs_dir / "points.ply", gs_dir / "images"]
             missing = [str(path) for path in required if not path.exists()]
             if missing:
                 raise FileNotFoundError(f"HYWorld2 GS data missing required files: {missing}")
+            _hy_log("GS Data", "Stage 3/3 complete: dataset is valid")
             return ({"workspace": workspace, "gs_data_dir": str(gs_dir)}, _safe_json_dumps({"valid": True, "gs_data_dir": gs_dir}))
         if mode == "repair_metadata":
+            _hy_log("GS Data", "Stage 2/3: repairing metadata")
             meta = gs_dir / "meta_info.json"
             if not meta.exists():
                 with open(meta, "w", encoding="utf-8") as handle:
                     json.dump({"scene_type": workspace.get("scene_type", "unknown")}, handle, indent=2)
+                _hy_log("GS Data", f"Wrote {meta}")
+            _hy_log("GS Data", "Stage 3/3 complete: metadata ready")
             return ({"workspace": workspace, "gs_data_dir": str(gs_dir)}, _safe_json_dumps({"repaired": True, "gs_data_dir": gs_dir}))
         _ensure_worldgen_path()
         import hyworld2.worldgen.gen_gs_data as gen_gs_data
 
         if not hasattr(gen_gs_data, "run_gen_gs_data"):
             raise RuntimeError("gen_gs_data.py must expose run_gen_gs_data for native node execution.")
+        _hy_log("GS Data", "Stage 2/3: running gen_gs_data")
+        _hy_log("GS Data", f"Options: result_name={result_name or workspace.get('result_name', 'worldstereo-memory-dmd')}, save_normal={bool(save_normal)}, split_sky={bool(split_sky)}, split_align={bool(split_align)}")
         result = gen_gs_data.run_gen_gs_data(
             root_path=str(scene),
             out_name=out_name,
@@ -2278,6 +2426,7 @@ class HYWorld2GSData:
             world_size=1,
         )
         gs_dir = Path(result["output_path"])
+        _hy_log("GS Data", f"Stage 3/3 complete: output_path={gs_dir}")
         return ({"workspace": workspace, "gs_data_dir": str(gs_dir)}, _safe_json_dumps(result))
 
 
@@ -2317,12 +2466,15 @@ class HYWorld2Train3DGS:
     OUTPUT_NODE = True
 
     def run(self, gs_data, max_steps=5000, save_steps="4000,5000,6000,8000,10000", eval_steps="1000,2000,3000,4000,5000,6000,7000,8000,9000,10000", ply_steps="4000,5000,6000,8000,10000", downsample_pts_num=1_000_000, save_ply=True, disable_video=True, disable_viewer=True, depth_loss=False, normal_loss=False, sky_depth_from_pcd=False, use_scale_regularization=False, use_mask_gaussian=False, mask_export_stochastic=True, do_prune=False, prune_opacity_threshold=0.01, antialiased=False, normalize_world_space=True):
+        _hy_log("Train 3DGS", "Stage 1/5: preparing trainer config")
         _ensure_worldgen_path()
         import hyworld2.worldgen.world_gs_trainer as trainer
         from gsplat.strategy import DefaultStrategy
 
         data_dir = Path(gs_data["gs_data_dir"])
         out_dir = data_dir.parent / "gs_results"
+        _hy_log("Train 3DGS", f"Input data_dir: {data_dir}")
+        _hy_log("Train 3DGS", f"Output train_dir: {out_dir}")
         _reset_dir(out_dir, "HYWorld2 train_dir")
         _ensure_scene_type_meta(data_dir)
         strategy = DefaultStrategy(verbose=True)
@@ -2352,6 +2504,13 @@ class HYWorld2Train3DGS:
         cfg.prune_opacity_threshold = float(prune_opacity_threshold)
         cfg.antialiased = bool(antialiased)
         cfg.no_normalize = not bool(normalize_world_space)
+        _hy_log(
+            "Train 3DGS",
+            "Config: "
+            f"max_steps={cfg.max_steps}, downsample_pts_num={cfg.downsample_pts_num}, save_ply={cfg.save_ply}, "
+            f"depth_loss={cfg.depth_loss}, normal_loss={cfg.normal_loss}, do_prune={cfg.do_prune}, "
+            f"normalize_world_space={bool(normalize_world_space)}"
+        )
         command_info = {
             "data_dir": str(data_dir),
             "result_dir": str(out_dir),
@@ -2382,17 +2541,24 @@ class HYWorld2Train3DGS:
         }
         with open(out_dir / "train_command.json", "w", encoding="utf-8") as handle:
             json.dump(command_info, handle, indent=2)
+        _hy_log("Train 3DGS", f"Stage 2/5: wrote train command metadata: {out_dir / 'train_command.json'}")
         if depth_loss and not cfg.depth_loss:
             print(f"[HYWorld2 Train 3DGS] depth_loss requested but valid metric float16-packed depths are missing under {data_dir / 'depths'}; disabling depth_loss.")
         if normal_loss and not cfg.normal_loss:
             print(f"[HYWorld2 Train 3DGS] normal_loss requested but normals are missing/constant under {data_dir / 'normals'}; disabling normal_loss.")
         if sky_depth_from_pcd and not cfg.sky_depth_from_pcd:
             print("[HYWorld2 Train 3DGS] sky_depth_from_pcd requested but depth/normal inputs are not usable; disabling sky_depth_from_pcd.")
+        _hy_log("Train 3DGS", "Stage 3/5: running 3DGS trainer")
         with torch.inference_mode(False), torch.enable_grad():
             trainer.main(0, 0, 1, cfg)
+        _hy_log("Train 3DGS", "Stage 4/5: locating and converting latest PLY")
         ply_path = _find_latest_ply(out_dir)
         if ply_path:
+            _hy_log("Train 3DGS", f"Latest PLY before basis conversion: {ply_path}")
             ply_path = _convert_trainer_gaussian_ply_to_worldmirror_basis(ply_path)
+            _hy_log("Train 3DGS", f"PLY ready: {ply_path}")
+        else:
+            _hy_log("Train 3DGS", "No PLY file found after training")
         camera_json = out_dir / "ply" / "trainer_cameras.json"
         if not camera_json.exists():
             candidates = sorted((out_dir / "ply").glob("trainer_cameras_*.json")) if (out_dir / "ply").exists() else []
@@ -2400,6 +2566,7 @@ class HYWorld2Train3DGS:
         poses, intrs = _load_camera_tensors_from_json(camera_json) if camera_json.exists() else (torch.empty((0, 4, 4)), torch.empty((0, 3, 3)))
         if poses.numel() > 0:
             poses = torch.stack([_worldstereo_c2w_to_worldmirror_c2w(pose) for pose in poses]).float()
+        _hy_log("Train 3DGS", f"Stage 5/5 complete: cameras={int(poses.shape[0]) if poses.ndim >= 1 else 0}, camera_json={camera_json}")
         info = {
             "ply_path": ply_path,
             "train_dir": str(out_dir),
