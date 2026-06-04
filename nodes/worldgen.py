@@ -29,10 +29,6 @@ WORLDGEN_DIR = PROJECT_ROOT / "hyworld2" / "worldgen"
 SAM3_REPO_ID = "MIUProject/sam3"
 SAM3_LOCAL_DIRNAME = "MIUProject_sam3"
 SH_C0 = 0.28209479177387814
-WORLDSTEREO_LIGHT_SINGLE_MODELS = {
-    "worldstereo-memory-dmd": "vnccs-worldstereo-memory-dmd-int4.safetensors",
-    "worldstereo-camera": "vnccs-worldstereo-camera-light-int4.safetensors",
-}
 
 
 def _default_sam3_path() -> str:
@@ -746,11 +742,6 @@ def _worldstereo_cli_args(worldstereo_model, model_type):
         if pretrained_path.exists():
             args.extend(["--pretrained_path", str(pretrained_path).replace("\\", "/")])
             args.append("--local_files_only")
-        single_model_name = WORLDSTEREO_LIGHT_SINGLE_MODELS.get(model_type)
-        if single_model_name:
-            single_model_path = models_root / "WorldStereoLight" / single_model_name
-            if single_model_path.exists():
-                args.extend(["--single_model_path", str(single_model_path).replace("\\", "/")])
         moge_dir = models_root / "MoGe"
         if moge_dir.exists():
             args.extend(["--moge_path", str(moge_dir).replace("\\", "/")])
@@ -767,6 +758,16 @@ def _worldstereo_cli_args(worldstereo_model, model_type):
     moge_dir = worldstereo_model.get("moge_dir")
     if moge_dir:
         args.extend(["--moge_path", str(moge_dir).replace("\\", "/")])
+    if worldstereo_model.get("loader_type") == "worldstereo_light":
+        text_encoder_path = worldstereo_model.get("text_encoder_path")
+        if text_encoder_path:
+            args.extend(["--text_encoder_path", str(text_encoder_path).replace("\\", "/")])
+        vae_path = worldstereo_model.get("vae_path")
+        if vae_path:
+            args.extend(["--vae_path", str(vae_path).replace("\\", "/")])
+        comfy_root = worldstereo_model.get("comfy_root")
+        if comfy_root:
+            args.extend(["--comfy_root", str(comfy_root).replace("\\", "/")])
     if resolved_model_type not in ("worldstereo-memory", "worldstereo-memory-dmd"):
         raise ValueError(
             f"video_gen.py supports worldstereo-memory/worldstereo-memory-dmd, got {resolved_model_type!r}. "
@@ -1013,7 +1014,7 @@ class VNCCS_WorldGenWorldStereoVideo:
             },
             "optional": {
                 "worldstereo_model": ("WORLDSTEREO_MODEL", {
-                    "tooltip": "Optional. Connect Load WorldStereo Model only for custom paths; otherwise WorldGen resolves local model folders without loading a model in ComfyUI.",
+                    "tooltip": "Optional. Connect Load WorldStereo Model for full models or Load WorldStereoLight Model for light single-file models.",
                 }),
                 "model_type": (["worldstereo-memory", "worldstereo-memory-dmd"], {"default": "worldstereo-memory-dmd"}),
                 "nproc_per_node": ("INT", {"default": 1, "min": 1, "max": 8, "step": 1}),

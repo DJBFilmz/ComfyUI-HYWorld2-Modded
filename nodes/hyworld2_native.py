@@ -1,5 +1,6 @@
 import contextlib
 import gc
+import hashlib
 import json
 import os
 import shutil
@@ -47,7 +48,8 @@ HYWORLD2_QWENVL_MODELS = {
     "Qwen2.5-VL-3B-Instruct": {"repo_id": "Qwen/Qwen2.5-VL-3B-Instruct", "quantized": False},
     "Qwen2.5-VL-7B-Instruct": {"repo_id": "Qwen/Qwen2.5-VL-7B-Instruct", "quantized": False},
 }
-HYWORLD2_QWENVL_DEFAULT = "Qwen3-VL-8B-Instruct"
+HYWORLD2_QWENVL_DEFAULT = "Qwen3-VL-4B-Instruct"
+HYWORLD2_QWENVL_DEFAULT_QUANTIZATION = "4-bit (VRAM-friendly)"
 HYWORLD2_QWENVL_QUANTIZATION = ["None (FP16)", "8-bit (Balanced)", "4-bit (VRAM-friendly)"]
 HYWORLD2_QWENVL_ATTENTION = ["auto", "sage", "flash_attention_2", "sdpa"]
 HYWORLD2_QWENVL_MAX_IMAGE_EDGE = 768
@@ -274,6 +276,140 @@ def _hyworld2_missing_memory_prerequisites(scene):
     if not pano_depths:
         missing.append(str(render_root / "pano_bank" / "depths" / "*.png"))
     return missing
+
+
+def _hyworld2_file_sha256(path):
+    path = Path(path)
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    stat = path.stat()
+    return {"sha256": digest.hexdigest(), "size": stat.st_size}
+
+
+def _hyworld2_trajectory_state_path(scene):
+    return Path(scene) / "hyworld2_trajectories_state.json"
+
+
+def _hyworld2_read_json_file(path, default=None):
+    path = Path(path)
+    if not path.is_file():
+        return default
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        return default
+
+
+def _hyworld2_write_json_file(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def _hyworld2_pil_pixel_fingerprint(image):
+    image = image.convert("RGB")
+    digest = hashlib.sha256()
+    digest.update(f"{image.size[0]}x{image.size[1]}:RGB:".encode("ascii"))
+    digest.update(image.tobytes())
+    return {"sha256": digest.hexdigest(), "width": image.size[0], "height": image.size[1], "mode": "RGB"}
+
+
+def _hyworld2_image_file_pixel_fingerprint(path):
+    path = Path(path)
+    if not path.is_file():
+        return None
+    with Image.open(path) as image:
+        return _hyworld2_pil_pixel_fingerprint(image)
+
+
+def _hyworld2_image_tensor_fingerprint(image_tensor):
+    if image_tensor is None:
+        return None
+    tensor = image_tensor.detach().cpu().contiguous()
+    digest = hashlib.sha256()
+    digest.update(str(tuple(tensor.shape)).encode("ascii"))
+    digest.update(str(tensor.dtype).encode("ascii"))
+    digest.update(tensor.numpy().tobytes())
+    return {"sha256": digest.hexdigest(), "shape": list(tensor.shape), "dtype": str(tensor.dtype)}
+
+
+def _hyworld2_workspace_state_path(scene):
+    return Path(scene) / "hyworld2_workspace_state.json"
+
+
+def _hyworld2_clear_workspace_derivatives(scene):
+    scene = Path(scene).resolve()
+    render_root = scene / "render_results"
+    if render_root.exists():
+        resolved = render_root.resolve()
+        if scene not in resolved.parents:
+            raise RuntimeError(f"Refusing to clear unexpected render_results directory: {render_root}")
+        shutil.rmtree(render_root)
+    for path in (
+        scene / "hyworld2_trajectories_state.json",
+        scene / "hyworld2_qwenvl_scene.json",
+        scene / "objects.json",
+        scene / "meta_info.json",
+    ):
+        if path.exists():
+            path.unlink()
+
+
+def _hyworld2_trajectory_dirs(render_root):
+    render_root = Path(render_root)
+    if not render_root.is_dir():
+        return []
+    return sorted(path.parent for path in render_root.glob("**/render.mp4") if path.is_file())
+
+
+def _hyworld2_trajectory_cache_status(scene, settings_signature, require_nav=False, require_anchor=False, anchor_topk=0, caption_mode="qwenvl_missing"):
+    scene = Path(scene)
+    render_root = scene / "render_results"
+    state = _hyworld2_read_json_file(_hyworld2_trajectory_state_path(scene), default={}) or {}
+    current_pano = _hyworld2_file_sha256(scene / "panorama.png")
+    cached_pano = state.get("panorama")
+    if not current_pano:
+        return False, "panorama.png is missing", state
+    if cached_pano != current_pano:
+        return False, "panorama cache mismatch", state
+    if state.get("settings_signature") != settings_signature:
+        return False, "trajectory settings changed", state
+
+    missing_geometry = _hyworld2_missing_memory_prerequisites(scene)
+    if missing_geometry:
+        return False, "base geometry is incomplete", state
+
+    trajectory_dirs = _hyworld2_trajectory_dirs(render_root)
+    if not trajectory_dirs:
+        return False, "no rendered trajectories found", state
+
+    if require_nav:
+        nav_dirs = [
+            path for path in trajectory_dirs
+            if any(part.startswith("target_") or part.startswith("reconstruct_") for part in path.parts)
+        ]
+        if not (scene / "objects.json").is_file():
+            return False, "object navigation requested but objects.json is missing", state
+        if not nav_dirs:
+            return False, "object navigation requested but no object trajectory renders were found", state
+
+    if require_anchor and int(anchor_topk) > 0:
+        anchor_dirs = [path for path in trajectory_dirs if any(part.startswith("wonder_scan_") for part in path.parts)]
+        if len(anchor_dirs) < int(anchor_topk):
+            return False, f"anchor scan requested but only {len(anchor_dirs)}/{int(anchor_topk)} scan renders were found", state
+
+    if caption_mode != "existing_files_only":
+        missing_caption = [path for path in trajectory_dirs if not (path / "traj_caption.json").is_file()]
+        if missing_caption:
+            return False, "trajectory captions are incomplete", state
+
+    return True, "cached trajectory workspace is complete", state
 
 
 def _release_model_memory(label="HYWorld2"):
@@ -713,6 +849,34 @@ def _worldstereo_c2w_to_worldmirror_c2w(c2w):
     c2w = c2w.detach().cpu().float()
     basis = _WORLDSTEREO_TO_WORLDMIRROR_BASIS.to(dtype=c2w.dtype)
     return basis @ c2w
+
+
+def _normalize_c2w_poses_to_first(poses):
+    """Match worldrecon.pipeline prior-camera normalization: inv(first_pose) @ pose."""
+    if not isinstance(poses, torch.Tensor) or poses.numel() == 0:
+        return poses
+    work = poses.detach().cpu().float()
+    squeeze_batch = False
+    trim_3x4 = False
+    if work.dim() == 4 and work.shape[0] == 1:
+        work = work[0]
+        squeeze_batch = True
+    if work.dim() != 3 or work.shape[-2:] not in ((3, 4), (4, 4)):
+        return poses
+    if work.shape[-2:] == (3, 4):
+        trim_3x4 = True
+        bottom = torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=work.dtype).view(1, 1, 4).repeat(work.shape[0], 1, 1)
+        work = torch.cat([work, bottom], dim=1)
+    try:
+        inv_first = torch.linalg.inv(work[0])
+        normalized = inv_first.unsqueeze(0) @ work
+    except Exception:
+        return poses
+    if trim_3x4:
+        normalized = normalized[:, :3, :]
+    if squeeze_batch:
+        normalized = normalized.unsqueeze(0)
+    return normalized.to(dtype=poses.dtype)
 
 
 def _quat_wxyz_multiply(a, b):
@@ -1163,6 +1327,8 @@ def _ensure_trajectory_planner_context(
     from hyworld2.worldgen.src.vlm_utils import get_qwen_caption_format
     from hyworld2.worldgen.src.navi_utils import get_navigation_instruction
 
+    qwen_device = "auto"
+    qwen_cpu_offload = False
     scene = Path(workspace["scene_dir"])
     panorama = _load_workspace_panorama(scene)
     pano_tensor = _pil_list_to_image_tensor([panorama])
@@ -1404,7 +1570,6 @@ class HYWorld2Workspace:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "mode": (["create", "load_existing", "resume"], {"default": "resume"}),
                 "workspace_name": ("STRING", {"default": "comfy_worldgen"}),
             },
             "optional": {
@@ -1421,24 +1586,68 @@ class HYWorld2Workspace:
     FUNCTION = "build"
     CATEGORY = "VNCCS/HYWorld2"
 
-    def build(self, mode, workspace_name, root_dir="", scene_dir="", panorama=None, scene_type="unknown", result_name="worldstereo-memory-dmd"):
-        _hy_log("Workspace", f"Stage 1/3: resolving workspace (mode={mode}, name={workspace_name})")
-        if mode in ("load_existing", "resume") and str(scene_dir).strip():
+    @classmethod
+    def IS_CHANGED(cls, workspace_name, **kwargs):
+        scene_dir = str(kwargs.get("scene_dir", "") or "").strip()
+        if scene_dir:
+            scene = Path(scene_dir)
+        else:
+            root_dir = str(kwargs.get("root_dir", "") or "").strip()
+            root = Path(root_dir) if root_dir else _output_root() / "hyworld2_worldgen"
+            scene = root / _sanitize_name(workspace_name, "comfy_worldgen")
+        watched = [
+            scene / "panorama.png",
+            scene / "hyworld2_workspace_state.json",
+            scene / "meta_info.json",
+        ]
+        state = [str(scene), _safe_json_dumps({key: kwargs[key] for key in sorted(kwargs) if key != "panorama"})]
+        if kwargs.get("panorama") is not None:
+            state.append(_safe_json_dumps({"input_panorama": _hyworld2_image_tensor_fingerprint(kwargs.get("panorama"))}))
+        for path in watched:
+            if path.exists():
+                stat = path.stat()
+                state.append(f"{path}:{stat.st_mtime_ns}:{stat.st_size}")
+            else:
+                state.append(f"{path}:missing")
+        return "|".join(state)
+
+    def build(self, workspace_name, root_dir="", scene_dir="", panorama=None, scene_type="unknown", result_name="worldstereo-memory-dmd"):
+        _hy_log("Workspace", f"Stage 1/3: resolving workspace (name={workspace_name})")
+        if str(scene_dir).strip():
             scene = Path(scene_dir)
         else:
             root = Path(root_dir) if str(root_dir).strip() else _output_root() / "hyworld2_worldgen"
             scene = root / _sanitize_name(workspace_name, "comfy_worldgen")
         _hy_log("Workspace", f"Workspace directory: {scene}")
         _ensure_dir(scene)
-        _ensure_dir(scene / "render_results")
+        workspace_state_path = _hyworld2_workspace_state_path(scene)
+        workspace_state = _hyworld2_read_json_file(workspace_state_path, default={}) or {}
+        cache_action = "reuse_without_panorama_input"
         if panorama is not None:
-            _hy_log("Workspace", "Stage 2/3: saving input panorama")
+            _hy_log("Workspace", "Stage 2/3: checking input panorama cache")
             frames = _image_tensor_to_pil_list(panorama)
             if frames:
-                frames[0].save(scene / "panorama.png")
-                _hy_log("Workspace", f"Saved panorama: {scene / 'panorama.png'}")
+                incoming = frames[0].convert("RGB")
+                incoming_fp = _hyworld2_pil_pixel_fingerprint(incoming)
+                existing_fp = _hyworld2_image_file_pixel_fingerprint(scene / "panorama.png")
+                cached_fp = workspace_state.get("panorama")
+                if existing_fp == incoming_fp:
+                    cache_action = "panorama_unchanged"
+                    _hy_log("Workspace", "Input panorama matches workspace panorama; keeping existing derived files")
+                else:
+                    cache_action = "panorama_changed" if existing_fp else "panorama_initialized"
+                    _hy_log("Workspace", f"Input panorama cache miss ({cache_action}); clearing derived workspace files")
+                    _hyworld2_clear_workspace_derivatives(scene)
+                    _ensure_dir(scene)
+                    incoming.save(scene / "panorama.png")
+                    _hy_log("Workspace", f"Saved panorama: {scene / 'panorama.png'}")
+                if cached_fp != incoming_fp:
+                    workspace_state["panorama"] = incoming_fp
+            else:
+                _hy_log("Workspace", "Stage 2/3: panorama input is empty; reusing workspace files")
         else:
             _hy_log("Workspace", "Stage 2/3: no panorama input connected; reusing workspace files")
+        _ensure_dir(scene / "render_results")
         meta_path = scene / "meta_info.json"
         meta = {}
         if meta_path.exists():
@@ -1448,15 +1657,21 @@ class HYWorld2Workspace:
                 meta.update(loaded)
         if scene_type != "unknown" or "scene_type" not in meta:
             meta["scene_type"] = scene_type
-        _hy_log("Workspace", f"Stage 3/3: writing metadata scene_type={meta.get('scene_type', 'unknown')}")
+        workspace_state["workspace_name"] = workspace_name
+        workspace_state["result_name"] = result_name
+        workspace_state["scene_type"] = meta.get("scene_type", "unknown")
+        workspace_state["cache_action"] = cache_action
+        _hy_log("Workspace", f"Stage 3/3: writing metadata scene_type={meta.get('scene_type', 'unknown')}, cache_action={cache_action}")
         with open(meta_path, "w", encoding="utf-8") as handle:
             json.dump(meta, handle, indent=2)
+        _hyworld2_write_json_file(workspace_state_path, workspace_state)
         workspace = {
             "scene_dir": str(scene),
             "render_results_dir": str(scene / "render_results"),
             "workspace_name": workspace_name,
             "result_name": result_name,
             "scene_type": meta.get("scene_type", "unknown"),
+            "cache_action": cache_action,
         }
         _hy_log("Workspace", "Workspace ready")
         return (workspace, _safe_json_dumps(workspace))
@@ -1467,27 +1682,24 @@ class HYWorld2QwenVL:
 
     @classmethod
     def INPUT_TYPES(cls):
-        device_options = ["auto", "cpu", "mps"] + [f"cuda:{i}" for i in range(torch.cuda.device_count())]
         return {
             "required": {
                 "workspace": ("HYWORLD2_WORKSPACE",),
                 "mode": (["scene_objects", "trajectory_caption", "prompt_refine"], {"default": "trajectory_caption"}),
                 "model_id": (_qwenvl_model_names(), {"default": HYWORLD2_QWENVL_DEFAULT}),
-                "quantization": (HYWORLD2_QWENVL_QUANTIZATION, {"default": "None (FP16)"}),
+                "quantization": (HYWORLD2_QWENVL_QUANTIZATION, {"default": HYWORLD2_QWENVL_DEFAULT_QUANTIZATION}),
                 "attention_mode": (HYWORLD2_QWENVL_ATTENTION, {"default": "auto"}),
                 "prompt": ("STRING", {"default": "", "multiline": True}),
             },
             "optional": {
                 "images": ("IMAGE",),
                 "trajectory_set": ("HYWORLD2_TRAJECTORY_SET",),
-                "device": (device_options, {"default": "auto"}),
                 "max_new_tokens": ("INT", {"default": 256, "min": 16, "max": 4096, "step": 16}),
                 "max_image_edge": ("INT", {"default": HYWORLD2_QWENVL_MAX_IMAGE_EDGE, "min": 128, "max": 4096, "step": 64}),
                 "temperature": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.5, "step": 0.05}),
                 "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "num_beams": ("INT", {"default": 1, "min": 1, "max": 8}),
                 "repetition_penalty": ("FLOAT", {"default": 1.2, "min": 0.5, "max": 2.0, "step": 0.05}),
-                "cpu_offload": ("BOOLEAN", {"default": True}),
                 "keep_model_loaded": ("BOOLEAN", {"default": True}),
                 "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1}),
                 "write_results": ("BOOLEAN", {"default": True}),
@@ -1515,7 +1727,7 @@ class HYWorld2QwenVL:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def _load_bundle(self, model_id, quantization="None (FP16)", attention_mode="auto", device="auto", keep_model_loaded=True, cpu_offload=False):
+    def _load_bundle(self, model_id, quantization=HYWORLD2_QWENVL_DEFAULT_QUANTIZATION, attention_mode="auto", device="auto", keep_model_loaded=True, cpu_offload=False):
         try:
             from transformers import AutoProcessor, AutoTokenizer
             try:
@@ -1525,6 +1737,8 @@ class HYWorld2QwenVL:
         except Exception as exc:
             raise ImportError("QwenVL requires transformers with vision-language model support. Install project requirements.") from exc
 
+        device = "auto"
+        cpu_offload = False
         requested_device = str(device or "auto").strip()
         selected_device = _qwenvl_normalize_device(device)
         allow_cpu_offload = bool(cpu_offload) and requested_device == "auto" and torch.cuda.is_available()
@@ -1561,8 +1775,6 @@ class HYWorld2QwenVL:
         print(f"[HYWorld2 QwenVL] Local model path: {model_path}")
         if "max_memory" in load_kwargs:
             print(f"[HYWorld2 QwenVL] Accelerate max_memory: {load_kwargs['max_memory']}")
-        if quant_cfg is not None and str(quantization) == "8-bit (Balanced)" and allow_cpu_offload:
-            print("[HYWorld2 QwenVL] 8-bit CPU offload enabled (llm_int8_enable_fp32_cpu_offload=True)")
         model = AutoModel.from_pretrained(model_path, **load_kwargs).eval()
         if selected_device in ("cpu", "mps") or is_fp8:
             model = model.to(selected_device)
@@ -1585,7 +1797,7 @@ class HYWorld2QwenVL:
         device="auto",
         max_new_tokens=256,
         max_image_edge=HYWORLD2_QWENVL_MAX_IMAGE_EDGE,
-        quantization="None (FP16)",
+        quantization=HYWORLD2_QWENVL_DEFAULT_QUANTIZATION,
         attention_mode="auto",
         temperature=0.6,
         top_p=0.9,
@@ -1658,11 +1870,13 @@ class HYWorld2QwenVL:
         top_p=0.9,
         num_beams=1,
         repetition_penalty=1.2,
-        cpu_offload=True,
+        cpu_offload=False,
         keep_model_loaded=True,
         seed=1,
         write_results=True,
     ):
+        device = "auto"
+        cpu_offload = False
         scene = Path(workspace["scene_dir"])
         _hy_log("QwenVL", f"Stage 1/3: preparing prompt (mode={mode})")
         if not prompt.strip():
@@ -1725,21 +1939,16 @@ class HYWorld2QwenVL:
 class HYWorld2Trajectories:
     @classmethod
     def INPUT_TYPES(cls):
-        device_options = ["auto", "cpu", "mps"] + [f"cuda:{i}" for i in range(torch.cuda.device_count())]
         return {
             "required": {
                 "workspace": ("HYWORLD2_WORKSPACE",),
-                "mode": (["generate_and_render_official", "reuse_existing"], {"default": "generate_and_render_official"}),
             },
             "optional": {
-                "skip_existing": ("BOOLEAN", {"default": True}),
                 "seed": ("INT", {"default": 1024, "min": 0, "max": 2**31 - 1}),
                 "scene_type": (["auto", "indoor", "outdoor"], {"default": "auto"}),
-                "apply_nav_traj": ("BOOLEAN", {"default": False}),
+                "additional_nav_traj": ("BOOLEAN", {"default": False}),
                 "qwen_model_id": (_qwenvl_model_names(), {"default": HYWORLD2_QWENVL_DEFAULT}),
-                "qwen_quantization": (HYWORLD2_QWENVL_QUANTIZATION, {"default": "None (FP16)"}),
-                "qwen_device": (device_options, {"default": "auto"}),
-                "qwen_cpu_offload": ("BOOLEAN", {"default": True}),
+                "qwen_quantization": (HYWORLD2_QWENVL_QUANTIZATION, {"default": HYWORLD2_QWENVL_DEFAULT_QUANTIZATION}),
                 "qwen_max_image_edge": ("INT", {"default": HYWORLD2_QWENVL_MAX_IMAGE_EDGE, "min": 128, "max": 4096, "step": 64}),
                 "apply_anchor_scan": ("BOOLEAN", {"default": False}),
                 "anchor_scan_topk": ("INT", {"default": 2, "min": 0, "max": 32}),
@@ -1752,10 +1961,11 @@ class HYWorld2Trajectories:
     CATEGORY = "VNCCS/HYWorld2"
 
     @classmethod
-    def IS_CHANGED(cls, workspace, mode, **kwargs):
+    def IS_CHANGED(cls, workspace, **kwargs):
         scene = Path(workspace["scene_dir"])
         watched = [
             scene / "panorama.png",
+            scene / "hyworld2_trajectories_state.json",
             scene / "meta_info.json",
             scene / "objects.json",
             scene / "render_results" / "global_pcd.ply",
@@ -1763,7 +1973,9 @@ class HYWorld2Trajectories:
             scene / "render_results" / "sky_mask.png",
             scene / "render_results" / "pano_bank" / "cameras.json",
         ]
-        state = [str(scene), str(mode)]
+        state = [str(scene)]
+        if kwargs:
+            state.append(_safe_json_dumps({key: kwargs[key] for key in sorted(kwargs)}))
         for path in watched:
             if path.exists():
                 stat = path.stat()
@@ -1788,13 +2000,23 @@ class HYWorld2Trajectories:
         }
         return (data, _safe_json_dumps(data))
 
+    def _settings_signature(self, **settings):
+        normalized = {}
+        for key, value in settings.items():
+            if isinstance(value, Path):
+                normalized[key] = str(value)
+            elif isinstance(value, (bool, int, float, str)) or value is None:
+                normalized[key] = value
+            else:
+                normalized[key] = str(value)
+        return hashlib.sha256(_safe_json_dumps(normalized).encode("utf-8")).hexdigest(), normalized
+
     def run(
         self,
         workspace,
-        mode,
-        skip_existing=True,
         seed=1024,
         scene_type="auto",
+        additional_nav_traj=False,
         fov_x=120.0,
         fov_y=90.0,
         split_view_num=3,
@@ -1807,7 +2029,6 @@ class HYWorld2Trajectories:
         up_right=60.0,
         obs_decay=2 / 3,
         contract=8.0,
-        skip_exist=True,
         apply_nav_traj=False,
         wonder_topk=3,
         recon_topk=5,
@@ -1832,10 +2053,10 @@ class HYWorld2Trajectories:
         render_processes=0,
         caption_mode="qwenvl_missing",
         qwen_model_id=HYWORLD2_QWENVL_DEFAULT,
-        qwen_quantization="None (FP16)",
+        qwen_quantization=HYWORLD2_QWENVL_DEFAULT_QUANTIZATION,
         qwen_attention_mode="auto",
         qwen_device="auto",
-        qwen_cpu_offload=True,
+        qwen_cpu_offload=False,
         qwen_max_image_edge=HYWORLD2_QWENVL_MAX_IMAGE_EDGE,
         qwen_max_new_tokens=256,
         qwen_keep_model_loaded=True,
@@ -1846,26 +2067,86 @@ class HYWorld2Trajectories:
         anchor_scan_min_separation=0.75,
         anchor_scan_yaw_degrees=360.0,
     ):
-        if mode == "reuse_existing":
-            scene = Path(workspace["scene_dir"])
-            missing = _hyworld2_missing_memory_prerequisites(scene)
-            if missing:
-                raise FileNotFoundError(
-                    "HYWorld2 Trajectories cannot reuse this workspace because required base geometry is missing. "
-                    "Run HYWorld2 Trajectories in generate_and_render_official mode first. Missing:\n"
-                    + "\n".join(f"- {path}" for path in missing)
-                )
-            print(f"[HYWorld2 Trajectories] Reusing existing trajectory renders from {scene / 'render_results'}")
-            return self._sort(workspace, generated=False)
-        if mode != "generate_and_render_official":
-            raise ValueError(f"Unsupported HYWorld2 Trajectories mode: {mode}")
-        skip_exist = bool(skip_existing)
-
+        qwen_device = "auto"
+        qwen_cpu_offload = False
+        apply_nav_traj = bool(additional_nav_traj or apply_nav_traj)
         scene = Path(workspace["scene_dir"])
         render_root = scene / "render_results"
-        render_root_existed = render_root.exists()
-        _ensure_dir(render_root)
         logs = []
+        settings_signature, settings_state = self._settings_signature(
+            seed=int(seed),
+            scene_type=str(scene_type),
+            additional_nav_traj=bool(apply_nav_traj),
+            fov_x=float(fov_x),
+            fov_y=float(fov_y),
+            split_view_num=int(split_view_num),
+            splitted_resolution=int(splitted_resolution),
+            nframe=int(nframe),
+            distance_threshold=float(distance_threshold),
+            obs_iteration_limit=int(obs_iteration_limit),
+            rotation_deg=float(rotation_deg),
+            rotation_up=float(rotation_up),
+            up_right=float(up_right),
+            obs_decay=float(obs_decay),
+            contract=float(contract),
+            wonder_topk=int(wonder_topk),
+            recon_topk=int(recon_topk),
+            move_dist=float(move_dist),
+            radius_threshold=float(radius_threshold),
+            min_angle_threshold=float(min_angle_threshold),
+            traj_sim_threshold=float(traj_sim_threshold),
+            traj_sim_threshold_recon=float(traj_sim_threshold_recon),
+            apply_up_route=bool(apply_up_route),
+            apply_recon_iteration=bool(apply_recon_iteration),
+            eloop_dist=float(eloop_dist),
+            force_vlm=bool(force_vlm),
+            cellSize=float(cellSize),
+            cellHeight=float(cellHeight),
+            agentHeight=float(agentHeight),
+            agentRadius=float(agentRadius),
+            agentMaxClimb=float(agentMaxClimb),
+            maxSlope=float(maxSlope),
+            roof_height_threshold=float(roof_height_threshold),
+            sam3_path=str(sam3_path or HYWORLD2_SAM3_REPO_ID),
+            local_files_only=bool(local_files_only),
+            caption_mode=str(caption_mode),
+            qwen_model_id=str(qwen_model_id),
+            qwen_quantization=str(qwen_quantization),
+            qwen_attention_mode=str(qwen_attention_mode),
+            qwen_max_image_edge=int(qwen_max_image_edge),
+            qwen_max_new_tokens=int(qwen_max_new_tokens),
+            qwen_frame_count=int(qwen_frame_count),
+            apply_anchor_scan=bool(apply_anchor_scan),
+            anchor_scan_topk=int(anchor_scan_topk),
+            anchor_scan_min_distance=float(anchor_scan_min_distance),
+            anchor_scan_min_separation=float(anchor_scan_min_separation),
+            anchor_scan_yaw_degrees=float(anchor_scan_yaw_degrees),
+        )
+        cache_ok, cache_reason, cache_state = _hyworld2_trajectory_cache_status(
+            scene,
+            settings_signature,
+            require_nav=bool(apply_nav_traj),
+            require_anchor=bool(apply_anchor_scan),
+            anchor_topk=int(anchor_scan_topk),
+            caption_mode=str(caption_mode),
+        )
+        if cache_ok:
+            print(f"[HYWorld2 Trajectories] Auto cache hit: {cache_reason}. Reusing {render_root}")
+            logs.append({"stage": "auto_cache", "action": "reuse_existing", "reason": cache_reason})
+            return self._sort(workspace, generated=False, logs=logs)
+
+        skip_exist = True
+        render_root_existed = render_root.exists()
+        if cache_reason == "panorama cache mismatch" and render_root_existed:
+            print("[HYWorld2 Trajectories] Source panorama changed; clearing stale render_results for full regeneration.")
+            shutil.rmtree(render_root)
+            render_root_existed = False
+            skip_exist = False
+            logs.append({"stage": "auto_cache", "action": "full_regeneration", "reason": cache_reason})
+        else:
+            logs.append({"stage": "auto_cache", "action": "generate", "reason": cache_reason})
+
+        _ensure_dir(render_root)
         missing_geometry = _hyworld2_missing_memory_prerequisites(scene)
         if skip_exist and missing_geometry and render_root_existed:
             print("[HYWorld2 Trajectories] Existing render_results is incomplete; forcing geometry/trajectory rebuild.")
@@ -2000,6 +2281,17 @@ class HYWorld2Trajectories:
         )
         HYWorld2QwenVL._clear_cache()
         print(f"[HYWorld2 Trajectories] Stage 5/5 complete: wrote {len(captions_written)} caption file(s)")
+        _hyworld2_write_json_file(
+            _hyworld2_trajectory_state_path(scene),
+            {
+                "panorama": _hyworld2_file_sha256(scene / "panorama.png"),
+                "settings_signature": settings_signature,
+                "settings": settings_state,
+                "render_count": len(render_list),
+                "captions_written": len(captions_written),
+                "anchor_scans_written": len(anchor_scans_written),
+            },
+        )
         data = {
             "workspace": workspace,
             "render_list": render_list,
@@ -2055,7 +2347,7 @@ class HYWorld2MemoryBank:
         if int(trajectory_set.get("count", 0)) <= 0:
             raise ValueError(
                 "HYWorld2 Memory Bank requires a non-empty HYWorld2 Trajectories output. "
-                "Connect HYWorld2 Trajectories.trajectory_set and run generate_and_render_official first."
+                "Connect HYWorld2 Trajectories.trajectory_set and let it build or reuse the trajectory workspace first."
             )
         missing = _hyworld2_missing_memory_prerequisites(scene)
         if missing:
@@ -2115,7 +2407,6 @@ class HYWorld2MemoryBank:
 class HYWorld2WorldExpansion:
     @classmethod
     def INPUT_TYPES(cls):
-        device_options = ["auto", "cpu", "mps"] + [f"cuda:{i}" for i in range(torch.cuda.device_count())]
         return {
             "required": {
                 "workspace": ("HYWORLD2_WORKSPACE",),
@@ -2126,10 +2417,8 @@ class HYWorld2WorldExpansion:
             "optional": {
                 "caption_mode": (["qwenvl_missing", "qwenvl_overwrite", "existing_files_only"], {"default": "qwenvl_missing"}),
                 "qwen_model_id": (_qwenvl_model_names(), {"default": HYWORLD2_QWENVL_DEFAULT}),
-                "qwen_quantization": (HYWORLD2_QWENVL_QUANTIZATION, {"default": "None (FP16)"}),
+                "qwen_quantization": (HYWORLD2_QWENVL_QUANTIZATION, {"default": HYWORLD2_QWENVL_DEFAULT_QUANTIZATION}),
                 "qwen_attention_mode": (HYWORLD2_QWENVL_ATTENTION, {"default": "auto"}),
-                "qwen_device": (device_options, {"default": "auto"}),
-                "qwen_cpu_offload": ("BOOLEAN", {"default": True}),
                 "qwen_max_image_edge": ("INT", {"default": HYWORLD2_QWENVL_MAX_IMAGE_EDGE, "min": 128, "max": 4096, "step": 64}),
                 "qwen_max_new_tokens": ("INT", {"default": 192, "min": 16, "max": 2048, "step": 16}),
                 "qwen_keep_model_loaded": ("BOOLEAN", {"default": True}),
@@ -2153,16 +2442,18 @@ class HYWorld2WorldExpansion:
         qwen_model_id,
         qwen_device,
         qwen_max_new_tokens,
-        qwen_quantization="None (FP16)",
+        qwen_quantization=HYWORLD2_QWENVL_DEFAULT_QUANTIZATION,
         qwen_attention_mode="auto",
         qwen_keep_model_loaded=True,
-        qwen_cpu_offload=True,
+        qwen_cpu_offload=False,
         qwen_max_image_edge=HYWORLD2_QWENVL_MAX_IMAGE_EDGE,
         qwen_frame_count=4,
     ):
         if caption_mode == "existing_files_only":
             _hy_log("World Expansion", "Caption stage: existing_files_only, not generating captions")
             return []
+        qwen_device = "auto"
+        qwen_cpu_offload = False
         qwen = HYWorld2QwenVL()
         written = []
         _hy_log("World Expansion", f"Caption stage: mode={caption_mode}, trajectories={len(render_list)}, model={qwen_model_id}, cpu_offload={bool(qwen_cpu_offload)}")
@@ -2227,10 +2518,10 @@ class HYWorld2WorldExpansion:
         model,
         caption_mode="qwenvl_missing",
         qwen_model_id=HYWORLD2_QWENVL_DEFAULT,
-        qwen_quantization="None (FP16)",
+        qwen_quantization=HYWORLD2_QWENVL_DEFAULT_QUANTIZATION,
         qwen_attention_mode="auto",
         qwen_device="auto",
-        qwen_cpu_offload=True,
+        qwen_cpu_offload=False,
         qwen_max_image_edge=HYWORLD2_QWENVL_MAX_IMAGE_EDGE,
         qwen_max_new_tokens=192,
         qwen_keep_model_loaded=True,
@@ -2239,6 +2530,8 @@ class HYWorld2WorldExpansion:
         skip_existing=True,
         max_trajectories=0,
     ):
+        qwen_device = "auto"
+        qwen_cpu_offload = False
         _hy_log("World Expansion", "Stage 1/6: preparing WorldStereo memory expansion")
         _ensure_worldgen_path()
         from hyworld2.worldgen.src.data_utils import load_mutli_traj_dataset
@@ -2253,40 +2546,74 @@ class HYWorld2WorldExpansion:
         render_list = list(trajectory_set.get("render_list", []))
         if int(max_trajectories) > 0:
             render_list = render_list[: int(max_trajectories)]
-        _hy_log("World Expansion", f"Stage 2/6: trajectory count={len(render_list)}, device={device}, model_type={model_type}")
-        _hy_log("World Expansion", "Stage 3/6: ensuring trajectory captions")
-        captions_written = self._ensure_captions(
-            workspace,
-            render_list,
-            caption_mode,
-            qwen_model_id,
-            qwen_device,
-            int(qwen_max_new_tokens),
-            qwen_quantization,
-            qwen_attention_mode,
-            bool(qwen_keep_model_loaded),
-            bool(qwen_cpu_offload),
-            int(qwen_max_image_edge),
-            int(qwen_frame_count),
-        )
-        _hy_log("World Expansion", f"Stage 3/6 complete: captions_written={len(captions_written)}")
-        _hy_log("World Expansion", "Stage 4/6: encoding prompt cache")
-        prompt_cache = _build_prompt_cache(model, workspace, render_list, model_type, device)
-        _hy_log("World Expansion", f"Stage 4/6 complete: cached {len(prompt_cache)} prompt embedding set(s)")
-        generator = torch.Generator(device=device).manual_seed(int(seed))
-        autocast_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-        completed = []
-        _hy_log("World Expansion", "Stage 5/6: generating trajectory videos and updating memory")
+        render_items = []
+        pending_render_list = []
+        existing_result_count = 0
         for render_path in render_list:
             render_parts = Path(render_path).parts
             view_id, traj_id = render_parts[-3], render_parts[-2]
             traj_dir = Path(workspace["scene_dir"]) / "render_results" / view_id / traj_id
             result_path = traj_dir / f"{model_type}_result.mp4"
+            has_result = result_path.is_file() and result_path.stat().st_size > 0
+            render_items.append(
+                {
+                    "render_path": render_path,
+                    "view_id": view_id,
+                    "traj_id": traj_id,
+                    "traj_dir": traj_dir,
+                    "result_path": result_path,
+                    "has_result": bool(has_result),
+                }
+            )
+            if bool(skip_existing) and has_result:
+                existing_result_count += 1
+            else:
+                pending_render_list.append(render_path)
+        _hy_log("World Expansion", f"Stage 2/6: trajectory count={len(render_list)}, device={device}, model_type={model_type}")
+        if bool(skip_existing):
+            _hy_log(
+                "World Expansion",
+                f"Existing WorldStereo result videos: {existing_result_count}/{len(render_list)}; "
+                f"pending generation: {len(pending_render_list)}",
+            )
+        _hy_log("World Expansion", "Stage 3/6: ensuring trajectory captions")
+        captions_written = []
+        if pending_render_list:
+            captions_written = self._ensure_captions(
+                workspace,
+                pending_render_list,
+                caption_mode,
+                qwen_model_id,
+                qwen_device,
+                int(qwen_max_new_tokens),
+                qwen_quantization,
+                qwen_attention_mode,
+                bool(qwen_keep_model_loaded),
+                bool(qwen_cpu_offload),
+                int(qwen_max_image_edge),
+                int(qwen_frame_count),
+            )
+        else:
+            _hy_log("World Expansion", "Stage 3/6: all result videos exist; caption generation skipped")
+        _hy_log("World Expansion", f"Stage 3/6 complete: captions_written={len(captions_written)}")
+        _hy_log("World Expansion", "Stage 4/6: encoding prompt cache")
+        prompt_cache = _build_prompt_cache(model, workspace, pending_render_list, model_type, device) if pending_render_list else {}
+        _hy_log("World Expansion", f"Stage 4/6 complete: cached {len(prompt_cache)} prompt embedding set(s)")
+        generator = torch.Generator(device=device).manual_seed(int(seed))
+        autocast_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+        completed = []
+        _hy_log("World Expansion", "Stage 5/6: generating trajectory videos and updating memory")
+        for item in render_items:
+            render_path = item["render_path"]
+            view_id = item["view_id"]
+            traj_id = item["traj_id"]
+            traj_dir = item["traj_dir"]
+            result_path = item["result_path"]
             _hy_log("World Expansion", f"Trajectory {len(completed)+1}/{len(render_list)}: {view_id}/{traj_id}")
             camera_data = json.load(open(traj_dir / "camera.json", "r", encoding="utf-8"))
             tar_w2cs = torch.from_numpy(np.asarray(camera_data["extrinsic"], dtype=np.float32)).to(device)
             tar_Ks = torch.from_numpy(np.asarray(camera_data["intrinsic"], dtype=np.float32)).to(device)
-            if skip_existing and result_path.exists():
+            if skip_existing and item["has_result"]:
                 _hy_log("World Expansion", f"Trajectory {view_id}/{traj_id}: reusing existing result {result_path}")
                 frames = _load_video_frames(result_path)
                 update_w2cs, update_Ks = _sample_camera_tensors_to_frame_count(tar_w2cs, tar_Ks, len(frames))
@@ -2391,7 +2718,7 @@ class HYWorld2PrepareWorldMirrorBatch:
             view_id, traj_id, frame_id = fname.split("/")
             image = bank.ref_frames[gi].convert("RGB")
             image.save(images_dir / f"{camera_id}.png")
-            pose = _worldstereo_w2c_to_worldmirror_c2w(bank.ref_w2cs[gi])
+            pose = torch.linalg.inv(bank.ref_w2cs[gi].detach().cpu().float())
             cameras["extrinsics"].append({"camera_id": camera_id, "matrix": pose.numpy().tolist()})
             cameras["intrinsics"].append({"camera_id": camera_id, "matrix": bank.ref_Ks[gi].detach().cpu().numpy().tolist()})
             images.append(image)
@@ -2407,7 +2734,8 @@ class HYWorld2PrepareWorldMirrorBatch:
         bank.world_mirror_dir = str(world_mirror_dir)
         bank.name_map = name_map
         image_tensor = _pil_list_to_image_tensor(images)
-        camera_poses = torch.stack(poses).float()
+        camera_poses_raw = torch.stack(poses).float()
+        camera_poses = _normalize_c2w_poses_to_first(camera_poses_raw)
         camera_intrinsics = torch.stack(intrs).float()
         batch = {
             "memory_bank": memory_bank,
@@ -2415,10 +2743,24 @@ class HYWorld2PrepareWorldMirrorBatch:
             "name_map": name_map,
             "images": image_tensor,
             "camera_poses": camera_poses,
+            "camera_poses_raw_c2w": camera_poses_raw,
             "camera_intrinsics": camera_intrinsics,
         }
         _hy_log("Prepare WorldMirror Batch", f"Stage 4/4 complete: images={len(images)}, world_mirror_dir={world_mirror_dir}")
-        return (image_tensor, camera_poses, camera_intrinsics, batch, _safe_json_dumps({"frames": len(images), "world_mirror_dir": world_mirror_dir}))
+        return (
+            image_tensor,
+            camera_poses,
+            camera_intrinsics,
+            batch,
+            _safe_json_dumps(
+                {
+                    "frames": len(images),
+                    "world_mirror_dir": world_mirror_dir,
+                    "cameras_json_pose_basis": "official_hyworld2_c2w",
+                    "camera_pose_tensor_basis": "official_first_relative_c2w",
+                }
+            ),
+        )
 
 
 class HYWorld2MemoryAlignment:
@@ -2566,24 +2908,35 @@ class HYWorld2Train3DGS:
                 "gs_data": ("HYWORLD2_GS_DATA",),
             },
             "optional": {
-                "max_steps": ("INT", {"default": 5000, "min": 1, "max": 100000, "step": 100}),
-                "save_steps": ("STRING", {"default": "4000,5000,6000,8000,10000"}),
-                "eval_steps": ("STRING", {"default": "1000,2000,3000,4000,5000,6000,7000,8000,9000,10000"}),
-                "ply_steps": ("STRING", {"default": "4000,5000,6000,8000,10000"}),
+                "max_steps": ("INT", {"default": 8000, "min": 1, "max": 100000, "step": 100}),
+                "save_steps": ("STRING", {"default": "8000"}),
+                "eval_steps": ("STRING", {"default": "8000"}),
+                "ply_steps": ("STRING", {"default": "8000"}),
                 "downsample_pts_num": ("INT", {"default": 1_000_000, "min": 1, "max": 50_000_000, "step": 100000}),
                 "save_ply": ("BOOLEAN", {"default": True}),
                 "disable_video": ("BOOLEAN", {"default": True}),
                 "disable_viewer": ("BOOLEAN", {"default": True}),
-                "depth_loss": ("BOOLEAN", {"default": False}),
-                "normal_loss": ("BOOLEAN", {"default": False}),
-                "sky_depth_from_pcd": ("BOOLEAN", {"default": False}),
-                "use_scale_regularization": ("BOOLEAN", {"default": False}),
-                "use_mask_gaussian": ("BOOLEAN", {"default": False}),
+                "depth_loss": ("BOOLEAN", {"default": True}),
+                "normal_loss": ("BOOLEAN", {"default": True}),
+                "sky_depth_from_pcd": ("BOOLEAN", {"default": True}),
+                "use_scale_regularization": ("BOOLEAN", {"default": True}),
+                "use_mask_gaussian": ("BOOLEAN", {"default": True}),
                 "mask_export_stochastic": ("BOOLEAN", {"default": True}),
+                "mask_export_anchor_protection": ("BOOLEAN", {"default": False}),
+                "use_anchor_protection": ("BOOLEAN", {"default": True}),
                 "do_prune": ("BOOLEAN", {"default": False}),
                 "prune_opacity_threshold": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 1.0, "step": 0.001}),
-                "antialiased": ("BOOLEAN", {"default": False}),
+                "antialiased": ("BOOLEAN", {"default": True}),
                 "normalize_world_space": ("BOOLEAN", {"default": True}),
+                "export_mesh": ("BOOLEAN", {"default": True}),
+                "strategy_refine_start_iter": ("INT", {"default": 150, "min": 0, "max": 100000, "step": 10}),
+                "strategy_refine_stop_iter": ("INT", {"default": 750, "min": 0, "max": 100000, "step": 10}),
+                "strategy_refine_every": ("INT", {"default": 100, "min": 1, "max": 100000, "step": 10}),
+                "strategy_refine_scale2d_stop_iter": ("INT", {"default": 750, "min": 0, "max": 100000, "step": 10}),
+                "strategy_reset_every": ("INT", {"default": 99990, "min": 1, "max": 1000000, "step": 10}),
+                "strategy_grow_grad2d": ("FLOAT", {"default": 0.0001, "min": 0.0, "max": 1.0, "step": 0.00001}),
+                "strategy_prune_scale3d": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 100.0, "step": 0.01}),
+                "convert_ply_to_worldmirror_preview_basis": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -2593,7 +2946,39 @@ class HYWorld2Train3DGS:
     CATEGORY = "VNCCS/HYWorld2"
     OUTPUT_NODE = True
 
-    def run(self, gs_data, max_steps=5000, save_steps="4000,5000,6000,8000,10000", eval_steps="1000,2000,3000,4000,5000,6000,7000,8000,9000,10000", ply_steps="4000,5000,6000,8000,10000", downsample_pts_num=1_000_000, save_ply=True, disable_video=True, disable_viewer=True, depth_loss=False, normal_loss=False, sky_depth_from_pcd=False, use_scale_regularization=False, use_mask_gaussian=False, mask_export_stochastic=True, do_prune=False, prune_opacity_threshold=0.01, antialiased=False, normalize_world_space=True):
+    def run(
+        self,
+        gs_data,
+        max_steps=8000,
+        save_steps="8000",
+        eval_steps="8000",
+        ply_steps="8000",
+        downsample_pts_num=1_000_000,
+        save_ply=True,
+        disable_video=True,
+        disable_viewer=True,
+        depth_loss=True,
+        normal_loss=True,
+        sky_depth_from_pcd=True,
+        use_scale_regularization=True,
+        use_mask_gaussian=True,
+        mask_export_stochastic=True,
+        mask_export_anchor_protection=False,
+        use_anchor_protection=True,
+        do_prune=False,
+        prune_opacity_threshold=0.01,
+        antialiased=True,
+        normalize_world_space=True,
+        export_mesh=True,
+        strategy_refine_start_iter=150,
+        strategy_refine_stop_iter=750,
+        strategy_refine_every=100,
+        strategy_refine_scale2d_stop_iter=750,
+        strategy_reset_every=99990,
+        strategy_grow_grad2d=0.0001,
+        strategy_prune_scale3d=0.1,
+        convert_ply_to_worldmirror_preview_basis=False,
+    ):
         _hy_log("Train 3DGS", "Stage 1/5: preparing trainer config")
         _ensure_worldgen_path()
         import hyworld2.worldgen.world_gs_trainer as trainer
@@ -2605,7 +2990,16 @@ class HYWorld2Train3DGS:
         _hy_log("Train 3DGS", f"Output train_dir: {out_dir}")
         _reset_dir(out_dir, "HYWorld2 train_dir")
         _ensure_scene_type_meta(data_dir)
-        strategy = DefaultStrategy(verbose=True)
+        strategy = DefaultStrategy(
+            verbose=True,
+            refine_start_iter=int(strategy_refine_start_iter),
+            refine_stop_iter=int(strategy_refine_stop_iter),
+            refine_every=int(strategy_refine_every),
+            refine_scale2d_stop_iter=int(strategy_refine_scale2d_stop_iter),
+            reset_every=int(strategy_reset_every),
+            grow_grad2d=float(strategy_grow_grad2d),
+            prune_scale3d=float(strategy_prune_scale3d),
+        )
         cfg = trainer.Config(strategy=strategy)
         cfg.data_dir = str(data_dir)
         cfg.result_dir = str(out_dir)
@@ -2628,16 +3022,24 @@ class HYWorld2Train3DGS:
         cfg.use_mask_gaussian = bool(use_mask_gaussian)
         if hasattr(cfg, "mask_export_stochastic"):
             cfg.mask_export_stochastic = bool(mask_export_stochastic)
+        if hasattr(cfg, "mask_export_anchor_protection"):
+            cfg.mask_export_anchor_protection = bool(mask_export_anchor_protection)
+        if hasattr(cfg, "use_anchor_protection"):
+            cfg.use_anchor_protection = bool(use_anchor_protection)
         cfg.do_prune = bool(do_prune)
         cfg.prune_opacity_threshold = float(prune_opacity_threshold)
         cfg.antialiased = bool(antialiased)
         cfg.no_normalize = not bool(normalize_world_space)
+        if hasattr(cfg, "export_mesh"):
+            cfg.export_mesh = bool(export_mesh)
         _hy_log(
             "Train 3DGS",
             "Config: "
             f"max_steps={cfg.max_steps}, downsample_pts_num={cfg.downsample_pts_num}, save_ply={cfg.save_ply}, "
-            f"depth_loss={cfg.depth_loss}, normal_loss={cfg.normal_loss}, do_prune={cfg.do_prune}, "
-            f"normalize_world_space={bool(normalize_world_space)}"
+            f"depth_loss={cfg.depth_loss}, normal_loss={cfg.normal_loss}, sky_depth_from_pcd={cfg.sky_depth_from_pcd}, "
+            f"use_scale_regularization={cfg.use_scale_regularization}, use_mask_gaussian={cfg.use_mask_gaussian}, "
+            f"use_anchor_protection={getattr(cfg, 'use_anchor_protection', False)}, "
+            f"antialiased={cfg.antialiased}, normalize_world_space={bool(normalize_world_space)}"
         )
         command_info = {
             "data_dir": str(data_dir),
@@ -2660,10 +3062,28 @@ class HYWorld2Train3DGS:
             "use_scale_regularization": bool(cfg.use_scale_regularization),
             "use_mask_gaussian": bool(cfg.use_mask_gaussian),
             "mask_export_stochastic": bool(getattr(cfg, "mask_export_stochastic", False)),
+            "mask_export_anchor_protection": bool(getattr(cfg, "mask_export_anchor_protection", False)),
+            "use_anchor_protection": bool(getattr(cfg, "use_anchor_protection", False)),
             "do_prune": bool(cfg.do_prune),
             "prune_opacity_threshold": float(cfg.prune_opacity_threshold),
             "antialiased": bool(cfg.antialiased),
             "normalize_world_space": bool(normalize_world_space),
+            "export_mesh": bool(getattr(cfg, "export_mesh", False)),
+            "strategy": {
+                "refine_start_iter": int(strategy.refine_start_iter),
+                "refine_stop_iter": int(strategy.refine_stop_iter),
+                "refine_every": int(strategy.refine_every),
+                "refine_scale2d_stop_iter": int(strategy.refine_scale2d_stop_iter),
+                "reset_every": int(strategy.reset_every),
+                "grow_grad2d": float(strategy.grow_grad2d),
+                "prune_scale3d": float(strategy.prune_scale3d),
+                "prune_opa": float(strategy.prune_opa),
+                "grow_scale3d": float(strategy.grow_scale3d),
+                "grow_scale2d": float(strategy.grow_scale2d),
+                "prune_scale2d": float(strategy.prune_scale2d),
+            },
+            "official_hyworld2_stage5_profile": True,
+            "convert_ply_to_worldmirror_preview_basis": bool(convert_ply_to_worldmirror_preview_basis),
             "lpips_net": cfg.lpips_net,
             "in_process": True,
         }
@@ -2682,8 +3102,10 @@ class HYWorld2Train3DGS:
         _hy_log("Train 3DGS", "Stage 4/5: locating and converting latest PLY")
         ply_path = _find_latest_ply(out_dir)
         if ply_path:
-            _hy_log("Train 3DGS", f"Latest PLY before basis conversion: {ply_path}")
-            ply_path = _convert_trainer_gaussian_ply_to_worldmirror_basis(ply_path)
+            _hy_log("Train 3DGS", f"Latest PLY: {ply_path}")
+            if bool(convert_ply_to_worldmirror_preview_basis):
+                _hy_log("Train 3DGS", "Converting PLY to WorldMirror preview basis (non-official compatibility path)")
+                ply_path = _convert_trainer_gaussian_ply_to_worldmirror_basis(ply_path)
             _hy_log("Train 3DGS", f"PLY ready: {ply_path}")
         else:
             _hy_log("Train 3DGS", "No PLY file found after training")
@@ -2692,15 +3114,18 @@ class HYWorld2Train3DGS:
             candidates = sorted((out_dir / "ply").glob("trainer_cameras_*.json")) if (out_dir / "ply").exists() else []
             camera_json = candidates[-1] if candidates else data_dir / "cameras.json"
         poses, intrs = _load_camera_tensors_from_json(camera_json) if camera_json.exists() else (torch.empty((0, 4, 4)), torch.empty((0, 3, 3)))
-        if poses.numel() > 0:
+        if poses.numel() > 0 and bool(convert_ply_to_worldmirror_preview_basis):
             poses = torch.stack([_worldstereo_c2w_to_worldmirror_c2w(pose) for pose in poses]).float()
         _hy_log("Train 3DGS", f"Stage 5/5 complete: cameras={int(poses.shape[0]) if poses.ndim >= 1 else 0}, camera_json={camera_json}")
+        output_basis = "worldmirror" if bool(convert_ply_to_worldmirror_preview_basis) else "hyworld2_worldgen"
         info = {
             "ply_path": ply_path,
             "train_dir": str(out_dir),
             "camera_json": str(camera_json) if camera_json.exists() else "",
-            "camera_pose_basis": "worldmirror_c2w",
-            "ply_basis": "worldmirror",
+            "camera_pose_basis": "worldmirror_c2w" if bool(convert_ply_to_worldmirror_preview_basis) else "hyworld2_worldgen_c2w",
+            "ply_basis": output_basis,
+            "official_hyworld2_stage5_profile": True,
+            "convert_ply_to_worldmirror_preview_basis": bool(convert_ply_to_worldmirror_preview_basis),
         }
         return (ply_path, poses, intrs, str(out_dir), _safe_json_dumps(info))
 

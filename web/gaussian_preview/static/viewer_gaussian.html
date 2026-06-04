@@ -367,6 +367,18 @@
             console.log('[GaussianViewer] Viewport scale compensation:', desired.toFixed(4));
         }
 
+        function applyCoordinateBasisToSplat(splat, coordinateBasis) {
+            if (!splat) return;
+            const basis = (coordinateBasis || 'worldmirror').toLowerCase();
+            if (basis === 'hyworld2_worldgen') {
+                const q = Math.SQRT1_2;
+                splat.rotation = new SPLAT.Quaternion(q, 0, 0, q);
+                console.log('[GaussianViewer] Applied HYWorld2 worldgen -> preview basis rotation.');
+            } else {
+                splat.rotation = new SPLAT.Quaternion();
+            }
+        }
+
         function resizeRendererToCanvas() {
             if (!renderer || isResolutionLocked) return;
             const width = Math.max(1, canvas.clientWidth);
@@ -431,6 +443,7 @@
             // For a 4x4 extrinsics matrix [R|t], camera position in world space is -R^T * t
             // But for identity matrix, camera is simply at origin
             let camPosX = 0, camPosY = 0, camPosZ = 0;
+            let forwardX = 0, forwardY = 0, forwardZ = 1;
 
             if (extrinsics && Array.isArray(extrinsics) && extrinsics.length === 4) {
                 // Extract rotation and translation from 4x4 extrinsics
@@ -445,6 +458,14 @@
                 camPosX = -(R[0][0] * t[0] + R[1][0] * t[1] + R[2][0] * t[2]);
                 camPosY = -(R[0][1] * t[0] + R[1][1] * t[1] + R[2][1] * t[2]);
                 camPosZ = -(R[0][2] * t[0] + R[1][2] * t[1] + R[2][2] * t[2]);
+
+                forwardX = R[2][0];
+                forwardY = R[2][1];
+                forwardZ = R[2][2];
+                const forwardLen = Math.hypot(forwardX, forwardY, forwardZ) || 1.0;
+                forwardX /= forwardLen;
+                forwardY /= forwardLen;
+                forwardZ /= forwardLen;
 
                 console.log('[GaussianViewer] Computed camera position from extrinsics:', camPosX, camPosY, camPosZ);
             }
@@ -572,14 +593,14 @@
 
             // SHARP uses Y-down coordinate system, so flip camera Y as well
             camPosY = -camPosY;
-
-            // For SHARP: camera is at origin, scene is at positive Z
-            // The orbit controls work by having the camera orbit around a target point.
-            // To get the "original image view", we set camera at the computed position
-            // and look at the scene center.
+            forwardY = -forwardY;
 
             const camPos = new SPLAT.Vector3(camPosX, camPosY, camPosZ);
-            const targetPos = new SPLAT.Vector3(camPosX, camPosY, camPosZ + pivotDistance);
+            const targetPos = new SPLAT.Vector3(
+                camPosX + forwardX * pivotDistance,
+                camPosY + forwardY * pivotDistance,
+                camPosZ + forwardZ * pivotDistance
+            );
 
             // Store for reset
             initialCameraData = {
@@ -648,7 +669,7 @@
         }
 
         // Load a PLY or compact .splat file from ArrayBuffer data
-        async function loadSplatFromData(arrayBuffer, filename, format, extrinsics, intrinsics) {
+        async function loadSplatFromData(arrayBuffer, filename, format, extrinsics, intrinsics, coordinateBasis) {
             format = (format || 'ply').toLowerCase();
             console.log(`[GaussianViewer] 📥 loadSplatFromData started for ${filename} (${format})`);
             try {
@@ -716,6 +737,7 @@
 
                 if (scene.objects.length > 0) {
                     currentSplat = scene.objects[scene.objects.length - 1];
+                    applyCoordinateBasisToSplat(currentSplat, coordinateBasis);
                     console.log('[GaussianViewer] 📦 Active splat captured:', currentSplat.constructor.name);
                 } else {
                     console.error('[GaussianViewer] ❌ CRITICAL: No object added to scene after loading!');
@@ -724,6 +746,7 @@
                 // Get the loaded splat (last object in scene)
                 if (scene.objects && scene.objects.length > 0) {
                     currentSplat = scene.objects[scene.objects.length - 1];
+                    applyCoordinateBasisToSplat(currentSplat, coordinateBasis);
 
                     // Log bounds info for debugging
                     if (currentSplat.bounds) {
@@ -1125,11 +1148,11 @@
         // Listen for messages from parent
         window.addEventListener('message', (event) => {
             console.log('[GaussianViewer] 📨 Received message from parent:', event.data.type);
-            const { type, data, filename, format, extrinsics, intrinsics } = event.data;
+            const { type, data, filename, format, extrinsics, intrinsics, coordinateBasis } = event.data;
 
             if (type === 'LOAD_MESH_DATA' && data) {
                 console.log('[GaussianViewer] 📦 Processing LOAD_MESH_DATA. Size:', (data.byteLength / (1024 * 1024)).toFixed(2), 'MB');
-                loadSplatFromData(data, filename || 'gaussian.ply', format || 'ply', extrinsics, intrinsics);
+                loadSplatFromData(data, filename || 'gaussian.ply', format || 'ply', extrinsics, intrinsics, coordinateBasis);
             } else {
                 console.warn('[GaussianViewer] ⚠️ Unknown message type or missing data:', type);
             }

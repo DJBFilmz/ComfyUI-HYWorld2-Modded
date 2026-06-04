@@ -182,6 +182,12 @@ if __name__ == '__main__':
                         help="WorldStereo repo id or local parent directory containing the model_type subfolder")
     parser.add_argument("--single_model_path", type=str, default="",
                         help="Optional HYWorld2 single-transformer checkpoint from the ComfyUI WorldStereoLight loader")
+    parser.add_argument("--text_encoder_path", type=str, default="",
+                        help="Optional single-file ComfyUI Wan UMT5 text encoder checkpoint")
+    parser.add_argument("--vae_path", type=str, default="",
+                        help="Optional single-file Wan VAE checkpoint")
+    parser.add_argument("--comfy_root", type=str, default="",
+                        help="Optional ComfyUI root used to load ComfyUI single-file text encoders")
     parser.add_argument("--moge_path", type=str, default=MOGE_ID,
                         help="MoGe repo id or local checkpoint directory")
     parser.add_argument("--sam3_path", type=str, default=SAM3_REPO_ID,
@@ -234,6 +240,9 @@ if __name__ == '__main__':
             device_mesh=device_mesh,
             device=device,
             model_device="cpu",
+            text_encoder_path=args.text_encoder_path,
+            vae_path=args.vae_path,
+            comfy_root=args.comfy_root,
         )
     else:
         worldstereo = WorldStereo.from_pretrained(
@@ -244,6 +253,9 @@ if __name__ == '__main__':
             fsdp=args.fsdp,
             device_mesh=device_mesh,
             device=device,
+            text_encoder_path=args.text_encoder_path,
+            vae_path=args.vae_path,
+            comfy_root=args.comfy_root,
         )
     if torch.cuda.is_available():
         worldstereo.pipeline.enable_sequential_cpu_offload()

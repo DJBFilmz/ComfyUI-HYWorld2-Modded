@@ -173,6 +173,7 @@ app.registerExtension({
                         const previewType = message.preview_type?.[0] || type;
                         const previewSizeMb = message.preview_file_size_mb?.[0] || fileSizeMb;
                         const previewFormat = message.preview_format?.[0] || "ply";
+                        const coordinateBasis = message.coordinate_basis?.[0] || "worldmirror";
 
                         // Extract camera parameters if provided
                         const extrinsics = message.extrinsics?.[0] || null;
@@ -216,6 +217,7 @@ app.registerExtension({
                                     format: previewFormat,
                                     extrinsics: extrinsics,
                                     intrinsics: intrinsics,
+                                    coordinateBasis: coordinateBasis,
                                     timestamp: Date.now()
                                 }, "*", [arrayBuffer]);
                             } catch (error) {

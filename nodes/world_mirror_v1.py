@@ -9,6 +9,8 @@ import os
 import sys
 import math
 import re
+import json
+from pathlib import Path
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -1684,6 +1686,10 @@ class VNCCS_BackgroundPreview:
                 "camera_intrinsics": ("TENSOR", {
                     "tooltip": "Optional: camera intrinsics tensor from WorldMirror V2. Used for viewer FOV."
                 }),
+                "coordinate_basis": (["auto", "worldmirror", "hyworld2_worldgen", ""], {
+                    "default": "auto",
+                    "tooltip": "Coordinate basis of the PLY/camera tensors. Use hyworld2_worldgen for official HYWorld2 trainer outputs."
+                }),
             },
         }
     
@@ -1695,9 +1701,10 @@ class VNCCS_BackgroundPreview:
     OUTPUT_IS_LIST = (False, False)
     
     @classmethod
-    def IS_CHANGED(cls, ply_path=None, **kwargs):
+    def IS_CHANGED(cls, ply_path=None, coordinate_basis="auto", **kwargs):
         """Force re-execution when a new video is recorded."""
         import glob
+        coordinate_basis = cls._normalize_coordinate_basis(coordinate_basis)
         output_dir = folder_paths.get_output_directory()
         try:
             pattern = os.path.join(output_dir, "gaussian-recording-*.mp4")
@@ -1708,8 +1715,18 @@ class VNCCS_BackgroundPreview:
         except Exception:
             pass
         if ply_path:
-            return hash(ply_path)
+            return hash((ply_path, coordinate_basis))
         return None
+
+    @staticmethod
+    def _normalize_coordinate_basis(coordinate_basis):
+        value = str(coordinate_basis or "auto").strip()
+        if not value:
+            return "auto"
+        if value not in {"auto", "worldmirror", "hyworld2_worldgen"}:
+            print(f"[VNCCS_BackgroundPreview] Unknown coordinate_basis={coordinate_basis!r}; falling back to auto")
+            return "auto"
+        return value
 
     def _tensor_to_list(self, value):
         if value is None:
@@ -1735,7 +1752,51 @@ class VNCCS_BackgroundPreview:
             return None
         return intrs.tolist()
 
-    def _camera_poses_to_preview_extrinsics(self, camera_poses):
+    def _infer_coordinate_basis(self, ply_path, coordinate_basis="auto"):
+        requested = self._normalize_coordinate_basis(coordinate_basis)
+        if requested != "auto":
+            return requested
+        try:
+            path = Path(ply_path)
+            candidates = [
+                path.parent.parent / "train_command.json",
+                path.parent.parent / "train_config.json",
+                path.parent / "train_command.json",
+            ]
+            for candidate in candidates:
+                if not candidate.exists():
+                    continue
+                with open(candidate, "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+                basis = data.get("ply_basis") or data.get("camera_pose_basis")
+                if isinstance(basis, str):
+                    basis = basis.lower()
+                    if "hyworld2" in basis:
+                        return "hyworld2_worldgen"
+                    if "worldmirror" in basis:
+                        return "worldmirror"
+            if (path.parent / "trainer_cameras.json").exists() or path.name.startswith("point_cloud_"):
+                return "hyworld2_worldgen"
+        except Exception as exc:
+            print(f"[VNCCS_BackgroundPreview] coordinate_basis auto-detect skipped: {type(exc).__name__}: {exc}")
+        return "worldmirror"
+
+    def _camera_poses_to_preview_basis(self, poses, coordinate_basis):
+        if coordinate_basis != "hyworld2_worldgen":
+            return poses
+        basis = torch.tensor(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, -1.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            dtype=poses.dtype,
+            device=poses.device,
+        )
+        return basis.unsqueeze(0) @ poses
+
+    def _camera_poses_to_preview_extrinsics(self, camera_poses, coordinate_basis="worldmirror"):
         if camera_poses is None or not hasattr(camera_poses, "detach"):
             return None
         poses = camera_poses.detach().cpu().float()
@@ -1749,6 +1810,7 @@ class VNCCS_BackgroundPreview:
         if poses.shape[-2] == 3:
             bottom = torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=poses.dtype).view(1, 1, 4)
             poses = torch.cat([poses, bottom.repeat(poses.shape[0], 1, 1)], dim=1)
+        poses = self._camera_poses_to_preview_basis(poses, coordinate_basis)
 
         c2w = poses[0].clone()
         centers = poses[:, :3, 3]
@@ -1794,9 +1856,11 @@ class VNCCS_BackgroundPreview:
         ply_path=None,
         camera_poses=None,
         camera_intrinsics=None,
+        coordinate_basis="auto",
         **kwargs,
     ):
         """Prepare PLY file for gsplat.js preview."""
+        coordinate_basis = self._normalize_coordinate_basis(coordinate_basis)
         import glob
 
         # If no path provided, we can't preview
@@ -1810,6 +1874,7 @@ class VNCCS_BackgroundPreview:
 
         output_dir = folder_paths.get_output_directory()
         ply_info = self._view_info_for_path(ply_path)
+        resolved_coordinate_basis = self._infer_coordinate_basis(ply_path, coordinate_basis)
 
         preview_path = os.path.splitext(ply_path)[0] + ".splat"
         if os.path.exists(preview_path):
@@ -1853,10 +1918,11 @@ class VNCCS_BackgroundPreview:
             "preview_path": [preview_info["rel_path"]],
             "preview_file_size_mb": [preview_info["size_mb"]],
             "preview_format": [preview_format],
+            "coordinate_basis": [resolved_coordinate_basis],
         }
         
         # Add camera parameters if provided
-        extrinsics = self._camera_poses_to_preview_extrinsics(camera_poses)
+        extrinsics = self._camera_poses_to_preview_extrinsics(camera_poses, resolved_coordinate_basis)
         # Do not forward WorldMirror intrinsics to the browser viewer by default:
         # viewer_gaussian.html switches into native-resolution rendering whenever
         # intrinsics are present, which is much heavier for multi-million splats.

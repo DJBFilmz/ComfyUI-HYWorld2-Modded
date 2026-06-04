@@ -27,6 +27,7 @@ import gc
 import inspect
 import json
 import os
+import sys
 import types
 from contextlib import contextmanager
 from typing import Any
@@ -101,6 +102,99 @@ _DIFFUSERS_VAE_LOAD_KWARGS = {
 }
 
 _HYWORLD2_SINGLE_FORMAT = "hyworld2_worldstereo_single_transformer_v1"
+
+
+class _ComfyWanT5EncoderAdapter(torch.nn.Module):
+    """HF-like wrapper around ComfyUI's Wan UMT5 text encoder."""
+
+    def __init__(self, comfy_clip, device):
+        super().__init__()
+        self.comfy_clip = comfy_clip
+        self._transformer = comfy_clip.cond_stage_model.umt5xxl.transformer
+        self.dtype = torch.float32
+        self.device = device
+
+    def eval(self):
+        self.comfy_clip.cond_stage_model.eval()
+        return self
+
+    def to(self, *args, **kwargs):
+        self.comfy_clip.cond_stage_model.to(*args, **kwargs)
+        device = kwargs.get("device", None)
+        if device is None and args:
+            for arg in args:
+                if isinstance(arg, (torch.device, str)):
+                    device = arg
+                    break
+        if device is not None:
+            self.device = torch.device(device)
+        return self
+
+    def forward(self, input_ids, attention_mask=None, *args, **kwargs):
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=input_ids.device)
+        model_device = self._transformer.get_input_embeddings().weight.device
+        hidden, _ = self._transformer(
+            input_ids.to(model_device),
+            attention_mask.to(model_device),
+            dtype=torch.float32,
+        )
+        return types.SimpleNamespace(last_hidden_state=hidden)
+
+
+def _infer_comfy_root_from_model_path(path: str | os.PathLike[str] | None) -> str:
+    if not path:
+        return ""
+    current = os.path.abspath(os.fspath(path))
+    if os.path.isfile(current):
+        current = os.path.dirname(current)
+    while True:
+        if os.path.basename(current).lower() == "models":
+            return os.path.dirname(current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            return ""
+        current = parent
+
+
+def _load_comfy_wan_text_encoder(path, *, device, comfy_root=""):
+    path = os.path.abspath(os.fspath(path))
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Single-file text encoder not found: {path}")
+    comfy_root = comfy_root or os.environ.get("COMFYUI_ROOT", "") or _infer_comfy_root_from_model_path(path)
+    if not comfy_root or not os.path.exists(os.path.join(comfy_root, "comfy")):
+        raise FileNotFoundError(
+            "Could not locate ComfyUI root for single-file text encoder. "
+            "Pass comfy_root pointing at the ComfyUI directory."
+        )
+    if comfy_root not in sys.path:
+        sys.path.insert(0, comfy_root)
+
+    import comfy.sd
+
+    runtime_device = torch.device(device)
+    load_device = torch.device("cuda") if torch.cuda.is_available() else runtime_device
+    model_options = {
+        "load_device": load_device,
+        "offload_device": torch.device("cpu"),
+        "initial_device": runtime_device,
+    }
+    comfy_clip = comfy.sd.load_clip(
+        [path],
+        clip_type=comfy.sd.CLIPType.WAN,
+        model_options=model_options,
+        disable_dynamic=True,
+    )
+    cond_stage_model = getattr(comfy_clip, "cond_stage_model", None)
+    if not hasattr(cond_stage_model, "umt5xxl"):
+        raise ValueError(
+            "Single-file text encoder was not loaded as ComfyUI Wan UMT5. "
+            "The current file is not compatible with comfy.sd.CLIPType.WAN; "
+            "it must contain ComfyUI T5 keys such as "
+            "'encoder.block.23.layer.1.DenseReluDense.wi_1.weight'. "
+            f"Path: {path}"
+        )
+    return _ComfyWanT5EncoderAdapter(comfy_clip, device=device).eval()
 
 
 class _Int4Linear(torch.nn.Module):
@@ -406,6 +500,9 @@ class WorldStereo:
         device: torch.device | None = None,
         model_device: torch.device | str | None = None,
         transformer_only: bool = False,
+        text_encoder_path: str = "",
+        vae_path: str = "",
+        comfy_root: str = "",
     ) -> "WorldStereo":
         """
         Build a WorldStereo instance from Hugging Face format
@@ -473,7 +570,14 @@ class WorldStereo:
             return cls(pipeline=types.SimpleNamespace(transformer=transformer), cfg=cfg)
 
         text_encoder, image_clip, vae = cls._load_aux(
-            cfg, device=model_device, device_mesh=device_mesh, fsdp=fsdp, local_files_only=local_files_only
+            cfg,
+            device=model_device,
+            device_mesh=device_mesh,
+            fsdp=fsdp,
+            local_files_only=local_files_only,
+            text_encoder_path=text_encoder_path,
+            vae_path=vae_path,
+            comfy_root=comfy_root,
         )
         image_processor = CLIPImageProcessor.from_pretrained(
             cfg.base_model, do_rescale=False, subfolder="image_processor", local_files_only=local_files_only
@@ -509,6 +613,9 @@ class WorldStereo:
         device_mesh=None,
         device: torch.device | None = None,
         model_device: torch.device | str | None = None,
+        text_encoder_path: str = "",
+        vae_path: str = "",
+        comfy_root: str = "",
     ) -> "WorldStereo":
         """Build a full pipeline from one fused WorldStereo transformer safetensors file."""
         if fsdp:
@@ -548,7 +655,14 @@ class WorldStereo:
         )
 
         text_encoder, image_clip, vae = cls._load_aux(
-            cfg, device=model_device, device_mesh=device_mesh, fsdp=False, local_files_only=local_files_only
+            cfg,
+            device=model_device,
+            device_mesh=device_mesh,
+            fsdp=False,
+            local_files_only=local_files_only,
+            text_encoder_path=text_encoder_path,
+            vae_path=vae_path,
+            comfy_root=comfy_root,
         )
         image_processor = CLIPImageProcessor.from_pretrained(
             cfg.base_model, do_rescale=False, subfolder="image_processor", local_files_only=local_files_only
@@ -843,19 +957,35 @@ class WorldStereo:
         return transformer.eval()
 
     @staticmethod
-    def _load_aux(cfg, *, device, device_mesh, fsdp: bool, local_files_only: bool = False):
+    def _load_aux(
+        cfg,
+        *,
+        device,
+        device_mesh,
+        fsdp: bool,
+        local_files_only: bool = False,
+        text_encoder_path: str = "",
+        vae_path: str = "",
+        comfy_root: str = "",
+    ):
         import transformers as _tr
         from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
 
         # ---- text encoder ----
         half_dtype = _get_half_dtype()
-        rank0_log(f"Loading TextEncoder (UMT5)… dtype={half_dtype}")
-        text_encoder = UMT5EncoderModel.from_pretrained(
-            cfg.base_model, subfolder="text_encoder", torch_dtype=half_dtype, local_files_only=local_files_only
-        ).eval()
-        if _tr.__version__ >= "5.0.0":
-            rank0_log("Patching text_encoder.encoder.embed_tokens for transformers>=5.0.0", "WARNING")
-            text_encoder.encoder.embed_tokens = text_encoder.shared
+        if text_encoder_path:
+            if fsdp:
+                raise ValueError("Single-file ComfyUI UMT5 text_encoder_path is not supported with FSDP.")
+            rank0_log(f"Loading TextEncoder (ComfyUI Wan UMT5 fp8 scaled): {text_encoder_path}")
+            text_encoder = _load_comfy_wan_text_encoder(text_encoder_path, device=device, comfy_root=comfy_root)
+        else:
+            rank0_log(f"Loading TextEncoder (UMT5)… dtype={half_dtype}")
+            text_encoder = UMT5EncoderModel.from_pretrained(
+                cfg.base_model, subfolder="text_encoder", torch_dtype=half_dtype, local_files_only=local_files_only
+            ).eval()
+            if _tr.__version__ >= "5.0.0":
+                rank0_log("Patching text_encoder.encoder.embed_tokens for transformers>=5.0.0", "WARNING")
+                text_encoder.encoder.embed_tokens = text_encoder.shared
 
         # ---- image encoder ----
         rank0_log(f"Loading ImageEncoder (CLIP)… dtype={half_dtype}")
@@ -893,15 +1023,34 @@ class WorldStereo:
 
         # ---- VAE ----
         vae_dtype = half_dtype
-        rank0_log(f"Loading 3D-VAE… dtype={vae_dtype}")
-        with _disable_diffusers_fp32_keep_modules(AutoencoderKLWan):
-            vae = AutoencoderKLWan.from_pretrained(
-                cfg.base_model,
-                subfolder="vae",
-                torch_dtype=vae_dtype,
-                local_files_only=local_files_only,
-                **_DIFFUSERS_VAE_LOAD_KWARGS,
-            ).eval()
+        if vae_path:
+            vae_path = os.path.abspath(os.fspath(vae_path))
+            if not os.path.exists(vae_path):
+                raise FileNotFoundError(f"Single-file VAE not found: {vae_path}")
+            rank0_log(f"Loading single-file Wan 3D-VAE: {vae_path} dtype={vae_dtype}")
+            vae_config = AutoencoderKLWan.load_config(
+                cfg.base_model, subfolder="vae", local_files_only=local_files_only
+            )
+            with _disable_diffusers_fp32_keep_modules(AutoencoderKLWan):
+                vae = AutoencoderKLWan.from_config(vae_config)
+            vae_sd = load_safetensors(vae_path, device="cpu")
+            result = vae.load_state_dict(vae_sd, strict=False)
+            if result.missing_keys:
+                rank0_log(f"Single-file VAE missing keys: {len(result.missing_keys)}", "WARNING")
+            if result.unexpected_keys:
+                rank0_log(f"Single-file VAE unexpected keys: {len(result.unexpected_keys)}", "WARNING")
+            del vae_sd
+            vae = vae.to(dtype=vae_dtype).eval()
+        else:
+            rank0_log(f"Loading 3D-VAE… dtype={vae_dtype}")
+            with _disable_diffusers_fp32_keep_modules(AutoencoderKLWan):
+                vae = AutoencoderKLWan.from_pretrained(
+                    cfg.base_model,
+                    subfolder="vae",
+                    torch_dtype=vae_dtype,
+                    local_files_only=local_files_only,
+                    **_DIFFUSERS_VAE_LOAD_KWARGS,
+                ).eval()
 
         if fsdp:
             fsdp_kwargs = dict(
@@ -925,7 +1074,8 @@ class WorldStereo:
             gc.collect()
             torch.cuda.empty_cache()
         else:
-            text_encoder = text_encoder.to(device=device)
+            if not text_encoder_path:
+                text_encoder = text_encoder.to(device=device)
             image_clip = image_clip.to(device=device)
 
         vae = vae.to(device=device)

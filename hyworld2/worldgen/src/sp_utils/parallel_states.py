@@ -37,7 +37,7 @@ class ParallelDims:
 
     def build_mesh(self, device_type):
         assert self.world_size % self.sp == 0, "world_size must be divisible by sp"
-        if self.world_size == 1 and self.sp == 1 and not dist.is_initialized():
+        if self.world_size == 1 and self.sp == 1:
             self.world_mesh = None
             return None
         mesh = init_device_mesh(
@@ -66,6 +66,8 @@ class ParallelDims:
 
     @property
     def sp_rank(self):
+        if self.world_mesh is None:
+            return 0
         if self.sp_enabled:
             return self.world_mesh['sp'].get_local_rank()
         elif not dist.is_initialized():
