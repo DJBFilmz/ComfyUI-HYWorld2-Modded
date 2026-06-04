@@ -619,25 +619,6 @@ def _find_latest_ply(result_dir):
     return str(candidates[0])
 
 
-def _official_strategy_settings(max_steps):
-    refine_stop = max(1, min(750, int(max_steps) - 1))
-    return {
-        "refine_start_iter": 150,
-        "refine_stop_iter": refine_stop,
-        "refine_every": 100,
-        "refine_scale2d_stop_iter": refine_stop,
-        "reset_every": 99990,
-        "grow_grad2d": 0.0001,
-        "prune_scale3d": 0.1,
-    }
-
-
-def _apply_official_strategy_preset(strategy, max_steps):
-    for name, value in _official_strategy_settings(max_steps).items():
-        if hasattr(strategy, name):
-            setattr(strategy, name, value)
-
-
 def _normal_tensor_is_usable(normals):
     if normals is None or normals.numel() == 0:
         return False
@@ -1469,24 +1450,24 @@ class HYWorld2Train3DGS:
                 "gs_data": ("HYWORLD2_GS_DATA",),
             },
             "optional": {
-                "max_steps": ("INT", {"default": 1500, "min": 1, "max": 100000, "step": 100}),
-                "save_steps": ("STRING", {"default": "1500"}),
-                "eval_steps": ("STRING", {"default": "1500"}),
-                "ply_steps": ("STRING", {"default": "1500"}),
+                "max_steps": ("INT", {"default": 5000, "min": 1, "max": 100000, "step": 100}),
+                "save_steps": ("STRING", {"default": "4000,5000,6000,8000,10000"}),
+                "eval_steps": ("STRING", {"default": "1000,2000,3000,4000,5000,6000,7000,8000,9000,10000"}),
+                "ply_steps": ("STRING", {"default": "4000,5000,6000,8000,10000"}),
                 "downsample_pts_num": ("INT", {"default": 1_000_000, "min": 1, "max": 50_000_000, "step": 100000}),
                 "save_ply": ("BOOLEAN", {"default": True}),
                 "disable_video": ("BOOLEAN", {"default": True}),
                 "disable_viewer": ("BOOLEAN", {"default": True}),
-                "depth_loss": ("BOOLEAN", {"default": True}),
-                "normal_loss": ("BOOLEAN", {"default": True}),
-                "sky_depth_from_pcd": ("BOOLEAN", {"default": True}),
-                "use_scale_regularization": ("BOOLEAN", {"default": True}),
+                "depth_loss": ("BOOLEAN", {"default": False}),
+                "normal_loss": ("BOOLEAN", {"default": False}),
+                "sky_depth_from_pcd": ("BOOLEAN", {"default": False}),
+                "use_scale_regularization": ("BOOLEAN", {"default": False}),
                 "use_mask_gaussian": ("BOOLEAN", {"default": False}),
-                "mask_export_stochastic": ("BOOLEAN", {"default": False}),
-                "antialiased": ("BOOLEAN", {"default": True}),
-                "official_strategy_preset": ("BOOLEAN", {"default": True}),
+                "mask_export_stochastic": ("BOOLEAN", {"default": True}),
+                "do_prune": ("BOOLEAN", {"default": False}),
+                "prune_opacity_threshold": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 1.0, "step": 0.001}),
+                "antialiased": ("BOOLEAN", {"default": False}),
                 "normalize_world_space": ("BOOLEAN", {"default": True}),
-                "perceptual_loss": (["lpips_vgg", "lpips_alex", "simple", "off"], {"default": "lpips_vgg"}),
             },
         }
 
@@ -1496,7 +1477,7 @@ class HYWorld2Train3DGS:
     CATEGORY = "VNCCS/HYWorld2"
     OUTPUT_NODE = True
 
-    def run(self, gs_data, max_steps=1500, save_steps="1500", eval_steps="1500", ply_steps="1500", downsample_pts_num=1_000_000, save_ply=True, disable_video=True, disable_viewer=True, depth_loss=True, normal_loss=True, sky_depth_from_pcd=True, use_scale_regularization=True, use_mask_gaussian=False, mask_export_stochastic=False, antialiased=True, official_strategy_preset=True, normalize_world_space=True, perceptual_loss="lpips_vgg"):
+    def run(self, gs_data, max_steps=5000, save_steps="4000,5000,6000,8000,10000", eval_steps="1000,2000,3000,4000,5000,6000,7000,8000,9000,10000", ply_steps="4000,5000,6000,8000,10000", downsample_pts_num=1_000_000, save_ply=True, disable_video=True, disable_viewer=True, depth_loss=False, normal_loss=False, sky_depth_from_pcd=False, use_scale_regularization=False, use_mask_gaussian=False, mask_export_stochastic=True, do_prune=False, prune_opacity_threshold=0.01, antialiased=False, normalize_world_space=True):
         _ensure_worldgen_path()
         import hyworld2.worldgen.world_gs_trainer as trainer
         from gsplat.strategy import DefaultStrategy
@@ -1506,8 +1487,6 @@ class HYWorld2Train3DGS:
         _reset_dir(out_dir, "HYWorld2 train_dir")
         _ensure_scene_type_meta(data_dir)
         strategy = DefaultStrategy(verbose=True)
-        if official_strategy_preset:
-            _apply_official_strategy_preset(strategy, max_steps)
         cfg = trainer.Config(strategy=strategy)
         cfg.data_dir = str(data_dir)
         cfg.result_dir = str(out_dir)
@@ -1530,18 +1509,10 @@ class HYWorld2Train3DGS:
         cfg.use_mask_gaussian = bool(use_mask_gaussian)
         if hasattr(cfg, "mask_export_stochastic"):
             cfg.mask_export_stochastic = bool(mask_export_stochastic)
+        cfg.do_prune = bool(do_prune)
+        cfg.prune_opacity_threshold = float(prune_opacity_threshold)
         cfg.antialiased = bool(antialiased)
         cfg.no_normalize = not bool(normalize_world_space)
-        if perceptual_loss == "lpips_vgg":
-            cfg.lpips_net = "vgg"
-        elif perceptual_loss == "lpips_alex":
-            cfg.lpips_net = "alex"
-        elif perceptual_loss == "simple":
-            cfg.lpips_net = "simple"
-        else:
-            cfg.lpips_net = "none"
-            cfg.lpips_lambda1 = 0
-            cfg.lpips_lambda2 = 0
         command_info = {
             "data_dir": str(data_dir),
             "result_dir": str(out_dir),
@@ -1563,11 +1534,11 @@ class HYWorld2Train3DGS:
             "use_scale_regularization": bool(cfg.use_scale_regularization),
             "use_mask_gaussian": bool(cfg.use_mask_gaussian),
             "mask_export_stochastic": bool(getattr(cfg, "mask_export_stochastic", False)),
+            "do_prune": bool(cfg.do_prune),
+            "prune_opacity_threshold": float(cfg.prune_opacity_threshold),
             "antialiased": bool(cfg.antialiased),
-            "official_strategy_preset": bool(official_strategy_preset),
-            "official_strategy_settings": _official_strategy_settings(max_steps) if official_strategy_preset else {},
             "normalize_world_space": bool(normalize_world_space),
-            "perceptual_loss": perceptual_loss,
+            "lpips_net": cfg.lpips_net,
             "in_process": True,
         }
         with open(out_dir / "train_command.json", "w", encoding="utf-8") as handle:

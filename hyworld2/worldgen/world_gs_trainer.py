@@ -5,7 +5,6 @@ import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-import inspect
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -19,13 +18,7 @@ import tqdm
 import tyro
 import viser
 import yaml
-try:
-    from fused_ssim import fused_ssim
-except ImportError:
-    from pytorch_msssim import ssim as _pytorch_msssim
-
-    def fused_ssim(img1, img2, padding="valid"):
-        return _pytorch_msssim(img1, img2, data_range=1.0, size_average=True)
+from fused_ssim import fused_ssim
 from gsplat import export_splats
 from gsplat.compression import PngCompression
 from gsplat.distributed import cli
@@ -36,6 +29,8 @@ from nerfview import CameraState, RenderTabState, apply_float_colormap
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
+from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
 
 from gs.gsplat_viewer import GsplatViewer, GsplatRenderTabState
@@ -46,42 +41,6 @@ from gs.traj import (
     generate_interpolated_path,
     generate_spiral_path,
 )
-
-_RASTERIZATION_KWARGS = set(inspect.signature(rasterization).parameters)
-
-
-class SimplePerceptualLoss(torch.nn.Module):
-    """Dependency-light image loss: multi-scale color plus image-gradient L1."""
-
-    def forward(self, colors: Tensor, pixels: Tensor) -> Tensor:
-        colors = colors.clamp(0.0, 1.0)
-        pixels = pixels.clamp(0.0, 1.0)
-        loss = F.l1_loss(colors, pixels)
-        for scale in (2, 4):
-            if colors.shape[-2] >= scale and colors.shape[-1] >= scale:
-                c_small = F.avg_pool2d(colors, kernel_size=scale, stride=scale)
-                p_small = F.avg_pool2d(pixels, kernel_size=scale, stride=scale)
-                loss = loss + 0.5 / scale * F.l1_loss(c_small, p_small)
-        dx_c = colors[..., :, 1:] - colors[..., :, :-1]
-        dx_p = pixels[..., :, 1:] - pixels[..., :, :-1]
-        dy_c = colors[..., 1:, :] - colors[..., :-1, :]
-        dy_p = pixels[..., 1:, :] - pixels[..., :-1, :]
-        return loss + 0.25 * (F.l1_loss(dx_c, dx_p) + F.l1_loss(dy_c, dy_p))
-
-
-class SimplePSNR(torch.nn.Module):
-    def __init__(self, data_range: float = 1.0):
-        super().__init__()
-        self.data_range = float(data_range)
-
-    def forward(self, colors: Tensor, pixels: Tensor) -> Tensor:
-        mse = F.mse_loss(colors, pixels).clamp_min(1e-12)
-        return 20.0 * math.log10(self.data_range) - 10.0 * torch.log10(mse)
-
-
-class SimpleSSIM(torch.nn.Module):
-    def forward(self, colors: Tensor, pixels: Tensor) -> Tensor:
-        return fused_ssim(colors, pixels, padding="valid")
 
 
 @dataclass
@@ -290,7 +249,7 @@ class Config:
     # Save training images to tensorboard
     tb_save_image: bool = False
 
-    lpips_net: Literal["vgg", "alex", "simple", "none"] = "vgg"
+    lpips_net: Literal["vgg", "alex"] = "vgg"
 
     # 3DGUT (uncented transform + eval 3D)
     with_ut: bool = False
@@ -881,22 +840,14 @@ class Runner:
             ]
 
         # Losses & Metrics.
-        self.ssim = SimpleSSIM().to(self.device)
-        self.psnr = SimplePSNR(data_range=1.0).to(self.device)
+        self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
+        self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
 
-        if cfg.lpips_lambda1 <= 0 and cfg.lpips_lambda2 <= 0 or cfg.lpips_net == "none":
-            self.lpips = lambda colors, pixels: torch.zeros((), device=self.device)
-        elif cfg.lpips_net == "simple":
-            self.lpips = SimplePerceptualLoss().to(self.device)
-        elif cfg.lpips_net == "alex":
-            from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-
+        if cfg.lpips_net == "alex":
             self.lpips = LearnedPerceptualImagePatchSimilarity(
                 net_type="alex", normalize=True
             ).to(self.device)
         elif cfg.lpips_net == "vgg":
-            from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-
             # The 3DGS official repo uses lpips vgg, which is equivalent with the following:
             self.lpips = LearnedPerceptualImagePatchSimilarity(
                 net_type="vgg", normalize=False
@@ -989,7 +940,6 @@ class Runner:
             camera_model = self.cfg.camera_model
         if self.cfg.use_mask_gaussian:
             kwargs["gauss_masks"] = gauss_masks_tensor
-        kwargs = {key: value for key, value in kwargs.items() if key in _RASTERIZATION_KWARGS}
         render_colors, render_alphas, info = rasterization(
             means=means,
             quats=quats,

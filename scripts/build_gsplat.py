@@ -23,8 +23,10 @@ NAVMESH_DIR = PROJECT_ROOT / "hyworld2" / "worldgen" / "third_party" / "navmesh"
 RECASTNAV_DIR = PROJECT_ROOT / "hyworld2" / "worldgen" / "third_party" / "recastnavigation"
 WHEELS_DIR = PROJECT_ROOT / "gsplat"
 PYTORCH3D_BUILD_DIR = SCRIPT_DIR / "pytorch3d_build"
+FUSED_SSIM_BUILD_DIR = SCRIPT_DIR / "fused_ssim_build"
 PYTORCH3D_REPO_URL = "https://github.com/facebookresearch/pytorch3d.git"
 PYTORCH3D_REF = "stable"
+FUSED_SSIM_REPO_URL = "https://github.com/rahul-goel/fused-ssim/"
 RECASTNAV_REPO_URL = "https://github.com/recastnavigation/recastnavigation.git"
 CUDA_130_HOME = Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0")
 
@@ -77,6 +79,15 @@ def find_compatible_pytorch3d_wheel(local_label: str) -> Path | None:
     return None
 
 
+def find_compatible_fused_ssim_wheel() -> Path | None:
+    py_tags = supported_python_tags()
+    for wheel_path in sorted(WHEELS_DIR.glob("fused_ssim-*.whl"), key=os.path.getmtime, reverse=True):
+        parts = wheel_path.name.split("-")
+        if len(parts) >= 5 and parts[-3] in py_tags:
+            return wheel_path
+    return None
+
+
 def find_compatible_recast_wheel() -> Path | None:
     py_tags = supported_python_tags()
     for wheel_path in sorted(WHEELS_DIR.glob("recast-*.whl"), key=os.path.getmtime, reverse=True):
@@ -102,6 +113,17 @@ def reset_pytorch3d_build_dir() -> None:
             function(path)
 
         shutil.rmtree(PYTORCH3D_BUILD_DIR, onerror=handle_remove_readonly)
+
+
+def reset_fused_ssim_build_dir() -> None:
+    assert_build_dir_is_safe(FUSED_SSIM_BUILD_DIR)
+    if FUSED_SSIM_BUILD_DIR.exists():
+        print(f"[INFO] Removing stale fused-ssim build directory: {FUSED_SSIM_BUILD_DIR}")
+        def handle_remove_readonly(function, path, exc_info):
+            os.chmod(path, stat.S_IWRITE)
+            function(path)
+
+        shutil.rmtree(FUSED_SSIM_BUILD_DIR, onerror=handle_remove_readonly)
 
 
 def directory_has_files(path: Path) -> bool:
@@ -144,6 +166,19 @@ def clone_pytorch3d_source() -> None:
         str(PYTORCH3D_BUILD_DIR),
     ])
     patch_pytorch3d_windows_build()
+
+
+def clone_fused_ssim_source() -> None:
+    reset_fused_ssim_build_dir()
+    run_command([
+        "git",
+        "clone",
+        "--depth",
+        "1",
+        FUSED_SSIM_REPO_URL,
+        str(FUSED_SSIM_BUILD_DIR),
+    ])
+    patch_fused_ssim_windows_build()
 
 
 def patch_pytorch3d_windows_build() -> Path | None:
@@ -202,6 +237,45 @@ def patch_pytorch3d_windows_build() -> Path | None:
     return shim_header
 
 
+def patch_fused_ssim_windows_build() -> None:
+    if os.name != "nt":
+        return
+    shim_header = FUSED_SSIM_BUILD_DIR / "hyworld2_undef_windows_small.h"
+    shim_header.write_text(
+        "#pragma once\n"
+        "#include <windows.h>\n"
+        "#ifdef small\n"
+        "#undef small\n"
+        "#endif\n",
+        encoding="utf-8",
+    )
+    setup_path = FUSED_SSIM_BUILD_DIR / "setup.py"
+    setup_text = setup_path.read_text(encoding="utf-8")
+    needle = 'compiler_args = {"cxx": ["-O3", "-DFUSED_SSIM_CUDA"], "nvcc": ["-O3", "-DFUSED_SSIM_CUDA"]}\n'
+    shim_path = str(shim_header).replace("\\", "/")
+    replacement = (
+        'compiler_args = {"cxx": ["-O3", "-DFUSED_SSIM_CUDA"], '
+        f'"nvcc": ["-O3", "-DFUSED_SSIM_CUDA", "-allow-unsupported-compiler", "--pre-include", r"{shim_path}"]}}\n'
+    )
+    if needle in setup_text and "-allow-unsupported-compiler" not in setup_text:
+        setup_path.write_text(setup_text.replace(needle, replacement, 1), encoding="utf-8")
+    for header_name in ("ssim.h", "ssim3d.h"):
+        header_path = FUSED_SSIM_BUILD_DIR / header_name
+        header_text = header_path.read_text(encoding="utf-8")
+        header_text = header_text.replace("#include <torch/extension.h>", "#include <torch/types.h>")
+        header_path.write_text(header_text, encoding="utf-8")
+    for source_name, header_name in (("ssim.cu", "ssim.h"), ("ssim3d.cu", "ssim3d.h")):
+        source_path = FUSED_SSIM_BUILD_DIR / source_name
+        source_text = source_path.read_text(encoding="utf-8")
+        source_text = source_text.replace(
+            "#include <torch/extension.h>",
+            f'#include "{header_name}"\n#include <ATen/Functions.h>',
+        )
+        source_text = source_text.replace("torch::zeros_like", "at::zeros_like")
+        source_text = source_text.replace("torch::empty", "at::empty")
+        source_path.write_text(source_text, encoding="utf-8")
+
+
 def relabel_wheel(wheel: Path, local_label: str) -> Path:
     if "+" in wheel.name:
         return wheel
@@ -213,6 +287,20 @@ def relabel_wheel(wheel: Path, local_label: str) -> Path:
     if new_path != wheel:
         shutil.copy2(wheel, new_path)
     return new_path
+
+
+def cuda_130_build_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.setdefault("MAX_JOBS", "10")
+    env.setdefault("FORCE_CUDA", "1")
+    if CUDA_130_HOME.exists():
+        env["CUDA_HOME"] = str(CUDA_130_HOME)
+        env["CUDA_PATH"] = str(CUDA_130_HOME)
+        env["CUB_HOME"] = str(CUDA_130_HOME / "include")
+    env["NVCC_FLAGS"] = " ".join(
+        part for part in [env.get("NVCC_FLAGS", ""), "-allow-unsupported-compiler"] if part
+    )
+    return env
 
 
 def patch_pytorch3d_source_nopulsar() -> None:
@@ -290,13 +378,7 @@ def build_pytorch3d_wheel(local_label: str) -> Path:
     WHEELS_DIR.mkdir(exist_ok=True)
     clone_pytorch3d_source()
     patch_pytorch3d_source_nopulsar()
-    env = os.environ.copy()
-    env.setdefault("MAX_JOBS", "10")
-    env.setdefault("FORCE_CUDA", "1")
-    if CUDA_130_HOME.exists():
-        env["CUDA_HOME"] = str(CUDA_130_HOME)
-        env["CUDA_PATH"] = str(CUDA_130_HOME)
-        env["CUB_HOME"] = str(CUDA_130_HOME / "include")
+    env = cuda_130_build_env()
     env.setdefault("PYTORCH3D_NO_NINJA", "1")
     env.setdefault("PYTORCH3D_NO_PULSAR", "1")
     env.setdefault("PYTORCH3D_DISABLE_PULSAR", "1")
@@ -327,6 +409,45 @@ def build_pytorch3d_wheel(local_label: str) -> Path:
     patch_pytorch3d_wheel_nopulsar(wheel)
     print(f"[OK] Built PyTorch3D wheel: {wheel}")
     return wheel
+
+
+def build_fused_ssim_wheel() -> Path:
+    import torch
+
+    if torch.version.cuda is None:
+        raise RuntimeError(
+            "fused-ssim must be built with the same CUDA-enabled Python/Torch environment used by ComfyUI. "
+            f"Current Python has CPU-only torch: {sys.executable}"
+        )
+    WHEELS_DIR.mkdir(exist_ok=True)
+    clone_fused_ssim_source()
+    before = set(WHEELS_DIR.glob("fused_ssim-*.whl"))
+    run_command(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "wheel",
+            "--no-build-isolation",
+            "--no-deps",
+            "--no-cache-dir",
+            "-w",
+            str(WHEELS_DIR),
+            str(FUSED_SSIM_BUILD_DIR),
+        ],
+        cwd=FUSED_SSIM_BUILD_DIR,
+        env=cuda_130_build_env(),
+    )
+    after = set(WHEELS_DIR.glob("fused_ssim-*.whl"))
+    candidates = sorted(after - before, key=os.path.getmtime, reverse=True)
+    if not candidates:
+        candidates = sorted(after, key=os.path.getmtime, reverse=True)
+    for wheel in candidates:
+        parts = wheel.name.split("-")
+        if len(parts) >= 5 and parts[-3] in supported_python_tags():
+            print(f"[OK] Built fused-ssim wheel: {wheel}")
+            return wheel
+    raise RuntimeError(f"fused-ssim wheel build finished, but no compatible wheel found in {WHEELS_DIR}")
 
 
 def build_wheel(local_label: str) -> Path:
@@ -446,6 +567,13 @@ def verify_recast() -> None:
     print(f"[OK] Imported recast from {module_path}")
 
 
+def verify_fused_ssim() -> None:
+    import fused_ssim
+
+    module_path = getattr(fused_ssim, "__file__", "unknown")
+    print(f"[OK] Imported fused_ssim from {module_path}")
+
+
 def build_recast_wheel() -> Path:
     if not NAVMESH_DIR.exists():
         raise FileNotFoundError(f"HY-World navmesh bindings not found: {NAVMESH_DIR}")
@@ -548,6 +676,35 @@ def install_pytorch3d(skip_build_if_cached: bool = False) -> Path:
     return wheel
 
 
+def install_fused_ssim(skip_build_if_cached: bool = False) -> Path:
+    print("============================================================")
+    print("   fused-ssim installer")
+    print("============================================================")
+    if CUDA_130_HOME.exists():
+        print(f"[INFO] CUDA build root: {CUDA_130_HOME}")
+    else:
+        print(f"[WARN] CUDA 13.0 build root not found: {CUDA_130_HOME}")
+    wheel = find_compatible_fused_ssim_wheel() if skip_build_if_cached else None
+    if wheel is None:
+        wheel = build_fused_ssim_wheel()
+    else:
+        print(f"[INFO] Using cached fused-ssim wheel: {wheel}")
+    run_command([sys.executable, "-m", "pip", "uninstall", "-y", "fused-ssim"])
+    run_command(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--force-reinstall",
+            "--no-deps",
+            str(wheel),
+        ],
+    )
+    verify_fused_ssim()
+    return wheel
+
+
 def install_hyworld_gsplat() -> Path:
     if not FORK_DIR.exists():
         raise FileNotFoundError(f"HY-World gsplat_maskgaussian fork not found: {FORK_DIR}")
@@ -586,13 +743,15 @@ def main() -> None:
     parser.add_argument("--pytorch3d-only", action="store_true", help="Build/install PyTorch3D only; do not reinstall gsplat.")
     parser.add_argument("--gsplat-only", action="store_true", help="Build/install HY-World gsplat only.")
     parser.add_argument("--recast-only", action="store_true", help="Build/install Recast navmesh bindings only.")
+    parser.add_argument("--fused-ssim-only", action="store_true", help="Build/install fused-ssim only.")
     parser.add_argument("--skip-recast-build-if-cached", action="store_true", help="Reuse a matching recast wheel if it already exists.")
+    parser.add_argument("--skip-fused-ssim-build-if-cached", action="store_true", help="Reuse a matching fused-ssim wheel if it already exists.")
     parser.add_argument("--skip-pytorch3d-build-if-cached", action="store_true", help="Reuse a matching PyTorch3D wheel if it already exists.")
     args = parser.parse_args()
 
-    selected_only = [args.pytorch3d_only, args.gsplat_only, args.recast_only]
+    selected_only = [args.pytorch3d_only, args.gsplat_only, args.recast_only, args.fused_ssim_only]
     if sum(bool(item) for item in selected_only) > 1:
-        raise ValueError("--pytorch3d-only, --gsplat-only, and --recast-only are mutually exclusive")
+        raise ValueError("--pytorch3d-only, --gsplat-only, --recast-only, and --fused-ssim-only are mutually exclusive")
 
     if args.pytorch3d_only:
         print("============================================================")
@@ -609,7 +768,12 @@ def main() -> None:
         install_recast(skip_build_if_cached=args.skip_recast_build_if_cached)
         return
 
+    if args.fused_ssim_only:
+        install_fused_ssim(skip_build_if_cached=args.skip_fused_ssim_build_if_cached)
+        return
+
     install_hyworld_gsplat()
+    install_fused_ssim(skip_build_if_cached=args.skip_fused_ssim_build_if_cached)
     install_recast(skip_build_if_cached=True)
     install_pytorch3d(skip_build_if_cached=args.skip_pytorch3d_build_if_cached)
 
