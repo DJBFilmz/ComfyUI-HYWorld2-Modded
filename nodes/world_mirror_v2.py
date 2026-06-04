@@ -2730,6 +2730,10 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
                     "default": False,
                     "tooltip": "Print camera/depth/splat alignment diagnostics to the ComfyUI console."
                 }),
+                "enable_splat_upsample": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Build dense high-resolution splats from depth. Disable when only depth maps are needed."
+                }),
                 "splat_upsample_scale": ("FLOAT", {
                     "default": 0.003, "min": 0.0001, "max": 0.05, "step": 0.0001,
                     "tooltip": "Gaussian size for dense backprojected splats."
@@ -2791,6 +2795,7 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
         transformer_mlp_chunk_size=32768,
         apply_sky_mask=False,
         splat_camera_source="camera_inputs",
+        enable_splat_upsample=True,
         splat_upsample_mode="depth_backproject",
         splat_upsample_size=1022,
         splat_upsample_scale=0.003,
@@ -2807,6 +2812,7 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
         depth_prior=None,
     ):
         splat_upsample_size = self._infer_splat_upsample_size(images)
+        splat_upsample_mode = "depth_backproject" if bool(enable_splat_upsample) else "none"
         return super().run_inference(
             model,
             images,
@@ -2839,7 +2845,7 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
             camera_intrinsics=camera_intrinsics,
             camera_poses=camera_poses,
             depth_prior=depth_prior,
-            splat_upsample_mode="depth_backproject",
+            splat_upsample_mode=splat_upsample_mode,
             splat_upsample_size=splat_upsample_size,
             splat_upsample_depth_source="gs_depth",
             splat_upsample_scale=splat_upsample_scale,
