@@ -492,6 +492,90 @@ def _worldstereo_c2w_to_worldmirror_c2w(c2w):
     return basis @ c2w
 
 
+def _quat_wxyz_multiply(a, b):
+    aw, ax, ay, az = np.moveaxis(a, -1, 0)
+    bw, bx, by, bz = np.moveaxis(b, -1, 0)
+    return np.stack(
+        [
+            aw * bw - ax * bx - ay * by - az * bz,
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+        ],
+        axis=-1,
+    )
+
+
+def _convert_trainer_gaussian_ply_to_worldmirror_basis(ply_path):
+    path = Path(ply_path)
+    if not path.exists():
+        return str(path)
+
+    with open(path, "rb") as handle:
+        header = b""
+        vertex_count = None
+        props = []
+        while True:
+            line = handle.readline()
+            if not line:
+                raise ValueError(f"Invalid PLY header in {path}")
+            header += line
+            text = line.decode("ascii", "replace").strip()
+            if text.startswith("element vertex"):
+                vertex_count = int(text.split()[-1])
+            elif text.startswith("property"):
+                parts = text.split()
+                props.append((parts[1], parts[2]))
+            elif text == "end_header":
+                data_offset = handle.tell()
+                break
+
+    if vertex_count is None:
+        raise ValueError(f"PLY has no vertex count: {path}")
+    prop_names = [name for _, name in props]
+    required_xyz = {"x", "y", "z"}
+    if not required_xyz.issubset(prop_names):
+        return str(path)
+
+    type_map = {
+        "float": "<f4",
+        "float32": "<f4",
+        "double": "<f8",
+        "uchar": "u1",
+        "uint8": "u1",
+        "char": "i1",
+        "int": "<i4",
+        "uint": "<u4",
+    }
+    dtype = np.dtype([(name, type_map.get(kind, "<f4")) for kind, name in props])
+    vertices = np.fromfile(path, dtype=dtype, count=vertex_count, offset=data_offset).copy()
+
+    old_x = vertices["x"].copy()
+    old_y = vertices["y"].copy()
+    old_z = vertices["z"].copy()
+    vertices["x"] = old_x
+    vertices["y"] = -old_z
+    vertices["z"] = old_y
+
+    rot_names = ["rot_0", "rot_1", "rot_2", "rot_3"]
+    if set(rot_names).issubset(prop_names):
+        quats = np.stack([vertices[name] for name in rot_names], axis=-1).astype(np.float32)
+        norms = np.linalg.norm(quats, axis=1, keepdims=True)
+        valid = norms[:, 0] > 1e-8
+        quats[valid] = quats[valid] / norms[valid]
+        basis_quat = np.array([np.sqrt(0.5), np.sqrt(0.5), 0.0, 0.0], dtype=np.float32)
+        quats[valid] = _quat_wxyz_multiply(basis_quat, quats[valid])
+        for idx, name in enumerate(rot_names):
+            vertices[name] = quats[:, idx]
+
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "wb") as handle:
+        handle.write(header)
+        vertices.tofile(handle)
+    os.replace(tmp_path, path)
+    return str(path)
+
+
 def _load_camera_tensors_from_json(path):
     with open(path, "r", encoding="utf-8") as handle:
         data = json.load(handle)
@@ -1497,16 +1581,21 @@ class HYWorld2Train3DGS:
         with torch.inference_mode(False), torch.enable_grad():
             trainer.main(0, 0, 1, cfg)
         ply_path = _find_latest_ply(out_dir)
+        if ply_path:
+            ply_path = _convert_trainer_gaussian_ply_to_worldmirror_basis(ply_path)
         camera_json = out_dir / "ply" / "trainer_cameras.json"
         if not camera_json.exists():
             candidates = sorted((out_dir / "ply").glob("trainer_cameras_*.json")) if (out_dir / "ply").exists() else []
             camera_json = candidates[-1] if candidates else data_dir / "cameras.json"
         poses, intrs = _load_camera_tensors_from_json(camera_json) if camera_json.exists() else (torch.empty((0, 4, 4)), torch.empty((0, 3, 3)))
+        if poses.numel() > 0:
+            poses = torch.stack([_worldstereo_c2w_to_worldmirror_c2w(pose) for pose in poses]).float()
         info = {
             "ply_path": ply_path,
             "train_dir": str(out_dir),
             "camera_json": str(camera_json) if camera_json.exists() else "",
-            "camera_pose_basis": "trainer_c2w",
+            "camera_pose_basis": "worldmirror_c2w",
+            "ply_basis": "worldmirror",
         }
         return (ply_path, poses, intrs, str(out_dir), _safe_json_dumps(info))
 
