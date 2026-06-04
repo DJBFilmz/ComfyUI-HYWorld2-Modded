@@ -42,6 +42,15 @@ SAM3_REPO_ID = "MIUProject/sam3"
 SAM3_LOCAL_DIRNAME = "MIUProject_sam3"
 
 
+def _nearest_proper_rotation(matrix: np.ndarray) -> np.ndarray:
+    u, _, vh = np.linalg.svd(matrix)
+    rotation = u @ vh
+    if np.linalg.det(rotation) <= 0:
+        u[:, -1] *= -1.0
+        rotation = u @ vh
+    return rotation.astype(np.float32, copy=False)
+
+
 def _default_sam3_path():
     env_path = os.environ.get("SAM3_PATH") or os.environ.get("HF_SAM3_PATH")
     if env_path:
@@ -573,7 +582,7 @@ class CameraSelector:
             cam_pos = -R_mat.T @ t
             positions.append(cam_pos)
 
-            quat = R.from_matrix(R_mat).as_quat()
+            quat = R.from_matrix(_nearest_proper_rotation(R_mat)).as_quat()
             if quat[3] < 0:
                 quat = -quat
             orientations.append(quat)
