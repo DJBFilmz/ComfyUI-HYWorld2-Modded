@@ -1037,15 +1037,32 @@ def _load_camera_tensors_from_json(path):
 
 def _find_latest_ply(result_dir):
     result_dir = Path(result_dir)
-    candidates = []
     preferred = result_dir / "ply"
-    if preferred.exists():
-        candidates.extend(preferred.glob("*.ply"))
-    candidates.extend(path for path in result_dir.rglob("*.ply") if path not in candidates)
-    if not candidates:
+    search_roots = [preferred] if preferred.exists() else []
+    search_roots.append(result_dir)
+
+    point_clouds = []
+    fallback = []
+    seen = set()
+    for root in search_roots:
+        for path in root.rglob("*.ply"):
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            match = re.fullmatch(r"point_cloud_(\d+)\.ply", path.name)
+            if match:
+                point_clouds.append((int(match.group(1)), path.stat().st_mtime, path))
+            else:
+                fallback.append(path)
+
+    if point_clouds:
+        point_clouds.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return str(point_clouds[0][2])
+    if not fallback:
         return ""
-    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-    return str(candidates[0])
+    fallback.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return str(fallback[0])
 
 
 def _normal_tensor_is_usable(normals):
@@ -1683,20 +1700,12 @@ class HYWorld2Workspace:
             root_dir = str(kwargs.get("root_dir", "") or "").strip()
             root = Path(root_dir) if root_dir else _output_root() / "hyworld2_worldgen"
             scene = root / _sanitize_name(workspace_name, "comfy_worldgen")
-        watched = [
-            scene / "panorama.png",
-            scene / "hyworld2_workspace_state.json",
-            scene / "meta_info.json",
-        ]
+        # Keep Comfy's native cache tied to node inputs, not to files this node
+        # rewrites while running. Watching mtime of workspace_state/meta files
+        # invalidates upstream cache after downstream failures.
         state = [str(scene), _safe_json_dumps({key: kwargs[key] for key in sorted(kwargs) if key != "panorama"})]
         if kwargs.get("panorama") is not None:
             state.append(_safe_json_dumps({"input_panorama": _hyworld2_image_tensor_fingerprint(kwargs.get("panorama"))}))
-        for path in watched:
-            if path.exists():
-                stat = path.stat()
-                state.append(f"{path}:{stat.st_mtime_ns}:{stat.st_size}")
-            else:
-                state.append(f"{path}:missing")
         return "|".join(state)
 
     def build(self, workspace_name, root_dir="", scene_dir="", panorama=None, scene_type="unknown", result_name="worldstereo-memory-dmd"):
@@ -2053,25 +2062,17 @@ class HYWorld2Trajectories:
     @classmethod
     def IS_CHANGED(cls, workspace, **kwargs):
         scene = Path(workspace["scene_dir"])
-        watched = [
-            scene / "panorama.png",
-            scene / "hyworld2_trajectories_state.json",
-            scene / "meta_info.json",
-            scene / "objects.json",
-            scene / "render_results" / "global_pcd.ply",
-            scene / "render_results" / "full_depth_prediction.pt",
-            scene / "render_results" / "sky_mask.png",
-            scene / "render_results" / "pano_bank" / "cameras.json",
+        # This node produces render_results and trajectory state files. They must
+        # not participate in Comfy's native cache key, otherwise a downstream
+        # error makes the next queue start from trajectory generation again.
+        state = [
+            str(scene),
+            str(workspace.get("result_name", "")),
+            str(workspace.get("scene_type", "")),
+            _safe_json_dumps(workspace.get("panorama") or {}),
         ]
-        state = [str(scene)]
         if kwargs:
             state.append(_safe_json_dumps({key: kwargs[key] for key in sorted(kwargs)}))
-        for path in watched:
-            if path.exists():
-                stat = path.stat()
-                state.append(f"{path}:{stat.st_mtime_ns}:{stat.st_size}")
-            else:
-                state.append(f"{path}:missing")
         return "|".join(state)
 
     def _sort(self, workspace, generated=False, captions_written=None, anchor_scans_written=None, logs=None):
@@ -2482,44 +2483,23 @@ class HYWorld2MemoryBank:
     @classmethod
     def IS_CHANGED(cls, workspace, trajectory_set, **kwargs):
         scene = Path(workspace["scene_dir"])
-        watched = [
-            scene / "panorama.png",
-            scene / "hyworld2_workspace_state.json",
-            scene / "hyworld2_trajectories_state.json",
-            scene / "meta_info.json",
-            scene / "render_results" / "global_pcd.ply",
-            scene / "render_results" / "global_normal.npy",
-            scene / "render_results" / "sky_mask.png",
-            scene / "render_results" / "full_depth_prediction.pt",
-            scene / "render_results" / "pano_bank" / "cameras.json",
-        ]
+        render_list = []
+        if isinstance(trajectory_set, dict):
+            render_list = [str(path) for path in trajectory_set.get("render_list", [])]
+        # Keep this key stable across HYWorld2 Trajectories' generated-vs-cache-hit
+        # output metadata. A downstream trainer failure must not invalidate
+        # MemoryBank, PrepareWorldMirrorBatch, WorldMirror, or MemoryAlignment.
         state = [
             str(scene),
+            str(workspace.get("result_name", "")),
             _safe_json_dumps({key: kwargs[key] for key in sorted(kwargs)}),
             _safe_json_dumps(
                 {
-                    "trajectory_count": int(trajectory_set.get("count", 0)) if isinstance(trajectory_set, dict) else 0,
-                    "trajectory_generated": bool(trajectory_set.get("generated", False)) if isinstance(trajectory_set, dict) else False,
-                    "workspace_cache_action": workspace.get("cache_action"),
-                    "result_name": workspace.get("result_name"),
+                    "trajectory_count": len(render_list),
+                    "render_list": render_list,
                 }
             ),
         ]
-        for path in watched:
-            if path.exists():
-                stat = path.stat()
-                state.append(f"{path}:{stat.st_mtime_ns}:{stat.st_size}")
-            else:
-                state.append(f"{path}:missing")
-        pano_bank = scene / "render_results" / "pano_bank"
-        for subdir in ("images", "depths"):
-            files = sorted((pano_bank / subdir).glob("*.png"))
-            state.append(f"{subdir}_count:{len(files)}")
-            if files:
-                first = files[0].stat()
-                last = files[-1].stat()
-                state.append(f"{subdir}_first:{files[0].name}:{first.st_mtime_ns}:{first.st_size}")
-                state.append(f"{subdir}_last:{files[-1].name}:{last.st_mtime_ns}:{last.st_size}")
         return "|".join(state)
 
     def run(self, workspace, trajectory_set, image_width=0, image_height=0, nframe=0, max_reference=8, align_nframe=8, downsampled_pts=2_000_000, kb_anomaly_percentile=90.0):
@@ -3132,6 +3112,9 @@ class HYWorld2Train3DGS:
                 "gs_data": ("HYWORLD2_GS_DATA",),
             },
             "optional": {
+                "train_sampling_preset": (["standard", "half_pano_per_epoch", "random_pano_50_per_epoch"], {"default": "standard"}),
+                "batch_size": ("INT", {"default": 1, "min": 1, "max": 16, "step": 1}),
+                "patch_size": (["Full", "712", "512", "256"], {"default": "Full"}),
                 "max_steps": ("INT", {"default": 8000, "min": 1, "max": 100000, "step": 100}),
                 "save_steps": ("STRING", {"default": "8000"}),
                 "eval_steps": ("STRING", {"default": "8000"}),
@@ -3173,6 +3156,9 @@ class HYWorld2Train3DGS:
     def run(
         self,
         gs_data,
+        train_sampling_preset="standard",
+        batch_size=1,
+        patch_size="Full",
         max_steps=8000,
         save_steps="8000",
         eval_steps="8000",
@@ -3227,6 +3213,10 @@ class HYWorld2Train3DGS:
         cfg = trainer.Config(strategy=strategy)
         cfg.data_dir = str(data_dir)
         cfg.result_dir = str(out_dir)
+        cfg.batch_size = int(batch_size)
+        cfg.patch_size = None if str(patch_size) == "Full" else int(patch_size)
+        if hasattr(cfg, "train_sampling_preset"):
+            cfg.train_sampling_preset = str(train_sampling_preset)
         cfg.max_steps = int(max_steps)
         cfg.save_steps = _parse_int_list(save_steps)
         cfg.eval_steps = _parse_int_list(eval_steps)
@@ -3259,6 +3249,8 @@ class HYWorld2Train3DGS:
         _hy_log(
             "Train 3DGS",
             "Config: "
+            f"batch_size={cfg.batch_size}, patch_size={cfg.patch_size or 'Full'}, "
+            f"train_sampling_preset={getattr(cfg, 'train_sampling_preset', 'standard')}, "
             f"max_steps={cfg.max_steps}, downsample_pts_num={cfg.downsample_pts_num}, save_ply={cfg.save_ply}, "
             f"depth_loss={cfg.depth_loss}, normal_loss={cfg.normal_loss}, sky_depth_from_pcd={cfg.sky_depth_from_pcd}, "
             f"use_scale_regularization={cfg.use_scale_regularization}, use_mask_gaussian={cfg.use_mask_gaussian}, "
@@ -3268,6 +3260,9 @@ class HYWorld2Train3DGS:
         command_info = {
             "data_dir": str(data_dir),
             "result_dir": str(out_dir),
+            "batch_size": int(cfg.batch_size),
+            "patch_size": cfg.patch_size,
+            "train_sampling_preset": str(getattr(cfg, "train_sampling_preset", "standard")),
             "max_steps": int(max_steps),
             "save_steps": cfg.save_steps,
             "eval_steps": cfg.eval_steps,

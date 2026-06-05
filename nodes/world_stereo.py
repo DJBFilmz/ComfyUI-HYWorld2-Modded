@@ -3412,8 +3412,7 @@ class VNCCS_InstallHYWorld2Dependencies:
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
-        import time
-        return time.time()
+        return str(kwargs.get("install", "RUN_DEPENDENCY_INSTALL"))
 
     def install_dependencies(self, install="RUN_DEPENDENCY_INSTALL"):
         import sys

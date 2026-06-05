@@ -78,6 +78,10 @@ class Config:
     polar_down_azimuth_interval: int = 1
     # Only keep video frames whose name starts with this prefix (e.g. "view_000-traj0"). None means no filter.
     video_prefix_filter: Optional[str] = None
+    # Per-epoch training-frame balance. standard keeps official sampling.
+    # half_pano_per_epoch keeps all generated/video frames and a random half of pano/polar.
+    # random_pano_50_per_epoch keeps all generated/video frames and independently samples each pano/polar frame with p=0.5.
+    train_sampling_preset: Literal["standard", "half_pano_per_epoch", "random_pano_50_per_epoch"] = "standard"
     # Random crop size for training  (experimental)
     patch_size: Optional[int] = None
     # A global scaler that applies to the scene size related parameters
@@ -678,6 +682,7 @@ class Runner:
             polar_up_extra_layers=cfg.polar_up_extra_layers,
             polar_down_azimuth_interval=cfg.polar_down_azimuth_interval,
             video_prefix_filter=cfg.video_prefix_filter,
+            train_sampling_preset=cfg.train_sampling_preset,
         )
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
@@ -1043,6 +1048,8 @@ class Runner:
             try:
                 data = next(trainloader_iter)
             except StopIteration:
+                if hasattr(self.trainset, "resample_epoch"):
+                    self.trainset.resample_epoch(log=True)
                 trainloader_iter = iter(trainloader)
                 data = next(trainloader_iter)
 
@@ -1063,10 +1070,36 @@ class Runner:
                     opt_depth = True
                 if cfg.sky_depth_from_pcd:
                     original_depth_mask = (depths_gt > 1e-4)  # before sky merge
-                    image_id_val = data["image_id"].item() if isinstance(data["image_id"], torch.Tensor) else data["image_id"]
-                    if image_id_val in self.sky_depth_maps and self.sky_depth_maps[image_id_val] is not None:
-                        depths_gt = self.sky_depth_maps[image_id_val].unsqueeze(0).to(device)
-                        opt_depth = True
+                    if self.sky_depth_maps:
+                        image_id_values = (
+                            data["image_id"].detach().cpu().reshape(-1).tolist()
+                            if isinstance(data["image_id"], torch.Tensor)
+                            else [data["image_id"]]
+                        )
+                        merged_depths = []
+                        has_sky_depth = False
+                        for batch_i, image_id_val in enumerate(image_id_values):
+                            sky_depth = self.sky_depth_maps.get(int(image_id_val))
+                            if sky_depth is not None:
+                                if all(key in data for key in ("crop_x", "crop_y", "crop_h", "crop_w")):
+                                    crop_x = int(data["crop_x"][batch_i].item())
+                                    crop_y = int(data["crop_y"][batch_i].item())
+                                    crop_h = int(data["crop_h"][batch_i].item())
+                                    crop_w = int(data["crop_w"][batch_i].item())
+                                    sky_depth = sky_depth[crop_y: crop_y + crop_h, crop_x: crop_x + crop_w]
+                                if sky_depth.shape != depths_gt[batch_i].shape:
+                                    sky_depth = F.interpolate(
+                                        sky_depth[None, None].to(dtype=depths_gt.dtype),
+                                        size=tuple(depths_gt[batch_i].shape[-2:]),
+                                        mode="nearest",
+                                    )[0, 0]
+                                merged_depths.append(sky_depth.to(device=device, dtype=depths_gt.dtype))
+                                has_sky_depth = True
+                            else:
+                                merged_depths.append(depths_gt[batch_i])
+                        if has_sky_depth:
+                            depths_gt = torch.stack(merged_depths, dim=0)
+                            opt_depth = True
             else:
                 depths_gt = None
 
@@ -1208,7 +1241,14 @@ class Runner:
 
             if opt_normal:
                 depths = depths.permute(0, 3, 1, 2)  # [B, 1, H, W]
-                intrinsics = Ks.repeat(depths.shape[0], 1, 1)
+                if Ks.shape[0] == depths.shape[0]:
+                    intrinsics = Ks
+                elif Ks.shape[0] == 1:
+                    intrinsics = Ks.expand(depths.shape[0], -1, -1)
+                else:
+                    raise ValueError(
+                        f"Normal loss camera/depth batch mismatch: Ks={tuple(Ks.shape)}, depths={tuple(depths.shape)}"
+                    )
                 if cfg.sky_depth_from_pcd and original_depth_mask is not None:
                     normal_mask = original_depth_mask.unsqueeze(1) if original_depth_mask.ndim == 3 else original_depth_mask
                     normal_mask = normal_mask & (depths > 0)

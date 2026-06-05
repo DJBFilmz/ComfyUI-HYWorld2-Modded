@@ -1030,12 +1030,18 @@ class Dataset:
             polar_up_extra_layers: bool = True,
             polar_down_azimuth_interval: int = 1,
             video_prefix_filter: Optional[str] = None,
+            train_sampling_preset: str = "standard",
     ):
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
         self.load_normals = load_normals
+        self.train_sampling_preset = str(train_sampling_preset or "standard")
+        self._epoch_rng = np.random.default_rng(seed=42)
+        self._epoch = 0
+        self._base_video_indices = []
+        self._base_pano_indices = []
         indices = np.arange(len(self.parser.image_names))
         self.indices = []
         pano_indices = []
@@ -1060,11 +1066,18 @@ class Dataset:
                 else:
                     if idx % self.parser.test_every != 0 or is_pano:
                         self.indices.append(idx)
+                        if is_pano:
+                            self._base_pano_indices.append(idx)
+                        else:
+                            self._base_video_indices.append(idx)
                     if is_pano:
                         pano_indices.append(idx)
             if pano_repeat > 1 and not pano_only:
                 for _ in range(pano_repeat - 1):
                     self.indices.extend(pano_indices)
+            if (not pano_only and not video_only
+                    and self.train_sampling_preset in ("half_pano_per_epoch", "random_pano_50_per_epoch")):
+                self.resample_epoch(log=False)
         else:
             for idx in indices:
                 name = self.parser.image_names[idx]
@@ -1082,7 +1095,33 @@ class Dataset:
         print(f"[Dataset-{split}] total={len(names)}, video_frames={n_video}, "
               f"panorama={n_panorama}, polar_up={n_polar_up}, polar_down={n_polar_down}"
               + (f", polar_old={n_polar_old}" if n_polar_old > 0 else "")
+              + (f", train_sampling_preset={self.train_sampling_preset}" if split == "train" else "")
               + (f", pano_repeat={pano_repeat}" if pano_repeat > 1 else ""))
+
+    def resample_epoch(self, log=True):
+        if self.split != "train" or self.train_sampling_preset == "standard":
+            return
+        pano = list(self._base_pano_indices)
+        video = list(self._base_video_indices)
+        if self.train_sampling_preset == "half_pano_per_epoch":
+            keep_count = len(pano) // 2
+            if keep_count > 0:
+                selected_pano = self._epoch_rng.choice(pano, size=keep_count, replace=False).tolist()
+            else:
+                selected_pano = []
+        elif self.train_sampling_preset == "random_pano_50_per_epoch":
+            selected_pano = [idx for idx in pano if self._epoch_rng.random() < 0.5]
+        else:
+            return
+        self.indices = video + selected_pano
+        self._epoch_rng.shuffle(self.indices)
+        self._epoch += 1
+        if log:
+            print(
+                f"[Dataset-{self.split}] epoch_resample={self._epoch}, "
+                f"preset={self.train_sampling_preset}, video_frames={len(video)}, "
+                f"pano_polar={len(selected_pano)}/{len(pano)}, total={len(self.indices)}"
+            )
 
     @staticmethod
     def _passes_interval_filter(
@@ -1117,6 +1156,8 @@ class Dataset:
         K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
         params = self.parser.params_dict[camera_id]
         camtoworlds = self.parser.camtoworlds[index]
+        crop_x = 0
+        crop_y = 0
 
         if len(params) > 0:
             # Images are distorted. Undistort them.
@@ -1136,6 +1177,9 @@ class Dataset:
             image = image[y: y + self.patch_size, x: x + self.patch_size]
             K[0, 2] -= x
             K[1, 2] -= y
+            crop_x = int(x)
+            crop_y = int(y)
+        crop_h, crop_w = image.shape[:2]
 
         image_name = self.parser.image_names[index]
         data = {
@@ -1144,12 +1188,18 @@ class Dataset:
             "image": torch.from_numpy(image).float(),
             "image_id": item,  # the index of the image in the dataset
             "image_name": image_name,
+            "crop_x": crop_x,
+            "crop_y": crop_y,
+            "crop_h": int(crop_h),
+            "crop_w": int(crop_w),
         }
 
         if self.load_depths:
             depth_path = self.parser.depth_dict[camera_id]
             if depth_path is not None:
                 depth = load_16bit_png_depth(depth_path)
+                if self.patch_size is not None:
+                    depth = depth[crop_y: crop_y + crop_h, crop_x: crop_x + crop_w]
                 data["depths"] = torch.from_numpy(depth).float()
             else:
                 data["depths"] = torch.zeros((image.shape[0], image.shape[1]), dtype=torch.float32)
@@ -1165,6 +1215,8 @@ class Dataset:
                 normal = Image.open(normal_path)
                 normal = np.array(normal) / 255
                 assert normal.ndim == 3 and normal.shape[2] == 3
+                if self.patch_size is not None:
+                    normal = normal[crop_y: crop_y + crop_h, crop_x: crop_x + crop_w]
                 normal = normal.astype(np.float32) * 2. - 1.
                 normal = normal.transpose(2, 0, 1)
                 data["normals"] = torch.from_numpy(normal).float()

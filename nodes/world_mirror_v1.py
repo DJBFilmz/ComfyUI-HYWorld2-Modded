@@ -1702,21 +1702,15 @@ class VNCCS_BackgroundPreview:
     
     @classmethod
     def IS_CHANGED(cls, ply_path=None, coordinate_basis="auto", **kwargs):
-        """Force re-execution when a new video is recorded."""
-        import glob
         coordinate_basis = cls._normalize_coordinate_basis(coordinate_basis)
-        output_dir = folder_paths.get_output_directory()
-        try:
-            pattern = os.path.join(output_dir, "gaussian-recording-*.mp4")
-            video_files = glob.glob(pattern)
-            if video_files:
-                video_files.sort(key=os.path.getmtime, reverse=True)
-                return os.path.getmtime(video_files[0])
-        except Exception:
-            pass
+        state = [str(ply_path or ""), coordinate_basis]
         if ply_path:
-            return hash((ply_path, coordinate_basis))
-        return None
+            try:
+                stat = os.stat(ply_path)
+                state.append(f"{stat.st_mtime_ns}:{stat.st_size}")
+            except OSError:
+                state.append("missing")
+        return "|".join(state)
 
     @staticmethod
     def _normalize_coordinate_basis(coordinate_basis):
