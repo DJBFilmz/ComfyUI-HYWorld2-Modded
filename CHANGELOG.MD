@@ -1,5 +1,69 @@
 # Changelog
 
+## 1.5.0
+
+### Added
+
+- Added the native HYWorld2 world-generation workflow:
+  - `HYWorld2 Workspace`
+  - `HYWorld2 QwenVL`
+  - `HYWorld2 Trajectories`
+  - `HYWorld2 Memory Bank`
+  - `HYWorld2 World Expansion`
+  - `HYWorld2 Prepare WorldMirror Batch`
+  - `HYWorld2 Memory Alignment`
+  - `HYWorld2 GS Data`
+  - `HYWorld2 Train 3DGS`
+- Added native HYWorld2 worldgen modules for trajectory planning, trajectory rendering, memory-bank retrieval, WorldStereo scene expansion, GS dataset export, 3DGS training, and mesh export.
+- Added Qwen Pano helper nodes for reference/canvas preparation, prompt generation, panorama generation, and seam blending.
+- Added local QwenVL support for HYWorld2 planning and trajectory captioning, with 4B instruct and 4-bit quantization defaults.
+- Added robust LLM JSON parsing with `json-repair`.
+- Added native callable APIs for `traj_generate.py` and `traj_render.py`, allowing HYWorld2 trajectories to run in-process without `runpy`, `sys.argv`, cwd, env, or subprocess-style script execution.
+- Added native Windows wheel support for HYWorld2 worldgen dependencies, including the HYWorld gsplat fork, recast/navmesh, PyTorch3D, and fused SSIM.
+- Added `Load PLY File` for preview/debug workflows that need to inspect existing PLY files without rerunning the full pipeline.
+- Added a complete native world-generation workflow example.
+
+### Changed
+
+- Reworked HYWorld2 workspace, trajectory, expansion, and memory-bank execution around automatic cache detection instead of manual mode switching.
+- Updated trajectory generation to reuse existing workspace outputs when the source panorama, settings, and seed match.
+- Updated World Expansion to reuse existing generated result videos when the seed and output files match.
+- Added seed-aware cache state to HYWorld2 trajectory and expansion stages.
+- Added manual `scene_type` selection for HYWorld2 trajectories (`auto`, `indoor`, `outdoor`).
+- Reduced automatic scene-type classification input size to a 480px preview image.
+- Removed OpenAI/vLLM fallback behavior from trajectory generation; model work is routed through the local HYWorld2 QwenVL path.
+- Renamed and clarified the additional navigation trajectory option.
+- Added optional extreme-detail trajectory planning for notable environment details, with duplicate removal against the primary object pass.
+- Improved SAM3 loading/progress logging during trajectory generation.
+- Added `memory_images` output to `HYWorld2 Memory Bank` for inspecting frames passed downstream.
+- Added prerequisite checks for incomplete HYWorld2 workspaces before constructing the memory bank.
+- Updated `HYWorld2 Memory Alignment` to require connected `raw_splats` depth for alignment instead of internally launching a second WorldMirror reconstruction.
+- Added `enable_splat_upsample` to the simple WorldMirror V2 reconstruction node; it remains enabled by default and can be disabled for depth-only workflows.
+- Added 3DGS trainer controls for `batch_size`, patch-size presets, and panorama/generated-frame sampling presets.
+- Improved 3DGS trainer metadata, camera export, mesh export, and preview compatibility.
+- Updated Gaussian preview to handle `worldmirror` and `hyworld2_worldgen` coordinate bases more explicitly.
+- Added preview-basis conversion for HYWorld2 trainer PLYs without mutating the original PLY files.
+- Updated installer messaging and dependency handling for native HYWorld wheels.
+
+### Fixed
+
+- Fixed HYWorld2 trajectory rendering in single-process ComfyUI runs by avoiding distributed process-group requirements.
+- Fixed tensor indexing issues in WorldStereo generation caused by tensor `ref_index` values.
+- Fixed trainer batch handling for image IDs, depth tensors, and normal tensors.
+- Fixed trainer post-run distributed barrier errors in single-process mode.
+- Fixed Gaussian preview loading for HYWorld2 trainer PLYs by avoiding invalid `.splat` cache substitution.
+- Fixed HYWorld2 trainer preview basis issues that caused black, upside-down, or incorrectly oriented previews.
+- Fixed persistent coordinate-basis widget behavior in the background preview node.
+- Fixed ComfyUI cache invalidation warnings caused by `IS_CHANGED` receiving unresolved upstream values.
+- Fixed Memory Bank cache diagnostics and made cache-key logging explicit for HYWorld2 workspace, trajectory, and memory-bank nodes.
+
+### Dependencies
+
+- Updated `numpy` requirement to `>=2.0,<2.3`.
+- Updated `transformers` requirement to `>=5.2.0`.
+- Added HYWorld2 worldgen/runtime dependencies including `json-repair`, `utils3d`, `cupy-cuda13x`, `zim-anything`, trainer utilities, and native build helpers.
+- Removed direct PyPI `gsplat` dependency in favor of the vendored HYWorld gsplat fork installed by the project installer.
+
 ## 1.4.0
 
 ### Added
