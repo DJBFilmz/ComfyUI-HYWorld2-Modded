@@ -1317,6 +1317,17 @@ def _hy_log(node, message):
     print(f"[HYWorld2 {node}] {message}")
 
 
+def _hy_cache_debug(node, stage, payload):
+    text = _safe_json_dumps(payload)
+    digest = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    compact = payload
+    try:
+        compact = json.loads(text)
+    except Exception:
+        pass
+    print(f"[HYWorld2 Cache] {node} {stage}: hash={digest} payload={_safe_json_dumps(compact)}")
+
+
 def _load_workspace_panorama(scene):
     image_path = scene / "panorama_sr.png"
     if not image_path.exists():
@@ -1704,6 +1715,12 @@ class HYWorld2Workspace:
         # Keep Comfy's native cache tied to node inputs, not to files this node
         # rewrites while running. Watching mtime of workspace_state/meta files
         # invalidates upstream cache after downstream failures.
+        debug_payload = {
+            "scene": str(scene),
+            "kwargs": {key: kwargs[key] for key in sorted(kwargs) if key != "panorama"},
+            "panorama": _hyworld2_image_tensor_fingerprint(kwargs.get("panorama")) if kwargs.get("panorama") is not None else None,
+        }
+        _hy_cache_debug("Workspace", "IS_CHANGED", debug_payload)
         state = [str(scene), _safe_json_dumps({key: kwargs[key] for key in sorted(kwargs) if key != "panorama"})]
         if kwargs.get("panorama") is not None:
             state.append(_safe_json_dumps({"input_panorama": _hyworld2_image_tensor_fingerprint(kwargs.get("panorama"))}))
@@ -2062,10 +2079,26 @@ class HYWorld2Trajectories:
 
     @classmethod
     def IS_CHANGED(cls, workspace, **kwargs):
+        if not isinstance(workspace, dict) or not workspace.get("scene_dir"):
+            debug_payload = {
+                "workspace": "missing_or_unresolved",
+                "workspace_type": type(workspace).__name__,
+                "kwargs": {key: kwargs[key] for key in sorted(kwargs)},
+            }
+            _hy_cache_debug("Trajectories", "IS_CHANGED", debug_payload)
+            return _safe_json_dumps(debug_payload)
         scene = Path(workspace["scene_dir"])
         # This node produces render_results and trajectory state files. They must
         # not participate in Comfy's native cache key, otherwise a downstream
         # error makes the next queue start from trajectory generation again.
+        debug_payload = {
+            "scene": str(scene),
+            "result_name": str(workspace.get("result_name", "")),
+            "workspace_scene_type": str(workspace.get("scene_type", "")),
+            "workspace_panorama": workspace.get("panorama") or {},
+            "kwargs": {key: kwargs[key] for key in sorted(kwargs)},
+        }
+        _hy_cache_debug("Trajectories", "IS_CHANGED", debug_payload)
         state = [
             str(scene),
             str(workspace.get("result_name", "")),
@@ -2483,23 +2516,45 @@ class HYWorld2MemoryBank:
 
     @classmethod
     def IS_CHANGED(cls, workspace, trajectory_set, **kwargs):
+        if not isinstance(workspace, dict) or not workspace.get("scene_dir"):
+            debug_payload = {
+                "workspace": "missing_or_unresolved",
+                "workspace_type": type(workspace).__name__,
+                "trajectory_set_type": type(trajectory_set).__name__,
+                "kwargs": {key: kwargs[key] for key in sorted(kwargs)},
+            }
+            _hy_cache_debug("MemoryBank", "IS_CHANGED", debug_payload)
+            return _safe_json_dumps(debug_payload)
         scene = Path(workspace["scene_dir"])
         render_list = []
         if isinstance(trajectory_set, dict):
             render_list = [str(path) for path in trajectory_set.get("render_list", [])]
+        render_payload = {
+            "trajectory_count": len(render_list),
+            "render_list": render_list,
+        }
+        kwargs_payload = {key: kwargs[key] for key in sorted(kwargs)}
+        debug_payload = {
+            "scene": str(scene),
+            "result_name": str(workspace.get("result_name", "")),
+            "workspace_scene_type": str(workspace.get("scene_type", "")),
+            "workspace_panorama": workspace.get("panorama") or {},
+            "kwargs": kwargs_payload,
+            "trajectory_count": len(render_list),
+            "render_first": render_list[0] if render_list else "",
+            "render_last": render_list[-1] if render_list else "",
+            "render_list_hash": hashlib.sha256(_safe_json_dumps(render_list).encode("utf-8", errors="ignore")).hexdigest()[:16],
+            "trajectory_generated": bool(trajectory_set.get("generated", False)) if isinstance(trajectory_set, dict) else None,
+        }
+        _hy_cache_debug("MemoryBank", "IS_CHANGED", debug_payload)
         # Keep this key stable across HYWorld2 Trajectories' generated-vs-cache-hit
         # output metadata. A downstream trainer failure must not invalidate
         # MemoryBank, PrepareWorldMirrorBatch, WorldMirror, or MemoryAlignment.
         state = [
             str(scene),
             str(workspace.get("result_name", "")),
-            _safe_json_dumps({key: kwargs[key] for key in sorted(kwargs)}),
-            _safe_json_dumps(
-                {
-                    "trajectory_count": len(render_list),
-                    "render_list": render_list,
-                }
-            ),
+            _safe_json_dumps(kwargs_payload),
+            _safe_json_dumps(render_payload),
         ]
         return "|".join(state)
 
