@@ -370,13 +370,8 @@
         function applyCoordinateBasisToSplat(splat, coordinateBasis) {
             if (!splat) return;
             const basis = (coordinateBasis || 'worldmirror').toLowerCase();
-            if (basis === 'hyworld2_worldgen') {
-                const q = Math.SQRT1_2;
-                splat.rotation = new SPLAT.Quaternion(q, 0, 0, q);
-                console.log('[GaussianViewer] Applied HYWorld2 worldgen -> preview basis rotation.');
-            } else {
-                splat.rotation = new SPLAT.Quaternion();
-            }
+            splat.rotation = new SPLAT.Quaternion();
+            console.log('[GaussianViewer] Loading splat without runtime basis rotation:', basis);
         }
 
         function resizeRendererToCanvas() {

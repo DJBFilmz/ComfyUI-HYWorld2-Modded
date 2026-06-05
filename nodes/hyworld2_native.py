@@ -3,6 +3,7 @@ import gc
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 from argparse import Namespace
@@ -872,8 +873,8 @@ def _to_intrinsics(intrs):
 _WORLDSTEREO_TO_WORLDMIRROR_BASIS = torch.tensor(
     [
         [1.0, 0.0, 0.0, 0.0],
-        [0.0, 0.0, -1.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, -1.0, 0.0, 0.0],
         [0.0, 0.0, 0.0, 1.0],
     ],
     dtype=torch.float32,
@@ -983,8 +984,8 @@ def _convert_trainer_gaussian_ply_to_worldmirror_basis(ply_path):
     old_y = vertices["y"].copy()
     old_z = vertices["z"].copy()
     vertices["x"] = old_x
-    vertices["y"] = -old_z
-    vertices["z"] = old_y
+    vertices["y"] = old_z
+    vertices["z"] = -old_y
 
     rot_names = ["rot_0", "rot_1", "rot_2", "rot_3"]
     if set(rot_names).issubset(prop_names):
@@ -992,7 +993,7 @@ def _convert_trainer_gaussian_ply_to_worldmirror_basis(ply_path):
         norms = np.linalg.norm(quats, axis=1, keepdims=True)
         valid = norms[:, 0] > 1e-8
         quats[valid] = quats[valid] / norms[valid]
-        basis_quat = np.array([np.sqrt(0.5), np.sqrt(0.5), 0.0, 0.0], dtype=np.float32)
+        basis_quat = np.array([np.sqrt(0.5), -np.sqrt(0.5), 0.0, 0.0], dtype=np.float32)
         quats[valid] = _quat_wxyz_multiply(basis_quat, quats[valid])
         for idx, name in enumerate(rot_names):
             vertices[name] = quats[:, idx]
