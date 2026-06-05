@@ -16,7 +16,7 @@ if not exist "%PYTHON_EXE%" (
 )
 
 echo [OK] Found Python: %PYTHON_EXE%
-echo [*] Running build_gsplat.py...
+echo [*] Installing HY-World native wheels (gsplat, recast, PyTorch3D)...
 
 "%PYTHON_EXE%" "%SCRIPT_DIR%build_gsplat.py"
 

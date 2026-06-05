@@ -1,0 +1,1041 @@
+{
+  "id": "hyworld2-native-panorama",
+  "revision": 0,
+  "last_node_id": 837,
+  "last_link_id": 2384,
+  "nodes": [
+    {
+      "id": 45,
+      "type": "HYWorld2MemoryAlignment",
+      "pos": [
+        1960,
+        -70
+      ],
+      "size": [
+        340,
+        150
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "worldmirror_batch",
+          "type": "HYWORLD2_WORLDMIRROR_BATCH",
+          "link": 2313
+        },
+        {
+          "name": "raw_splats",
+          "shape": 7,
+          "type": "VNCCS_SPLAT",
+          "link": 2376
+        },
+        {
+          "name": "ply_data",
+          "shape": 7,
+          "type": "PLY_DATA",
+          "link": 2373
+        }
+      ],
+      "outputs": [
+        {
+          "name": "memory_bank",
+          "type": "HYWORLD2_MEMORY_BANK",
+          "links": [
+            151
+          ]
+        },
+        {
+          "name": "aligned_ply",
+          "type": "STRING",
+          "links": []
+        },
+        {
+          "name": "info",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-hyworld2",
+        "ver": "1.4.0",
+        "Node name for S&R": "HYWorld2MemoryAlignment"
+      },
+      "widgets_values": [
+        "align_and_export",
+        2000000,
+        false
+      ]
+    },
+    {
+      "id": 822,
+      "type": "HYWorld2Workspace",
+      "pos": [
+        -120,
+        -230
+      ],
+      "size": [
+        330,
+        180
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "panorama",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": 2317
+        }
+      ],
+      "outputs": [
+        {
+          "name": "workspace",
+          "type": "HYWORLD2_WORKSPACE",
+          "links": [
+            2318,
+            2349,
+            2360,
+            2365
+          ]
+        },
+        {
+          "name": "info",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-hyworld2",
+        "ver": "1.4.0",
+        "Node name for S&R": "HYWorld2Workspace"
+      },
+      "widgets_values": [
+        "comfy_worldgen2",
+        "",
+        "",
+        "unknown",
+        "worldstereo-memory-dmd"
+      ]
+    },
+    {
+      "id": 830,
+      "type": "HYWorld2MemoryBank",
+      "pos": [
+        280,
+        -60
+      ],
+      "size": [
+        350,
+        250
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "workspace",
+          "type": "HYWORLD2_WORKSPACE",
+          "link": 2349
+        },
+        {
+          "name": "trajectory_set",
+          "type": "HYWORLD2_TRAJECTORY_SET",
+          "link": 2366
+        }
+      ],
+      "outputs": [
+        {
+          "name": "memory_bank",
+          "type": "HYWORLD2_MEMORY_BANK",
+          "links": [
+            2361
+          ]
+        },
+        {
+          "name": "info",
+          "type": "STRING",
+          "links": null
+        },
+        {
+          "name": "memory_images",
+          "type": "IMAGE",
+          "links": []
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-hyworld2",
+        "ver": "1.4.0",
+        "Node name for S&R": "HYWorld2MemoryBank"
+      },
+      "widgets_values": [
+        0,
+        0,
+        0,
+        8,
+        8,
+        2000000,
+        90
+      ]
+    },
+    {
+      "id": 817,
+      "type": "VNCCS_LoadWorldStereoLightModel",
+      "pos": [
+        690,
+        -200
+      ],
+      "size": [
+        370,
+        130
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "WORLDSTEREO_MODEL",
+          "links": [
+            2363
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-hyworld2",
+        "ver": "1.4.0",
+        "Node name for S&R": "VNCCS_LoadWorldStereoLightModel"
+      },
+      "widgets_values": [
+        "Memory DMD Light INT4",
+        "sequential_cpu_offload",
+        "cuda"
+      ]
+    },
+    {
+      "id": 834,
+      "type": "HYWorld2Trajectories",
+      "pos": [
+        -140,
+        30
+      ],
+      "size": [
+        380,
+        330
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "workspace",
+          "type": "HYWORLD2_WORKSPACE",
+          "link": 2365
+        }
+      ],
+      "outputs": [
+        {
+          "name": "trajectory_set",
+          "type": "HYWORLD2_TRAJECTORY_SET",
+          "links": [
+            2366,
+            2367
+          ]
+        },
+        {
+          "name": "info",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-hyworld2",
+        "ver": "1.4.0",
+        "Node name for S&R": "HYWorld2Trajectories"
+      },
+      "widgets_values": [
+        1,
+        "fixed",
+        "auto",
+        false,
+        false,
+        6,
+        "Qwen3-VL-4B-Instruct",
+        "4-bit (VRAM-friendly)",
+        768,
+        false,
+        2
+      ]
+    },
+    {
+      "id": 820,
+      "type": "HYWorld2PrepareWorldMirrorBatch",
+      "pos": [
+        1120,
+        0
+      ],
+      "size": [
+        350,
+        120
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "memory_bank",
+          "type": "HYWORLD2_MEMORY_BANK",
+          "link": 2364
+        }
+      ],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "links": [
+            2369
+          ]
+        },
+        {
+          "name": "camera_poses",
+          "type": "TENSOR",
+          "links": [
+            2371
+          ]
+        },
+        {
+          "name": "camera_intrinsics",
+          "type": "TENSOR",
+          "links": [
+            2370
+          ]
+        },
+        {
+          "name": "worldmirror_batch",
+          "type": "HYWORLD2_WORLDMIRROR_BATCH",
+          "links": [
+            2313
+          ]
+        },
+        {
+          "name": "info",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-hyworld2",
+        "ver": "1.4.0",
+        "Node name for S&R": "HYWorld2PrepareWorldMirrorBatch"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 835,
+      "type": "VNCCS_WorldMirrorV2_3D",
+      "pos": [
+        1510,
+        -120
+      ],
+      "size": [
+        410,
+        540
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "WORLDMIRROR_MODEL",
+          "link": 2368
+        },
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 2369
+        },
+        {
+          "name": "camera_intrinsics",
+          "shape": 7,
+          "type": "TENSOR",
+          "link": 2370
+        },
+        {
+          "name": "camera_poses",
+          "shape": 7,
+          "type": "TENSOR",
+          "link": 2371
+        },
+        {
+          "name": "depth_prior",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ply_data",
+          "type": "PLY_DATA",
+          "links": [
+            2373
+          ]
+        },
+        {
+          "name": "depth_maps",
+          "type": "IMAGE",
+          "links": null
+        },
+        {
+          "name": "normal_maps",
+          "type": "IMAGE",
+          "links": null
+        },
+        {
+          "name": "camera_poses",
+          "type": "TENSOR",
+          "links": []
+        },
+        {
+          "name": "camera_intrinsics",
+          "type": "TENSOR",
+          "links": []
+        },
+        {
+          "name": "raw_splats",
+          "type": "VNCCS_SPLAT",
+          "links": [
+            2376
+          ]
+        },
+        {
+          "name": "filter_mask",
+          "type": "IMAGE",
+          "links": null
+        },
+        {
+          "name": "gs_filter_mask",
+          "type": "IMAGE",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-hyworld2",
+        "ver": "1.4.0",
+        "Node name for S&R": "VNCCS_WorldMirrorV2_3D"
+      },
+      "widgets_values": [
+        840,
+        "none",
+        true,
+        false,
+        false,
+        true,
+        0.003,
+        "depth_adaptive",
+        1,
+        3,
+        true,
+        0.0015,
+        5000000,
+        1.75,
+        "camera_inputs"
+      ]
+    },
+    {
+      "id": 833,
+      "type": "HYWorld2WorldExpansion",
+      "pos": [
+        670,
+        0
+      ],
+      "size": [
+        430,
+        340
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "workspace",
+          "type": "HYWORLD2_WORKSPACE",
+          "link": 2360
+        },
+        {
+          "name": "memory_bank",
+          "type": "HYWORLD2_MEMORY_BANK",
+          "link": 2361
+        },
+        {
+          "name": "trajectory_set",
+          "type": "HYWORLD2_TRAJECTORY_SET",
+          "link": 2367
+        },
+        {
+          "name": "model",
+          "type": "WORLDSTEREO_MODEL",
+          "link": 2363
+        }
+      ],
+      "outputs": [
+        {
+          "name": "memory_bank",
+          "type": "HYWORLD2_MEMORY_BANK",
+          "links": [
+            2364
+          ]
+        },
+        {
+          "name": "info",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-hyworld2",
+        "ver": "1.4.0",
+        "Node name for S&R": "HYWorld2WorldExpansion"
+      },
+      "widgets_values": [
+        "Qwen3-VL-4B-Instruct",
+        "4-bit (VRAM-friendly)",
+        "auto",
+        768,
+        512,
+        true,
+        4,
+        1,
+        "fixed",
+        0
+      ]
+    },
+    {
+      "id": 10,
+      "type": "VNCCS_LoadWorldMirrorV2Model",
+      "pos": [
+        1540,
+        -270
+      ],
+      "size": [
+        320,
+        100
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "WORLDMIRROR_MODEL",
+          "links": [
+            2368
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-hyworld2",
+        "ver": "1.4.0",
+        "Node name for S&R": "VNCCS_LoadWorldMirrorV2Model"
+      },
+      "widgets_values": [
+        "cuda",
+        "fp8"
+      ]
+    },
+    {
+      "id": 13,
+      "type": "HYWorld2GSData",
+      "pos": [
+        1960,
+        160
+      ],
+      "size": [
+        360,
+        200
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "workspace",
+          "type": "HYWORLD2_WORKSPACE",
+          "link": 2318
+        },
+        {
+          "name": "memory_bank",
+          "shape": 7,
+          "type": "HYWORLD2_MEMORY_BANK",
+          "link": 151
+        }
+      ],
+      "outputs": [
+        {
+          "name": "gs_data",
+          "type": "HYWORLD2_GS_DATA",
+          "links": [
+            2381
+          ]
+        },
+        {
+          "name": "info",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-hyworld2",
+        "ver": "1.4.0",
+        "Node name for S&R": "HYWorld2GSData"
+      },
+      "widgets_values": [
+        "build",
+        "worldstereo-memory-dmd",
+        "gs_data",
+        true,
+        true,
+        false
+      ]
+    },
+    {
+      "id": 837,
+      "type": "HYWorld2Train3DGS",
+      "pos": [
+        2350,
+        -370
+      ],
+      "size": [
+        410,
+        890
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "gs_data",
+          "type": "HYWORLD2_GS_DATA",
+          "link": 2381
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ply_path",
+          "type": "STRING",
+          "links": [
+            2382
+          ]
+        },
+        {
+          "name": "camera_poses",
+          "type": "TENSOR",
+          "links": [
+            2383
+          ]
+        },
+        {
+          "name": "camera_intrinsics",
+          "type": "TENSOR",
+          "links": [
+            2384
+          ]
+        },
+        {
+          "name": "train_dir",
+          "type": "STRING",
+          "links": null
+        },
+        {
+          "name": "info",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-hyworld2",
+        "ver": "1.4.0",
+        "Node name for S&R": "HYWorld2Train3DGS"
+      },
+      "widgets_values": [
+        "standard",
+        1,
+        "Full",
+        5001,
+        "5001",
+        "5001",
+        "5001",
+        2000001,
+        true,
+        true,
+        true,
+        true,
+        true,
+        false,
+        true,
+        true,
+        true,
+        false,
+        true,
+        false,
+        0.01,
+        true,
+        true,
+        true,
+        150,
+        750,
+        100,
+        750,
+        99990,
+        0.0001,
+        0.1,
+        false
+      ]
+    },
+    {
+      "id": 1,
+      "type": "LoadImage",
+      "pos": [
+        -1450,
+        -360
+      ],
+      "size": [
+        1240,
+        780
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            2317
+          ]
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "title": "Load Panorama",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.23.0",
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "ComfyUI_temp_udaxi_00001_ (1) (1).png",
+        "image"
+      ]
+    },
+    {
+      "id": 15,
+      "type": "VNCCS_BackgroundPreview",
+      "pos": [
+        2810,
+        -660
+      ],
+      "size": [
+        1960,
+        1350
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ply_path",
+          "shape": 7,
+          "type": "STRING",
+          "link": 2382
+        },
+        {
+          "name": "camera_poses",
+          "shape": 7,
+          "type": "TENSOR",
+          "link": 2383
+        },
+        {
+          "name": "camera_intrinsics",
+          "shape": 7,
+          "type": "TENSOR",
+          "link": 2384
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video_path",
+          "type": "STRING",
+          "links": null
+        },
+        {
+          "name": "ply_path",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-hyworld2",
+        "ver": "1.4.0",
+        "Node name for S&R": "VNCCS_BackgroundPreview",
+        "coordinate_basis": "auto"
+      },
+      "widgets_values": [
+        "auto",
+        ""
+      ]
+    }
+  ],
+  "links": [
+    [
+      151,
+      45,
+      0,
+      13,
+      1,
+      "HYWORLD2_MEMORY_BANK"
+    ],
+    [
+      2313,
+      820,
+      3,
+      45,
+      0,
+      "HYWORLD2_WORLDMIRROR_BATCH"
+    ],
+    [
+      2317,
+      1,
+      0,
+      822,
+      0,
+      "IMAGE"
+    ],
+    [
+      2318,
+      822,
+      0,
+      13,
+      0,
+      "HYWORLD2_WORKSPACE"
+    ],
+    [
+      2349,
+      822,
+      0,
+      830,
+      0,
+      "HYWORLD2_WORKSPACE"
+    ],
+    [
+      2360,
+      822,
+      0,
+      833,
+      0,
+      "HYWORLD2_WORKSPACE"
+    ],
+    [
+      2361,
+      830,
+      0,
+      833,
+      1,
+      "HYWORLD2_MEMORY_BANK"
+    ],
+    [
+      2363,
+      817,
+      0,
+      833,
+      3,
+      "WORLDSTEREO_MODEL"
+    ],
+    [
+      2364,
+      833,
+      0,
+      820,
+      0,
+      "HYWORLD2_MEMORY_BANK"
+    ],
+    [
+      2365,
+      822,
+      0,
+      834,
+      0,
+      "HYWORLD2_WORKSPACE"
+    ],
+    [
+      2366,
+      834,
+      0,
+      830,
+      1,
+      "HYWORLD2_TRAJECTORY_SET"
+    ],
+    [
+      2367,
+      834,
+      0,
+      833,
+      2,
+      "HYWORLD2_TRAJECTORY_SET"
+    ],
+    [
+      2368,
+      10,
+      0,
+      835,
+      0,
+      "WORLDMIRROR_MODEL"
+    ],
+    [
+      2369,
+      820,
+      0,
+      835,
+      1,
+      "IMAGE"
+    ],
+    [
+      2370,
+      820,
+      2,
+      835,
+      2,
+      "TENSOR"
+    ],
+    [
+      2371,
+      820,
+      1,
+      835,
+      3,
+      "TENSOR"
+    ],
+    [
+      2373,
+      835,
+      0,
+      45,
+      2,
+      "PLY_DATA"
+    ],
+    [
+      2376,
+      835,
+      5,
+      45,
+      1,
+      "VNCCS_SPLAT"
+    ],
+    [
+      2381,
+      13,
+      0,
+      837,
+      0,
+      "HYWORLD2_GS_DATA"
+    ],
+    [
+      2382,
+      837,
+      0,
+      15,
+      0,
+      "STRING"
+    ],
+    [
+      2383,
+      837,
+      1,
+      15,
+      1,
+      "TENSOR"
+    ],
+    [
+      2384,
+      837,
+      2,
+      15,
+      2,
+      "TENSOR"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "Trajectories Build",
+      "bounding": [
+        -150,
+        -300,
+        790,
+        670
+      ],
+      "color": "#3f789e",
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "World Expansion (world-stereo)",
+      "bounding": [
+        660,
+        -270,
+        820,
+        620
+      ],
+      "color": "#3f789e",
+      "flags": {}
+    },
+    {
+      "id": 3,
+      "title": "World Reconstructor (world-mirror2)",
+      "bounding": [
+        1500,
+        -340,
+        430,
+        770
+      ],
+      "color": "#3f789e",
+      "flags": {}
+    },
+    {
+      "id": 4,
+      "title": "3DGS Trainer",
+      "bounding": [
+        1950,
+        -440,
+        820,
+        970
+      ],
+      "color": "#3f789e",
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.5286885245901777,
+      "offset": [
+        1651.689049189722,
+        1252.133695408699
+      ]
+    },
+    "frontendVersion": "1.44.19",
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true
+  },
+  "version": 0.4
+}

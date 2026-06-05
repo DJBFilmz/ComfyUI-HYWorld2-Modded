@@ -1,54 +1,38 @@
-# ComfyUI HY-World 2.0 — WorldMirror 3D
+# ComfyUI HY-World 2.0 - WorldMirror 3D
 
-ComfyUI custom nodes for 3D scene reconstruction from a single image or panorama using [HY-World 2.0](https://huggingface.co/tencent/HY-World-2.0) (Tencent).
-
----
-
-**If you find my project useful, please consider supporting it! I work on it completely on my own, and your support will allow me to continue maintaining it and adding even more cool features!**
-
-[![Buy Me a Coffee](https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20rtx%203090&emoji=☕&slug=MIUProject&button_colour=FFDD00&font_colour=000000&font_family=Comic&outline_colour=000000&coffee_colour=ffffff)](https://www.buymeacoffee.com/MIUProject)
----
+ComfyUI custom nodes for 3D scene reconstruction from a single image, panorama, image set, or video using HY-World 2.0 / WorldMirror.
 
 ## Nodes
 
-**Category: VNCCS/3D**
+Category: `VNCCS/3D`
 
 | Node | Description |
 |------|-------------|
 | `VNCCS_LoadWorldMirrorModel` | Download and load WorldMirror V1 model |
-| `VNCCS_WorldMirror3D` | V1 inference — outputs PLY point cloud, depth, normals, Gaussian splat |
+| `VNCCS_WorldMirror3D` | V1 inference: PLY point cloud, depth, normals, Gaussian splat |
 | `VNCCS_LoadWorldMirrorV2Model` | Download and load WorldMirror V2 model |
-| `VNCCS_WorldMirrorV2_3D` | V2 inference — outputs PLY point cloud, depth, normals, Gaussian splat |
-| `VNCCS_PLYSceneRenderer` | Render PLY scene from arbitrary camera angles |
+| `VNCCS_WorldMirrorV2_3D` | V2 inference: PLY point cloud, depth, normals, Gaussian splat |
+| `VNCCS_WorldMirrorV2_3D_Clean` | V2 reconstruction defaults for cleaner dense splats |
+| `VNCCS_PLYSceneRenderer` | Render PLY scenes from arbitrary camera angles |
 | `VNCCS_SplatRefiner` | Refine Gaussian splat data |
 | `VNCCS_DecomposePLYData` | Extract XYZ / RGB / normals / opacity tensors from PLY |
-| `VNCCS_SavePLY` | Save PLY file to disk |
-| `VNCCS_BackgroundPreview` | Preview 3D background renders |
-| `VNCCS_Equirect360ToViews` | Extract perspective views from equirectangular panorama |
-| `VNCCS_PanoramaMapper` | Map panorama to wall / floor / ceiling projections |
-WorldStereo
-I made changes to the WorldStereo nodes to integrate them into the workflow. This should, in theory, fix the shadowed or black holes in the gaussian splat. However, the render times are ridiculous, and I haven't been able to fully test it. 
-
-If you have the ability to make the project run faster—either by quantizing the models or cleaning up the code—please do so. I believe the community would be incredibly grateful.
-
-- David J. Buchanan
-
-Upon further testing (2026/05/22): My conclusion to the WorldStereo:
-
-1.	Yes, it does generate and could potentially fill the black areas/shadowed areas of the gaussian splat but because it has no context (not reading the full panorama, only slices of it), it guesses at what those black spot would look like and does a pretty bad job.
-2.	It takes hours to render. The lowest I got it down to was two and half hours. So, it’s not very practically unless you render once and keep reload the same splat—that’s assuming it guess the black holes correctly with the relevant information.
-3.	If there was a way to look at the entire splat from WorldMirror into WorlStereo to create the black/shadows areas that may solve the problem, but I’m am unsure how to do that. It seems like a more complex problem because it would be looking at the .ply data versus an image and therefore would take more calculation. Essentially, having ONE image to generate a splat is not very practically in the first place. 
-
-<br><br/>
----
+| `VNCCS_SavePLY` | Save PLY files to disk |
+| `VNCCS_Equirect360ToViews` | Extract perspective views from equirectangular panoramas |
+| `VNCCS_PanoramaMapper` | Map panoramas to wall / floor / ceiling projections |
 
 ## Installation
 
-### Via ComfyUI Manager (recommended)
+### Via ComfyUI Manager
 
 Search for **HY-World 2.0** and click Install. `requirements.txt` and `install.py` run automatically.
 
-`install.py` will attempt to install `gsplat` — first from a pre-built wheel, then by compiling from source if no wheel is available for your platform.
+`install.py` installs the HY-World vendored `gsplat_maskgaussian` fork from:
+
+```text
+hyworld2/worldgen/third_party/gsplat_maskgaussian
+```
+
+Do not install upstream/PyPI `gsplat` separately. HY-World worldgen and the native scene trainer require fork-only rasterization arguments such as `distloss` and `gauss_masks`; the project must have only one installed Python package named `gsplat`.
 
 ### Manual
 
@@ -60,94 +44,43 @@ pip install -r requirements.txt
 python install.py
 ```
 
----
+## HY-World gsplat_maskgaussian
 
-## gsplat — Requirements for Compilation
+`gsplat_maskgaussian` is a CUDA extension and is built from the vendored HY-World source. It replaces upstream `gsplat` under the same package name.
 
-`gsplat` is a CUDA extension and cannot always be installed from a pre-built wheel. If your Python version, PyTorch version, or CUDA version is not covered by an official wheel, it must be compiled from source.
+Required build tools:
 
-The `install.py` script handles this automatically, but the following tools must be present on the system.
+- CUDA Toolkit matching the PyTorch CUDA major/minor version as closely as possible.
+- MSVC C++ Build Tools on Windows with the Desktop development with C++ workload.
+- `ninja`, listed in `requirements.txt`.
+- Git, if the vendored GLM headers need to be restored.
 
-### Required
-
-**1. CUDA Toolkit**
-
-Install the CUDA Toolkit version that matches your PyTorch build:
-
-```
-PyTorch CUDA version  →  Required CUDA Toolkit
-cu118                 →  CUDA 11.8
-cu121                 →  CUDA 12.1
-cu124                 →  CUDA 12.4
-```
-
-Download: https://developer.nvidia.com/cuda-toolkit-archive
-
-After installation, verify:
-```
-nvcc --version
-```
-
-**2. MSVC C++ Compiler (Windows only)**
-
-Install **Visual Studio Build Tools 2019 or 2022** with the **"Desktop development with C++"** workload.
-
-Download: https://visualstudio.microsoft.com/visual-cpp-build-tools/
-
-After installation, verify (from a Developer Command Prompt):
-```
-cl
-```
-
-If neither system MSVC nor a portable compiler is found, the build script will attempt to download a portable MSVC automatically (~600 MB).
-
-**3. Git**
-
-Required to clone the gsplat source repository if no pre-built wheel is available.
-
-```
-git --version
-```
-
-### Optional
-
-- **ninja** — speeds up compilation significantly. Installed automatically by the build script if missing.
-
-### Pre-built wheels (no compilation needed)
-
-If a wheel exists for your exact combination of Python / PyTorch / CUDA, the build script will use it instead of compiling. Check availability at:
-
-https://docs.gsplat.studio/whl/
-
-### Manual build
-
-To run the gsplat build independently:
+Manual rebuild:
 
 ```bash
-# Windows
+# Windows embedded ComfyUI Python
 scripts\pipinstall.bat
 
-# Any platform
+# Any Python environment
 python scripts/build_gsplat.py
 ```
 
----
+Successful installation is verified by a CUDA smoke test that calls `gsplat.rendering.rasterization` with `distloss=True` and `gauss_masks`.
 
 ## Workflows
 
 Example workflows are in the `workflows/` directory:
 
-- `World-single-image.json` — single image to 3D scene
-- `World-Mirror-panorama.json` — equirectangular panorama to 3D scene
-
----
+- `World-single-image.json` - single image to 3D scene
+- `World-Mirror-panorama.json` - equirectangular panorama to 3D scene
 
 ## Requirements
 
 - Python 3.10+
 - PyTorch with CUDA
-- NVIDIA GPU (gsplat rendering requires CUDA)
-- Flash Attention — required for HY-World 2.0 model inference. Install via:
-  ```
-  pip install flash-attn --no-build-isolation
-  ```
+- NVIDIA GPU for gsplat rendering/training
+- Flash Attention for HY-World model inference where supported:
+
+```bash
+pip install flash-attn --no-build-isolation
+```

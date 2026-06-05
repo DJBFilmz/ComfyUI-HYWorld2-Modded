@@ -196,6 +196,53 @@ def _align_camera_priors_to_image_count(images, camera_poses, camera_intrinsics)
     )
 
 
+def _normalize_camera_poses_to_first(camera_poses):
+    """Match official pipeline prior-camera normalization: inv(first_pose) @ pose."""
+    if not isinstance(camera_poses, torch.Tensor):
+        return camera_poses
+
+    poses = camera_poses
+    had_batch = poses.dim() == 4 and poses.shape[0] == 1
+    if had_batch:
+        work = poses[0]
+    elif poses.dim() == 3:
+        work = poses
+    else:
+        return camera_poses
+
+    if work.shape[-2:] == (4, 4):
+        work4 = work
+        return_3x4 = False
+    elif work.shape[-2:] == (3, 4):
+        bottom = torch.zeros(
+            work.shape[0], 1, 4,
+            dtype=work.dtype,
+            device=work.device,
+        )
+        bottom[:, 0, 3] = 1.0
+        work4 = torch.cat([work, bottom], dim=1)
+        return_3x4 = True
+    else:
+        return camera_poses
+
+    if work4.shape[0] == 0:
+        return camera_poses
+
+    try:
+        first = work4[0]
+        inv_first = torch.linalg.inv(first.float()).to(dtype=work4.dtype, device=work4.device)
+        normalized = inv_first.unsqueeze(0) @ work4
+    except Exception as exc:
+        print(f"[V2] Official camera-pose normalization skipped: {type(exc).__name__}: {exc}")
+        return camera_poses
+
+    if return_3x4:
+        normalized = normalized[:, :3, :]
+    if had_batch:
+        normalized = normalized.unsqueeze(0)
+    return normalized
+
+
 def _extract_pose_tensor(value):
     if not isinstance(value, torch.Tensor):
         return None
@@ -438,6 +485,679 @@ def _tune_splats(splats, scale_multiplier=1.0, opacity_floor=0.0):
         floor = float(opacity_floor)
         out["opacities"] = map_value(out["opacities"], lambda t: t.clamp_min(floor))
     return out
+
+
+def _rotation_matrix_to_quat_wxyz(R, dtype=None, device=None):
+    R = R.detach().to(device=device, dtype=torch.float32)
+    trace = R.trace()
+    if trace > 0:
+        s = torch.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * s
+        x = (R[2, 1] - R[1, 2]) / s
+        y = (R[0, 2] - R[2, 0]) / s
+        z = (R[1, 0] - R[0, 1]) / s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = torch.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+        w = (R[2, 1] - R[1, 2]) / s
+        x = 0.25 * s
+        y = (R[0, 1] + R[1, 0]) / s
+        z = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = torch.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+        w = (R[0, 2] - R[2, 0]) / s
+        x = (R[0, 1] + R[1, 0]) / s
+        y = 0.25 * s
+        z = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = torch.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+        w = (R[1, 0] - R[0, 1]) / s
+        x = (R[0, 2] + R[2, 0]) / s
+        y = (R[1, 2] + R[2, 1]) / s
+        z = 0.25 * s
+    q = torch.stack([w, x, y, z])
+    q = q / q.norm().clamp_min(1e-8)
+    return q.to(dtype=dtype or R.dtype, device=device or R.device)
+
+
+def _quat_mul_wxyz(q1, q2):
+    w1, x1, y1, z1 = q1.unbind(-1)
+    w2, x2, y2, z2 = q2.unbind(-1)
+    return torch.stack([
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    ], dim=-1)
+
+
+def _estimate_similarity_transform(src_points, dst_points, eps=1e-8):
+    """Estimate dst ~= scale * R * src + t for matched 3D point sets."""
+    if src_points.shape != dst_points.shape or src_points.shape[0] < 3:
+        return None
+    X = src_points.detach().cpu().float()
+    Y = dst_points.detach().cpu().float()
+    finite = torch.isfinite(X).all(dim=1) & torch.isfinite(Y).all(dim=1)
+    X, Y = X[finite], Y[finite]
+    if X.shape[0] < 3:
+        return None
+
+    mu_x = X.mean(dim=0)
+    mu_y = Y.mean(dim=0)
+    Xc = X - mu_x
+    Yc = Y - mu_y
+    var_x = (Xc.square().sum(dim=1)).mean()
+    if var_x <= eps:
+        return None
+
+    cov = (Yc.T @ Xc) / X.shape[0]
+    try:
+        U, D, Vh = torch.linalg.svd(cov)
+    except RuntimeError:
+        return None
+    S = torch.eye(3, dtype=torch.float32)
+    if torch.linalg.det(U @ Vh) < 0:
+        S[-1, -1] = -1.0
+    R = U @ S @ Vh
+    scale = torch.trace(torch.diag(D) @ S) / var_x
+    if not torch.isfinite(scale) or scale <= eps:
+        return None
+    t = mu_y - scale * (R @ mu_x)
+    return {"scale": scale.float(), "rotation": R.float(), "translation": t.float()}
+
+
+def _compose_similarity(a, b):
+    """Compose transforms a(b(x)); each transform is scale, rotation, translation."""
+    s = a["scale"] * b["scale"]
+    R = a["rotation"] @ b["rotation"]
+    t = a["scale"] * (a["rotation"] @ b["translation"]) + a["translation"]
+    return {"scale": s.float(), "rotation": R.float(), "translation": t.float()}
+
+
+def _transform_points_similarity(points, transform):
+    R = transform["rotation"].to(points.device, dtype=points.dtype)
+    t = transform["translation"].to(points.device, dtype=points.dtype)
+    s = transform["scale"].to(points.device, dtype=points.dtype)
+    return (points @ R.T) * s + t
+
+
+def _camera_pose_icp_cloud(poses, intrinsics=None, image_hw=None):
+    """Build an ICP point set from camera positions and pose-derived ray samples."""
+    p = _extract_pose_tensor(poses)
+    if p is None or p.shape[0] < 3:
+        return None
+
+    intr = None
+    if isinstance(intrinsics, torch.Tensor):
+        intr = intrinsics.detach().cpu().float()
+        if intr.dim() == 4 and intr.shape[0] == 1:
+            intr = intr[0]
+        if intr.dim() != 3 or intr.shape[0] != p.shape[0] or intr.shape[-2:] != (3, 3):
+            intr = None
+
+    positions = p[:, :3, 3]
+    finite = torch.isfinite(positions).all(dim=1)
+    positions = positions[finite]
+    rotations = p[finite, :3, :3]
+    if positions.shape[0] < 3:
+        return None
+
+    span = positions.max(dim=0).values - positions.min(dim=0).values
+    ray_len = max(float(torch.linalg.norm(span).item()) * 0.05, 1e-3)
+    points = [positions]
+    for axis in range(3):
+        points.append(positions + rotations[:, :, axis] * ray_len)
+
+    if intr is not None:
+        intr = intr[finite]
+        if image_hw is None:
+            h = w = 1.0
+        else:
+            h, w = float(image_hw[0]), float(image_hw[1])
+        uv = torch.tensor(
+            [[0.0, 0.0], [w - 1.0, 0.0], [0.0, h - 1.0], [w - 1.0, h - 1.0], [w * 0.5, h * 0.5]],
+            dtype=torch.float32,
+        )
+        rays = []
+        for i in range(intr.shape[0]):
+            fx = intr[i, 0, 0].clamp_min(1e-6)
+            fy = intr[i, 1, 1].clamp_min(1e-6)
+            cx = intr[i, 0, 2]
+            cy = intr[i, 1, 2]
+            cam = torch.stack([
+                (uv[:, 0] - cx) / fx,
+                (uv[:, 1] - cy) / fy,
+                torch.ones(uv.shape[0], dtype=torch.float32),
+            ], dim=1)
+            cam = cam / cam.norm(dim=1, keepdim=True).clamp_min(1e-8)
+            rays.append(positions[i][None, :] + (cam @ rotations[i].T) * ray_len)
+        points.append(torch.cat(rays, dim=0))
+
+    cloud = torch.cat(points, dim=0)
+    if cloud.shape[0] < 3 or (cloud.max(dim=0).values - cloud.min(dim=0).values).norm() <= 1e-8:
+        return None
+    return cloud
+
+
+def _camera_positions_degenerate(poses, eps=1e-6):
+    p = _extract_pose_tensor(poses)
+    if p is None or p.shape[0] < 2:
+        return True
+    positions = p[:, :3, 3]
+    finite = torch.isfinite(positions).all(dim=1)
+    positions = positions[finite]
+    if positions.shape[0] < 2:
+        return True
+    span = positions.max(dim=0).values - positions.min(dim=0).values
+    return float(torch.linalg.norm(span).item()) <= float(eps)
+
+
+def _estimate_orientation_alignment(source_poses, target_poses):
+    src = _extract_pose_tensor(source_poses)
+    dst = _extract_pose_tensor(target_poses)
+    if src is None or dst is None or src.shape[0] != dst.shape[0] or src.shape[0] < 1:
+        return None
+    src_r = src[:, :3, :3].detach().cpu().float()
+    dst_r = dst[:, :3, :3].detach().cpu().float()
+    src_vecs = src_r.permute(0, 2, 1).reshape(-1, 3)
+    dst_vecs = dst_r.permute(0, 2, 1).reshape(-1, 3)
+    finite = torch.isfinite(src_vecs).all(dim=1) & torch.isfinite(dst_vecs).all(dim=1)
+    src_vecs = src_vecs[finite]
+    dst_vecs = dst_vecs[finite]
+    if src_vecs.shape[0] < 3:
+        return None
+    try:
+        U, _, Vh = torch.linalg.svd(dst_vecs.T @ src_vecs)
+    except RuntimeError:
+        return None
+    S = torch.eye(3, dtype=torch.float32)
+    if torch.linalg.det(U @ Vh) < 0:
+        S[-1, -1] = -1.0
+    R = U @ S @ Vh
+    aligned = (src_vecs @ R.T)
+    angular = torch.acos((aligned * dst_vecs).sum(dim=1).clamp(-1.0, 1.0)) * (180.0 / torch.pi)
+    return R.float(), float(angular.mean().item()), float(angular.max().item())
+
+
+def _icp_similarity(source_points, target_points, max_iterations=40, tolerance=1e-7):
+    if source_points is None or target_points is None or source_points.shape[0] < 3 or target_points.shape[0] < 3:
+        return None
+
+    source = source_points.detach().cpu().float()
+    target = target_points.detach().cpu().float()
+    transform = {
+        "scale": torch.tensor(1.0, dtype=torch.float32),
+        "rotation": torch.eye(3, dtype=torch.float32),
+        "translation": torch.zeros(3, dtype=torch.float32),
+    }
+    initial = None
+    if source.shape[0] == target.shape[0]:
+        initial = _estimate_similarity_transform(source, target)
+    if initial is not None:
+        transform = initial
+        transformed = _transform_points_similarity(source, transform)
+    else:
+        transformed = source
+    prev_rmse = None
+    best_transform = transform
+    best_rmse = None
+
+    for _ in range(int(max_iterations)):
+        dists = torch.cdist(transformed, target)
+        nn_dist, nn_idx = torch.min(dists, dim=1)
+        matched = target[nn_idx]
+        if nn_dist.numel() >= 8:
+            cutoff = torch.quantile(nn_dist, 0.90)
+            keep = nn_dist <= cutoff
+            if int(keep.sum().item()) >= 3:
+                src_fit = transformed[keep]
+                dst_fit = matched[keep]
+                rmse = torch.sqrt((nn_dist[keep].square()).mean())
+            else:
+                src_fit, dst_fit = transformed, matched
+                rmse = torch.sqrt((nn_dist.square()).mean())
+        else:
+            src_fit, dst_fit = transformed, matched
+            rmse = torch.sqrt((nn_dist.square()).mean())
+
+        delta = _estimate_similarity_transform(src_fit, dst_fit)
+        if delta is None:
+            return None
+        final_rmse = float(rmse.item())
+        if best_rmse is None or final_rmse < best_rmse:
+            best_rmse = final_rmse
+            best_transform = transform
+        elif final_rmse > best_rmse + tolerance:
+            break
+        next_transformed = _transform_points_similarity(transformed, delta)
+        next_transform = _compose_similarity(delta, transform)
+        next_nn = torch.min(torch.cdist(next_transformed, target), dim=1).values
+        next_rmse = float(torch.sqrt(next_nn.square().mean()).item())
+        if next_rmse > final_rmse + tolerance:
+            break
+        transformed = next_transformed
+        transform = next_transform
+        if prev_rmse is not None and abs(prev_rmse - final_rmse) <= tolerance:
+            break
+        prev_rmse = final_rmse
+
+    best_transform["rmse"] = float(best_rmse if best_rmse is not None else 0.0)
+    return best_transform
+
+
+def _transform_pose_tensor_similarity(poses, transform):
+    if not isinstance(poses, torch.Tensor):
+        return poses
+    out = poses.clone()
+    view = out.reshape(-1, *out.shape[-2:]) if out.dim() == 4 else out
+    if view.dim() != 3 or view.shape[-2:] != (4, 4):
+        return poses
+    R = transform["rotation"].to(out.device, dtype=out.dtype)
+    t = transform["translation"].to(out.device, dtype=out.dtype)
+    s = transform["scale"].to(out.device, dtype=out.dtype)
+    view[:, :3, :3] = R @ view[:, :3, :3]
+    view[:, :3, 3] = (view[:, :3, 3] @ R.T) * s + t
+    return out
+
+
+def _transform_splats_similarity(splats, transform):
+    if not isinstance(splats, dict):
+        return splats
+    out = dict(splats)
+    scale_value = float(transform["scale"].abs().item())
+
+    def map_value(value, fn):
+        if isinstance(value, list):
+            return [fn(v) if isinstance(v, torch.Tensor) else v for v in value]
+        if isinstance(value, torch.Tensor):
+            return fn(value)
+        return value
+
+    if "means" in out:
+        out["means"] = map_value(out["means"], lambda x: _transform_points_similarity(x, transform))
+    if "scales" in out:
+        out["scales"] = map_value(out["scales"], lambda x: x * scale_value)
+    if "quats" in out:
+        def rotate_quats(q):
+            q_rot = _rotation_matrix_to_quat_wxyz(
+                transform["rotation"], dtype=q.dtype, device=q.device
+            ).view(*([1] * (q.dim() - 1)), 4)
+            q_out = _quat_mul_wxyz(q_rot.expand_as(q), q)
+            return q_out / q_out.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        out["quats"] = map_value(out["quats"], rotate_quats)
+    return out
+
+
+def _align_predictions_to_input_cameras_icp(predictions, input_camera_poses, input_camera_intrinsics, image_hw):
+    pred_cloud = _camera_pose_icp_cloud(
+        predictions.get("camera_poses"),
+        predictions.get("camera_intrs"),
+        image_hw=image_hw,
+    )
+    input_cloud = _camera_pose_icp_cloud(
+        input_camera_poses,
+        input_camera_intrinsics,
+        image_hw=image_hw,
+    )
+    transform = _icp_similarity(pred_cloud, input_cloud)
+    if transform is None:
+        print("[V2] Input-camera ICP alignment skipped: insufficient or degenerate camera pose point sets.")
+        return predictions, None
+
+    aligned = dict(predictions)
+    if "camera_poses" in aligned:
+        aligned["camera_poses"] = _transform_pose_tensor_similarity(aligned["camera_poses"], transform)
+    if isinstance(aligned.get("pts3d"), torch.Tensor):
+        aligned["pts3d"] = _transform_points_similarity(aligned["pts3d"], transform)
+    if isinstance(aligned.get("splats"), dict):
+        aligned["splats"] = _transform_splats_similarity(aligned["splats"], transform)
+
+    print(
+        "[V2] ICP-aligned predicted reconstruction to input cameras: "
+        f"scale={float(transform['scale'].item()):.6f}, rmse={transform['rmse']:.6f}, "
+        f"source_points={pred_cloud.shape[0]}, target_points={input_cloud.shape[0]}"
+    )
+    return aligned, transform
+
+
+def _align_predictions_to_input_cameras_global(predictions, input_camera_poses, input_camera_intrinsics, image_hw):
+    pred_poses = predictions.get("camera_poses")
+    pred_pose_tensor = _extract_pose_tensor(pred_poses)
+    input_pose_tensor = _extract_pose_tensor(input_camera_poses)
+    if pred_pose_tensor is None or input_pose_tensor is None or pred_pose_tensor.shape[0] != input_pose_tensor.shape[0]:
+        print("[V2] Input-align skipped: predicted/input camera poses are missing or mismatched.")
+        return predictions, None
+
+    transform = None
+    if not _camera_positions_degenerate(input_camera_poses):
+        pred_cloud = _camera_pose_icp_cloud(
+            pred_poses,
+            predictions.get("camera_intrs"),
+            image_hw=image_hw,
+        )
+        input_cloud = _camera_pose_icp_cloud(
+            input_camera_poses,
+            input_camera_intrinsics,
+            image_hw=image_hw,
+        )
+        transform = _icp_similarity(pred_cloud, input_cloud)
+        if transform is not None:
+            print(
+                "[V2] Input-align: Sim3 aligned complete predicted reconstruction to input cameras: "
+                f"scale={float(transform['scale'].item()):.6f}, rmse={transform['rmse']:.6f}, "
+                f"source_points={pred_cloud.shape[0]}, target_points={input_cloud.shape[0]}"
+            )
+
+    if transform is None:
+        orient = _estimate_orientation_alignment(pred_pose_tensor, input_pose_tensor)
+        if orient is None:
+            print("[V2] Input-align skipped: could not estimate orientation alignment.")
+            return predictions, None
+        R, mean_angle, max_angle = orient
+        pred_center = pred_pose_tensor[:, :3, 3].median(dim=0).values
+        input_center = input_pose_tensor[:, :3, 3].median(dim=0).values
+        transform = {
+            "scale": torch.tensor(1.0, dtype=torch.float32),
+            "rotation": R,
+            "translation": input_center - (R @ pred_center),
+            "rmse": None,
+            "orientation_mean_deg": mean_angle,
+            "orientation_max_deg": max_angle,
+            "orientation_only": True,
+        }
+        print(
+            "[V2] Input-align: SO3 aligned complete predicted reconstruction to co-located input cameras: "
+            f"mean_angle={mean_angle:.4f} deg, max_angle={max_angle:.4f} deg"
+        )
+
+    aligned = dict(predictions)
+    if "camera_poses" in aligned:
+        aligned["camera_poses"] = _transform_pose_tensor_similarity(aligned["camera_poses"], transform)
+    if isinstance(aligned.get("pts3d"), torch.Tensor):
+        aligned["pts3d"] = _transform_points_similarity(aligned["pts3d"], transform)
+    if isinstance(aligned.get("splats"), dict):
+        aligned["splats"] = _transform_splats_similarity(aligned["splats"], transform)
+    aligned["_splat_camera_source"] = "camera_inputs"
+    aligned["_input_camera_transform"] = transform
+    return aligned, transform
+
+
+def _depth_maps_s_h_w(depth):
+    if not isinstance(depth, torch.Tensor):
+        return None
+    if depth.dim() == 5 and depth.shape[0] == 1 and depth.shape[-1] == 1:
+        return depth[0, ..., 0]
+    if depth.dim() == 4 and depth.shape[-1] == 1:
+        return depth[..., 0]
+    if depth.dim() == 4 and depth.shape[0] == 1:
+        return depth[0]
+    if depth.dim() == 3:
+        return depth
+    return None
+
+
+def _backproject_depth_from_input_cameras(depth_maps, input_camera_poses, input_camera_intrinsics):
+    poses = _extract_pose_tensor(input_camera_poses)
+    if poses is None or not isinstance(input_camera_intrinsics, torch.Tensor):
+        return None
+    intrs = input_camera_intrinsics.detach().float()
+    if intrs.dim() == 4 and intrs.shape[0] == 1:
+        intrs = intrs[0]
+    if intrs.dim() != 3 or intrs.shape[-2:] != (3, 3):
+        return None
+    if poses.shape[0] != depth_maps.shape[0] or intrs.shape[0] != depth_maps.shape[0]:
+        return None
+
+    device = depth_maps.device
+    depth_f = depth_maps.float()
+    poses = poses.to(device=device, dtype=torch.float32)
+    intrs = intrs.to(device=device, dtype=torch.float32)
+    pts, _, _ = depth_to_world_coords_points(depth_f, poses, intrs)
+    return pts
+
+
+def _map_splat_value(value, fn):
+    if isinstance(value, list):
+        return [fn(v) if isinstance(v, torch.Tensor) else v for v in value]
+    if isinstance(value, torch.Tensor):
+        return fn(value)
+    return value
+
+
+def _replace_splat_means_from_points(splats, points):
+    if not isinstance(splats, dict) or not isinstance(points, torch.Tensor):
+        return splats
+    out = dict(splats)
+    flat = points.reshape(-1, 3)
+    means = out.get("means")
+    if isinstance(means, list):
+        out["means"] = [
+            flat.to(device=m.device, dtype=m.dtype) if isinstance(m, torch.Tensor) else m
+            for m in means
+        ]
+    elif isinstance(means, torch.Tensor):
+        repl = flat.to(device=means.device, dtype=means.dtype)
+        out["means"] = repl.unsqueeze(0) if means.dim() >= 3 and means.shape[0] == 1 else repl
+    else:
+        out["means"] = flat.unsqueeze(0)
+    return out
+
+
+def _splat_means_count(splats):
+    if not isinstance(splats, dict):
+        return None
+    means = splats.get("means")
+    if isinstance(means, list):
+        means = means[0] if means and isinstance(means[0], torch.Tensor) else None
+    if not isinstance(means, torch.Tensor):
+        return None
+    if means.dim() >= 3 and means.shape[0] == 1:
+        return int(means.shape[1])
+    if means.dim() >= 2:
+        return int(means.shape[0])
+    return None
+
+
+def _scale_splat_scales(splats, scale):
+    if not isinstance(splats, dict) or "scales" not in splats:
+        return splats
+    out = dict(splats)
+    scale_value = float(abs(scale))
+    out["scales"] = _map_splat_value(out["scales"], lambda x: x * scale_value)
+    return out
+
+
+def _stabilize_camera_intrinsics(intrinsics, mode, image_hw=None):
+    if not isinstance(intrinsics, torch.Tensor):
+        return intrinsics
+    intrs = intrinsics.detach().clone().float()
+    had_batch = intrs.dim() == 4 and intrs.shape[0] == 1
+    if had_batch:
+        work = intrs[0]
+    elif intrs.dim() == 3:
+        work = intrs
+    else:
+        return intrinsics
+    if work.shape[-2:] != (3, 3) or work.shape[0] == 0:
+        return intrinsics
+
+    stable = work.clone()
+    finite = torch.isfinite(stable).all(dim=(1, 2))
+    if not bool(finite.any()):
+        return intrinsics
+    valid = stable[finite]
+    med = valid.median(dim=0).values
+
+    stable[:, 0, 0] = med[0, 0]
+    stable[:, 1, 1] = med[1, 1]
+    if mode in ("median_focal_center", "median_all"):
+        if image_hw is not None:
+            h, w = image_hw
+            stable[:, 0, 2] = float(w) * 0.5
+            stable[:, 1, 2] = float(h) * 0.5
+        else:
+            stable[:, 0, 2] = med[0, 2]
+            stable[:, 1, 2] = med[1, 2]
+    elif mode == "median_all":
+        stable[:, 0, 2] = med[0, 2]
+        stable[:, 1, 2] = med[1, 2]
+
+    return stable.unsqueeze(0) if had_batch else stable
+
+
+def _auto_stabilize_missing_input_cameras(predictions, mode, image_hw):
+    if mode == "off":
+        return None, None, None
+    pred_poses = predictions.get("camera_poses")
+    pred_intrs = predictions.get("camera_intrs")
+    poses = _extract_pose_tensor(pred_poses)
+    if poses is None or not isinstance(pred_intrs, torch.Tensor):
+        print("[V2] Missing-camera stabilization skipped: predicted cameras are unavailable.")
+        return None, None, None
+
+    intrs = pred_intrs.detach().float()
+    if intrs.dim() == 4 and intrs.shape[0] == 1:
+        intrs = intrs[0]
+    if intrs.dim() != 3 or intrs.shape[-2:] != (3, 3) or intrs.shape[0] != poses.shape[0]:
+        print("[V2] Missing-camera stabilization skipped: predicted intrinsics are invalid.")
+        return None, None, None
+
+    stable_intrs = _stabilize_camera_intrinsics(intrs, "median_focal_center", image_hw=image_hw)
+    stable_poses = poses.detach().clone().float()
+    info = {
+        "source": "predicted_cameras",
+        "mode": mode,
+        "fx_min": float(intrs[:, 0, 0].min().item()),
+        "fx_max": float(intrs[:, 0, 0].max().item()),
+        "fx_stable": float(stable_intrs[:, 0, 0].median().item()),
+        "fy_min": float(intrs[:, 1, 1].min().item()),
+        "fy_max": float(intrs[:, 1, 1].max().item()),
+        "fy_stable": float(stable_intrs[:, 1, 1].median().item()),
+    }
+    print(
+        "[V2] Missing-camera stabilization: "
+        f"mode={mode}, fx={info['fx_min']:.3f}..{info['fx_max']:.3f}->{info['fx_stable']:.3f}, "
+        f"fy={info['fy_min']:.3f}..{info['fy_max']:.3f}->{info['fy_stable']:.3f}"
+    )
+    return stable_poses, stable_intrs, info
+
+
+def _project_predictions_from_input_cameras(predictions, input_camera_poses, input_camera_intrinsics, scale_value):
+    projected = dict(predictions)
+    depth_device = projected["depth"].device if isinstance(projected.get("depth"), torch.Tensor) else torch.device("cpu")
+    depth_points = None
+
+    if isinstance(projected.get("depth"), torch.Tensor):
+        projected["depth"] = projected["depth"] * float(scale_value)
+        depth_maps = _depth_maps_s_h_w(projected["depth"])
+        if depth_maps is not None:
+            pts = _backproject_depth_from_input_cameras(depth_maps, input_camera_poses, input_camera_intrinsics)
+            if pts is not None:
+                depth_points = pts
+                projected["pts3d"] = pts.unsqueeze(0).to(
+                    device=projected["depth"].device,
+                    dtype=projected["depth"].dtype,
+                )
+
+    if isinstance(projected.get("gs_depth"), torch.Tensor):
+        projected["gs_depth"] = projected["gs_depth"] * float(scale_value)
+        gs_depth_maps = _depth_maps_s_h_w(projected["gs_depth"])
+        if gs_depth_maps is not None and isinstance(projected.get("splats"), dict):
+            gs_pts = _backproject_depth_from_input_cameras(gs_depth_maps, input_camera_poses, input_camera_intrinsics)
+            if gs_pts is not None:
+                projected["splats"] = _replace_splat_means_from_points(projected["splats"], gs_pts)
+                projected["splats"] = _scale_splat_scales(projected["splats"], scale_value)
+                print(
+                    "[V2] Input-camera projection: replaced splat means from gs_depth "
+                    f"({int(gs_pts.reshape(-1, 3).shape[0])} points)."
+                )
+    elif isinstance(projected.get("splats"), dict) and isinstance(depth_points, torch.Tensor):
+        splat_count = _splat_means_count(projected["splats"])
+        depth_count = int(depth_points.reshape(-1, 3).shape[0])
+        if splat_count == depth_count:
+            projected["splats"] = _replace_splat_means_from_points(projected["splats"], depth_points)
+            projected["splats"] = _scale_splat_scales(projected["splats"], scale_value)
+            print(
+                "[V2] Input-camera projection: gs_depth missing; replaced splat means "
+                f"from regular depth grid ({depth_count} points)."
+            )
+        else:
+            print(
+                "[V2] Input-camera projection: gs_depth missing; kept model splat means "
+                f"because splat_count={splat_count} and depth_count={depth_count} do not match."
+            )
+
+    if isinstance(input_camera_poses, torch.Tensor):
+        projected["camera_poses"] = input_camera_poses.unsqueeze(0).to(
+            device=depth_device,
+            dtype=torch.float32,
+        )
+    if isinstance(input_camera_intrinsics, torch.Tensor):
+        projected["camera_intrs"] = input_camera_intrinsics.unsqueeze(0).to(
+            device=depth_device,
+            dtype=torch.float32,
+        )
+    return projected
+
+
+def _reproject_predictions_from_input_cameras_with_icp_scale(
+    predictions,
+    input_camera_poses,
+    input_camera_intrinsics,
+    image_hw,
+):
+    if not V2_UTILS_AVAILABLE:
+        print("[V2] Input-camera ICP depth-scale projection skipped: V2 geometry utilities unavailable.")
+        return predictions, None
+
+    if _camera_positions_degenerate(input_camera_poses):
+        print(
+            "[V2] Input-camera projection: input camera positions are co-located, "
+            "so ICP scale is not observable. Using scale=1.0 and backprojecting depths "
+            "through input rotations/intrinsics."
+        )
+        projected = _project_predictions_from_input_cameras(
+            predictions,
+            input_camera_poses,
+            input_camera_intrinsics,
+            scale_value=1.0,
+        )
+        return projected, {
+            "scale": torch.tensor(1.0, dtype=torch.float32),
+            "rotation": torch.eye(3, dtype=torch.float32),
+            "translation": torch.zeros(3, dtype=torch.float32),
+            "rmse": None,
+            "degenerate_input_camera_positions": True,
+        }
+
+    pred_cloud = _camera_pose_icp_cloud(
+        predictions.get("camera_poses"),
+        predictions.get("camera_intrs"),
+        image_hw=image_hw,
+    )
+    input_cloud = _camera_pose_icp_cloud(
+        input_camera_poses,
+        input_camera_intrinsics,
+        image_hw=image_hw,
+    )
+    transform = _icp_similarity(pred_cloud, input_cloud)
+    if transform is None:
+        print("[V2] Input-camera ICP depth-scale projection skipped: insufficient or degenerate camera pose point sets.")
+        return predictions, None
+
+    scale_value = float(abs(transform["scale"].item()))
+    projected = _project_predictions_from_input_cameras(
+        predictions,
+        input_camera_poses,
+        input_camera_intrinsics,
+        scale_value=scale_value,
+    )
+
+    print(
+        "[V2] ICP-scaled depths and reprojected from input cameras: "
+        f"scale={scale_value:.6f}, rmse={transform['rmse']:.6f}, "
+        f"source_points={pred_cloud.shape[0]}, target_points={input_cloud.shape[0]}"
+    )
+    return projected, transform
 
 
 def _log_splat_stats(splats):
@@ -917,9 +1637,13 @@ class VNCCS_WorldMirrorV2_3D:
                     "default": "pose+intrinsics",
                     "tooltip": "Which input camera priors to pass into WorldMirror V2. Panorama poses are rotation-only, so testing intrinsics_only/none can reduce seam conflicts."
                 }),
-                "splat_camera_source": (["input_when_available", "predicted"], {
-                    "default": "input_when_available",
-                    "tooltip": "input_when_available keeps panorama GS positions locked to supplied cameras. predicted matches official inference."
+                "missing_camera_strategy": (["off", "stabilize_predicted_intrinsics", "reproject_stabilized_predicted"], {
+                    "default": "off",
+                    "tooltip": "When camera inputs are missing, derive pseudo input cameras from WorldMirror predictions. stabilize_predicted_intrinsics keeps predicted poses but uses sequence-median focal lengths. reproject_stabilized_predicted also rebuilds pts3d/splat means from depth with those stable cameras."
+                }),
+                "splat_camera_source": (["camera_inputs", "predicted"], {
+                    "default": "camera_inputs",
+                    "tooltip": "camera_inputs backprojects depths from input cameras using ICP scale. predicted uses the model predicted cameras."
                 }),
                 "splat_color_source": (["input_image", "model_sh"], {
                     "default": "input_image",
@@ -1000,7 +1724,9 @@ class VNCCS_WorldMirrorV2_3D:
         edge_depth_threshold  = 0.03,
         apply_confidence_mask = False,
         camera_conditioning = "pose+intrinsics",
-        splat_camera_source = "input_when_available",
+        normalize_camera_poses_to_first = False,
+        missing_camera_strategy = "off",
+        splat_camera_source = "camera_inputs",
         splat_color_source = "input_image",
         adaptive_target_size = False,
         apply_model_masks = False,
@@ -1039,6 +1765,9 @@ class VNCCS_WorldMirrorV2_3D:
             camera_poses,
             camera_intrinsics,
         )
+        if normalize_camera_poses_to_first and isinstance(camera_poses, torch.Tensor):
+            camera_poses = _normalize_camera_poses_to_first(camera_poses)
+            print("[V2] Official prior-camera normalization enabled: poses are relative to frame 0.")
         tensor_list = []
         adjusted_intrinsics = camera_intrinsics.clone().float() if isinstance(camera_intrinsics, torch.Tensor) else None
 
@@ -1081,7 +1810,8 @@ class VNCCS_WorldMirrorV2_3D:
         use_pose_prior = camera_conditioning in ("pose+intrinsics", "pose_only")
         use_intrinsics_prior = camera_conditioning in ("pose+intrinsics", "intrinsics_only")
         has_input_cameras = camera_poses is not None and camera_intrinsics is not None
-        use_input_splat_cameras = splat_camera_source == "input_when_available" and has_input_cameras
+        use_input_camera_source = splat_camera_source == "camera_inputs" and has_input_cameras
+        use_input_splat_cameras = use_input_camera_source
 
         if (use_pose_prior or use_input_splat_cameras) and camera_poses is not None:
             views["camera_poses"] = camera_poses.unsqueeze(0).to(exec_dev)
@@ -1133,10 +1863,11 @@ class VNCCS_WorldMirrorV2_3D:
         worldmirror.enable_gs = bool(worldmirror.enable_gs and use_gsplat and GSPLAT_AVAILABLE)
         effective_splat_camera_source = "predicted"
         if worldmirror.enable_gs and gs_renderer is not None:
-            gs_renderer.inference_position_from = (
-                "gsdepth+gtcamera" if use_input_splat_cameras else "gsdepth+predcamera"
-            )
-            effective_splat_camera_source = "input" if use_input_splat_cameras else "predicted"
+            gs_renderer.inference_position_from = "gsdepth+predcamera"
+            if use_input_camera_source:
+                effective_splat_camera_source = "predicted_depth+input_camera_icp_scale"
+            else:
+                effective_splat_camera_source = "predicted"
 
         try:
             print(
@@ -1258,11 +1989,61 @@ class VNCCS_WorldMirrorV2_3D:
                 _move_worldmirror(worldmirror, "cpu")
                 torch.cuda.empty_cache()
 
+        S, H, W = predictions["depth"].shape[1:4]
+
+        model_camera_poses = predictions.get("camera_poses")
+        model_camera_intrs = predictions.get("camera_intrs")
+        model_pts3d = predictions.get("pts3d")
+        model_pts3d_filtered = None
+        if isinstance(model_camera_poses, torch.Tensor):
+            model_camera_poses = model_camera_poses.detach().clone()
+        if isinstance(model_camera_intrs, torch.Tensor):
+            model_camera_intrs = model_camera_intrs.detach().clone()
+        if isinstance(model_pts3d, torch.Tensor):
+            model_pts3d = model_pts3d.detach().clone()
+
+        input_cameras_were_missing = camera_poses is None and camera_intrinsics is None
+        missing_camera_info = None
+        if input_cameras_were_missing and missing_camera_strategy != "off":
+            auto_poses, auto_intrs, missing_camera_info = _auto_stabilize_missing_input_cameras(
+                predictions,
+                missing_camera_strategy,
+                image_hw=(H, W),
+            )
+            if auto_poses is not None and auto_intrs is not None:
+                camera_poses = auto_poses
+                camera_intrinsics = auto_intrs
+                if missing_camera_strategy == "stabilize_predicted_intrinsics":
+                    predictions = dict(predictions)
+                    predictions["camera_poses"] = auto_poses.unsqueeze(0).to(
+                        device=predictions["depth"].device,
+                        dtype=torch.float32,
+                    )
+                    predictions["camera_intrs"] = auto_intrs.unsqueeze(0).to(
+                        device=predictions["depth"].device,
+                        dtype=torch.float32,
+                    )
+                elif missing_camera_strategy == "reproject_stabilized_predicted":
+                    predictions = _project_predictions_from_input_cameras(
+                        predictions,
+                        auto_poses,
+                        auto_intrs,
+                        scale_value=1.0,
+                    )
+
         if debug_log:
             _log_worldmirror_debug(predictions, views, camera_poses, camera_intrinsics, imgs_tensor)
 
+        input_camera_icp = None
+        if use_input_camera_source:
+            predictions, input_camera_icp = _reproject_predictions_from_input_cameras_with_icp_scale(
+                predictions,
+                camera_poses,
+                camera_intrinsics,
+                image_hw=(H, W),
+            )
+
         # ── 5. Sky mask (model-native first, ONNX fallback) ──────────────────
-        S, H, W = predictions["depth"].shape[1:4]
         sky_mask_np = None
 
         if apply_sky_mask and V2_UTILS_AVAILABLE:
@@ -1340,6 +2121,13 @@ class VNCCS_WorldMirrorV2_3D:
                 filtered_pts = pts[flat]
             else:
                 filtered_pts = pts
+        if isinstance(model_pts3d, torch.Tensor):
+            model_pts3d_flat = model_pts3d[0].reshape(-1, 3)
+            if pts_mask is not None and int(np.prod(pts_mask.shape)) == int(model_pts3d_flat.shape[0]):
+                flat = torch.from_numpy(pts_mask.reshape(-1)).to(model_pts3d_flat.device)
+                model_pts3d_filtered = model_pts3d_flat[flat]
+            else:
+                model_pts3d_filtered = model_pts3d_flat
 
         # ── 8. Filter splats with GS-specific mask ────────────────────────────
         splats = predictions.get("splats")
@@ -1348,6 +2136,11 @@ class VNCCS_WorldMirrorV2_3D:
         splats = _tune_splats(splats, splat_scale_multiplier, splat_opacity_floor)
         if debug_log:
             _log_splat_stats(splats)
+            if input_camera_icp is not None:
+                print("[V2 DEBUG] splats stats after input-camera ICP processing")
+                _log_splat_stats(splats)
+                if isinstance(splats, dict):
+                    _log_per_view_points("splats.means after input-camera projection", splats.get("means"), S, H, W)
         splat_mask = gs_mask if gs_mask is not None else pts_mask
         splats = _apply_mask_to_splats(splats, splat_mask if filter_splats else None)
         if voxel_prune_splats:
@@ -1357,6 +2150,8 @@ class VNCCS_WorldMirrorV2_3D:
         ply_data = {
             "pts3d":          predictions.get("pts3d"),
             "pts3d_filtered": filtered_pts,
+            "depth":          predictions.get("depth"),
+            "normals":        predictions.get("normals"),
             "pts3d_conf":     predictions.get("pts3d_conf"),
             "depth_conf":     predictions.get("depth_conf"),
             "depth_mask":     predictions.get("depth_mask"),
@@ -1374,6 +2169,11 @@ class VNCCS_WorldMirrorV2_3D:
             ),
             "camera_poses":   predictions.get("camera_poses"),
             "camera_intrs":   predictions.get("camera_intrs"),
+            "model_camera_poses": model_camera_poses,
+            "model_camera_intrs": model_camera_intrs,
+            "model_pts3d": model_pts3d,
+            "model_pts3d_filtered": model_pts3d_filtered,
+            "missing_camera_info": missing_camera_info,
         }
 
         # ── 10. Depth / normals → ComfyUI IMAGE [S,H,W,3] ────────────────────
@@ -1618,6 +2418,20 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
 
         return torch.stack(image_tensors).unsqueeze(0), intrinsics
 
+    def _scale_intrinsics_to_highres(self, intrinsics, source_size, target_size):
+        intrs = intrinsics.detach().cpu().float()
+        if intrs.dim() == 4 and intrs.shape[0] == 1:
+            intrs = intrs[0]
+        if intrs.dim() != 3 or intrs.shape[-2:] != (3, 3):
+            return None
+        scale = float(target_size) / max(float(source_size), 1.0)
+        out = intrs.clone()
+        out[:, 0, 0] *= scale
+        out[:, 1, 1] *= scale
+        out[:, 0, 2] *= scale
+        out[:, 1, 2] *= scale
+        return out
+
     def _build_upsampled_splats(
         self,
         output,
@@ -1656,8 +2470,6 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
             print(f"⚠️ [V2 EXP] splat upsample skipped: missing depth source '{requested_depth_source}'.")
             return output
 
-        highres_imgs, highres_intrs = self._prepare_highres_views(original_images, camera_intrinsics, upsample_size)
-        S, _, H, W = highres_imgs.shape[1:]
         if depth.dim() == 5:
             depth_low = depth[0, ..., 0]
         elif depth.dim() == 4 and depth.shape[-1] == 1:
@@ -1668,6 +2480,9 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
             print(f"⚠️ [V2 EXP] splat upsample skipped: unsupported depth shape {tuple(depth.shape)}.")
             return output
 
+        source_h, source_w = int(depth_low.shape[1]), int(depth_low.shape[2])
+        highres_imgs, highres_intrs = self._prepare_highres_views(original_images, camera_intrinsics, upsample_size)
+        S, _, H, W = highres_imgs.shape[1:]
         depth_hi = torch.nn.functional.interpolate(
             depth_low.detach().cpu().float().unsqueeze(1),
             size=(H, W),
@@ -1680,6 +2495,9 @@ class VNCCS_WorldMirrorV2_3D_Experimental(VNCCS_WorldMirrorV2_3D):
             predicted_poses = output[3]
         poses = _rescale_input_pose_translation_to_prediction(camera_poses, predicted_poses)
         intrs = highres_intrs.detach().cpu().float()
+        if poses is None:
+            print("⚠️ [V2 EXP] splat upsample skipped: invalid input camera_poses.")
+            return output
         pts, _, _ = depth_to_world_coords_points(depth_hi, poses, intrs)
         pose_t = poses[:, :3, 3]
         anchor_frames = pose_t.norm(dim=1) <= 1e-5
@@ -1872,6 +2690,10 @@ class VNCCS_WorldMirrorV2_3D_Advanced(VNCCS_WorldMirrorV2_3D_Experimental):
     def INPUT_TYPES(cls):
         inputs = copy.deepcopy(super().INPUT_TYPES())
         inputs.get("optional", {}).pop("low_vram_mode", None)
+        inputs.setdefault("optional", {})["normalize_camera_poses_to_first"] = ("BOOLEAN", {
+            "default": False,
+            "tooltip": "Official pipeline behavior for prior cameras: convert input poses to frame-0-relative space with inv(first_pose) @ pose before conditioning/alignment."
+        })
         return inputs
 
 
@@ -1908,6 +2730,10 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
                     "default": False,
                     "tooltip": "Print camera/depth/splat alignment diagnostics to the ComfyUI console."
                 }),
+                "enable_splat_upsample": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Build dense high-resolution splats from depth. Disable when only depth maps are needed."
+                }),
                 "splat_upsample_scale": ("FLOAT", {
                     "default": 0.003, "min": 0.0001, "max": 0.05, "step": 0.0001,
                     "tooltip": "Gaussian size for dense backprojected splats."
@@ -1940,6 +2766,10 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
                     "default": 1.75, "min": 0.0, "max": 8.0, "step": 0.05,
                     "tooltip": "Preserve proportionally more far splats when applying the point cap."
                 }),
+                "splat_camera_source": (["camera_inputs", "predicted"], {
+                    "default": "camera_inputs",
+                    "tooltip": "camera_inputs backprojects depths from input cameras using ICP scale. predicted uses the model predicted cameras."
+                }),
                 "camera_intrinsics": ("TENSOR", {
                     "tooltip": "Optional: intrinsics from Equirect360ToViews or WorldStereo."
                 }),
@@ -1964,8 +2794,8 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
         gs_param_chunk_size=1,
         transformer_mlp_chunk_size=32768,
         apply_sky_mask=False,
-        camera_conditioning="pose+intrinsics",
-        splat_camera_source="input_when_available",
+        splat_camera_source="camera_inputs",
+        enable_splat_upsample=True,
         splat_upsample_mode="depth_backproject",
         splat_upsample_size=1022,
         splat_upsample_scale=0.003,
@@ -1982,6 +2812,7 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
         depth_prior=None,
     ):
         splat_upsample_size = self._infer_splat_upsample_size(images)
+        splat_upsample_mode = "depth_backproject" if bool(enable_splat_upsample) else "none"
         return super().run_inference(
             model,
             images,
@@ -2001,7 +2832,7 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
             edge_depth_threshold=0.03,
             apply_confidence_mask=False,
             camera_conditioning="pose+intrinsics",
-            splat_camera_source="input_when_available",
+            splat_camera_source=splat_camera_source,
             splat_color_source="input_image",
             adaptive_target_size=False,
             apply_model_masks=False,
@@ -2014,7 +2845,7 @@ class VNCCS_WorldMirrorV2_3D_Clean(VNCCS_WorldMirrorV2_3D_Advanced):
             camera_intrinsics=camera_intrinsics,
             camera_poses=camera_poses,
             depth_prior=depth_prior,
-            splat_upsample_mode="depth_backproject",
+            splat_upsample_mode=splat_upsample_mode,
             splat_upsample_size=splat_upsample_size,
             splat_upsample_depth_source="gs_depth",
             splat_upsample_scale=splat_upsample_scale,

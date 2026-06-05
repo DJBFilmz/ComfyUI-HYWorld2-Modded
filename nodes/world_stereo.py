@@ -811,6 +811,13 @@ def _get_models_base() -> str:
     )
 
 
+def _get_comfy_root() -> str:
+    return (
+        folder_paths.base_path if FOLDER_PATHS_AVAILABLE
+        else os.path.dirname(PROJECT_ROOT)
+    )
+
+
 WORLDSTEREO_TURBO_LORAS = {
     "none": None,
     "CausVid 14B rank32 v2": {
@@ -1053,12 +1060,195 @@ def _apply_worldstereo_transformer_export_precision(pipeline, precision: str):
     return "fp8"
 
 
+def _apply_worldstereo_aux_export_precision(module, precision: str):
+    half_dtype = _worldstereo_half_dtype()
+    _move_module_to_half(module, half_dtype)
+    if precision == "bf16":
+        return "bf16"
+    if precision == "int4":
+        print("[WorldStereo Export] int4 is transformer-only; exporting auxiliary model as fp8 instead.")
+        precision = "fp8"
+    if precision != "fp8":
+        raise ValueError(f"Unsupported export precision: {precision!r}")
+
+    try:
+        from optimum.quanto import freeze, qfloat8_e4m3fn, quantize
+    except ImportError as e:
+        raise ImportError("optimum-quanto required for fp8 export: pip install optimum-quanto") from e
+
+    quantize(module, weights=qfloat8_e4m3fn)
+    freeze(module)
+    return "fp8"
+
+
+def _comfy_scaled_fp8_state_dict_for_t5(module):
+    half_dtype = _worldstereo_half_dtype()
+    state = _tensor_state_dict_for_safetensors(module)
+    state.pop("encoder.embed_tokens.weight", None)
+    state = _dedupe_safetensors_state_dict(state)
+
+    quantized = 0
+    for key in list(state.keys()):
+        if not key.endswith(".weight"):
+            continue
+        tensor = state[key]
+        if not isinstance(tensor, torch.Tensor) or tensor.ndim != 2 or not tensor.is_floating_point():
+            continue
+        if key == "shared.weight":
+            continue
+
+        source = tensor.detach().to(device="cpu", dtype=torch.float32)
+        max_abs = source.abs().max()
+        if max_abs.item() == 0:
+            scale = torch.ones((), dtype=torch.float32)
+        else:
+            scale = (max_abs / 448.0).clamp(min=torch.finfo(torch.float32).tiny).to(torch.float32)
+        state[key] = torch.clamp(source / scale, min=-448.0, max=448.0).to(torch.float8_e4m3fn).contiguous()
+        state[f"{key[:-len('.weight')]}.scale_weight"] = scale.contiguous()
+        quantized += 1
+
+    state["scaled_fp8"] = torch.empty((0,), dtype=torch.float32)
+    print(f"[WorldStereo Export] ComfyUI scaled fp8 T5 weights: {quantized}")
+    return state, "fp8"
+
+
 def _tensor_state_dict_for_safetensors(module):
     state = {}
     for key, value in module.state_dict().items():
         if isinstance(value, torch.Tensor):
             state[key] = value.detach().cpu().contiguous()
     return state
+
+
+def _dedupe_safetensors_state_dict(state: dict) -> dict:
+    seen = {}
+    deduped = {}
+    for key, value in state.items():
+        if not isinstance(value, torch.Tensor):
+            deduped[key] = value
+            continue
+        storage_key = (value.untyped_storage().data_ptr(), value.storage_offset(), tuple(value.shape), tuple(value.stride()))
+        if storage_key in seen:
+            print(f"[WorldStereo Export] Dropping tied tensor duplicate: {key} -> {seen[storage_key]}")
+            continue
+        seen[storage_key] = key
+        deduped[key] = value
+    return deduped
+
+
+def _export_worldstereo_aux_single_model(
+    *,
+    output_file: str,
+    metadata_file: str,
+    model_type: str,
+    precision: str,
+    device: str,
+    export_models_base: str,
+    write_metadata_json: bool,
+):
+    import gc
+    from diffusers.models import AutoencoderKLWan
+    from safetensors.torch import save_file
+    from transformers import UMT5EncoderModel
+
+    if model_type not in VNCCS_ExportWorldStereoSingleModel.AUX_MODEL_TYPES:
+        raise ValueError(f"Unsupported auxiliary export model_type: {model_type!r}")
+
+    base_model_dir = _resolve_wan_base_aux(
+        ["text_encoder"] if model_type == "official-clip-umt5-encoder" else ["vae"],
+        models_base=_get_models_base(),
+    )
+    base_model_dir = base_model_dir.replace("\\", "/")
+    print(f"[WorldStereo Export] Loading official auxiliary model from {base_model_dir}")
+
+    if model_type == "official-clip-umt5-encoder":
+        module = UMT5EncoderModel.from_pretrained(
+            base_model_dir,
+            subfolder="text_encoder",
+            torch_dtype=_worldstereo_half_dtype(),
+            local_files_only=True,
+        ).eval()
+        module = module.to(device=device)
+        _move_module_to_half(module, _worldstereo_half_dtype())
+        if precision == "int4":
+            print("[WorldStereo Export] int4 is transformer-only; exporting UMT5 as ComfyUI fp8 instead.")
+            precision = "fp8"
+        if precision == "fp8":
+            state, actual_precision = _comfy_scaled_fp8_state_dict_for_t5(module)
+        elif precision == "bf16":
+            state = _tensor_state_dict_for_safetensors(module)
+            state.pop("encoder.embed_tokens.weight", None)
+            state = _dedupe_safetensors_state_dict(state)
+            actual_precision = "bf16"
+        else:
+            raise ValueError(f"Unsupported UMT5 export precision: {precision!r}")
+        spiece_path = os.path.join(base_model_dir, "tokenizer", "spiece.model")
+        if not os.path.exists(spiece_path):
+            raise FileNotFoundError(f"Wan tokenizer spiece.model not found: {spiece_path}")
+        with open(spiece_path, "rb") as fh:
+            state["spiece_model"] = torch.ByteTensor(list(fh.read()))
+        export_format = "hyworld2_worldstereo_umt5_encoder_v1"
+        note = "Official Wan UMT5 encoder exported from WorldStereo base_model."
+    else:
+        module = AutoencoderKLWan.from_pretrained(
+            base_model_dir,
+            subfolder="vae",
+            torch_dtype=_worldstereo_half_dtype(),
+            local_files_only=True,
+        ).eval()
+        module = module.to(device=device)
+        if precision != "bf16":
+            print("[WorldStereo Export] Single-file Wan VAE loader expects normal weights; exporting VAE as bf16.")
+        actual_precision = "bf16"
+        _move_module_to_half(module, _worldstereo_half_dtype())
+        state = _tensor_state_dict_for_safetensors(module)
+        state = _dedupe_safetensors_state_dict(state)
+        export_format = "hyworld2_worldstereo_wan_vae_v1"
+        note = "Official Wan VAE exported from WorldStereo base_model."
+
+    total_params = sum(t.numel() for t in state.values())
+    total_bytes = sum(t.numel() * t.element_size() for t in state.values())
+    dtype_summary = {}
+    for tensor in state.values():
+        dtype_summary[str(tensor.dtype)] = dtype_summary.get(str(tensor.dtype), 0) + tensor.numel()
+
+    metadata = {
+        "format": export_format,
+        "model_type": model_type,
+        "precision": actual_precision,
+        "runtime_dtype": str(_worldstereo_half_dtype()),
+        "base_model": base_model_dir,
+        "num_tensors": str(len(state)),
+        "num_params": str(total_params),
+        "tensor_bytes": str(total_bytes),
+        "dtype_summary": json.dumps(dtype_summary, sort_keys=True),
+        "note": note,
+    }
+
+    print(f"[WorldStereo Export] Saving auxiliary checkpoint: {output_file}")
+    save_file(state, output_file, metadata=metadata)
+    if write_metadata_json:
+        with open(metadata_file, "w", encoding="utf-8") as fh:
+            json.dump(metadata, fh, indent=2)
+
+    del state
+    del module
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    info = (
+        f"exported={output_file}\n"
+        f"metadata={metadata_file if write_metadata_json else ''}\n"
+        f"model_type={model_type}\n"
+        f"precision={actual_precision}\n"
+        f"tensors={metadata['num_tensors']}\n"
+        f"params={metadata['num_params']}\n"
+        f"bytes={metadata['tensor_bytes']}\n"
+        f"dtypes={metadata['dtype_summary']}"
+    )
+    print(f"[WorldStereo Export] Done:\n{info}")
+    return info
 
 
 def _pack_int4_weight(weight: torch.Tensor, group_size: int = 128):
@@ -1111,9 +1301,12 @@ def _resolve_worldstereo_export_paths(export_path: str, model_type: str, precisi
     if export_path.lower().endswith(".safetensors"):
         output_file = export_path
     else:
-        suffix = turbo_lora.lower().replace(" ", "_").replace("/", "_").replace("(", "").replace(")", "")
-        suffix = suffix if suffix and suffix != "none" else "clean"
-        output_file = os.path.join(export_path, f"{model_type}-{suffix}-{precision}.safetensors")
+        if model_type in VNCCS_ExportWorldStereoSingleModel.AUX_MODEL_TYPES:
+            output_file = os.path.join(export_path, f"{model_type}-{precision}.safetensors")
+        else:
+            suffix = turbo_lora.lower().replace(" ", "_").replace("/", "_").replace("(", "").replace(")", "")
+            suffix = suffix if suffix and suffix != "none" else "clean"
+            output_file = os.path.join(export_path, f"{model_type}-{suffix}-{precision}.safetensors")
     metadata_file = os.path.splitext(output_file)[0] + ".json"
     return output_file, metadata_file
 
@@ -1134,6 +1327,18 @@ def _read_safetensors_metadata(path: str) -> dict:
 
 
 WORLDSTEREO_LIGHT_REPO_ID = "MIUProject/VNCCS_WorldStereoLight"
+WORLDSTEREO_LIGHT_TEXT_ENCODER_ASSET = {
+    "filename": "clip/WorldStereo_umt5-xxl-encoder-fp8.safetensors",
+    "local_subdir": "clip",
+    "local_filename": "WorldStereo_umt5-xxl-encoder-fp8.safetensors",
+    "label": "WorldStereo UMT5 encoder",
+}
+WORLDSTEREO_LIGHT_VAE_ASSET = {
+    "filename": "vae/WorldStereo_wan_2.1_vae.safetensors",
+    "local_subdir": "vae",
+    "local_filename": "WorldStereo_wan_2.1_vae.safetensors",
+    "label": "WorldStereo Wan VAE",
+}
 WORLDSTEREO_LIGHT_MODELS = {
     "Camera Light INT4": {
         "filename": "vnccs-worldstereo-camera-light-int4.safetensors",
@@ -1204,6 +1409,47 @@ def _download_worldstereo_light_model(model_name: str, models_base: str | None =
     return local_safetensors, metadata
 
 
+def _download_worldstereo_light_asset(asset: dict, models_base: str | None = None) -> str:
+    from huggingface_hub import hf_hub_download
+    import shutil
+
+    root = models_base or _get_models_base()
+    local_dir = os.path.join(root, asset["local_subdir"])
+    os.makedirs(local_dir, exist_ok=True)
+    local_path = os.path.join(local_dir, asset["local_filename"])
+    if os.path.exists(local_path):
+        print(f"[WorldStereoLight] Using local {asset.get('label', 'asset')}: {local_path}")
+        return local_path
+
+    print(f"[WorldStereoLight] Downloading {asset.get('label', 'asset')}: {asset['filename']} ...")
+    cached_path = hf_hub_download(
+        repo_id=WORLDSTEREO_LIGHT_REPO_ID,
+        filename=asset["filename"],
+    )
+    shutil.copy2(cached_path, local_path)
+    print(f"[WorldStereoLight] Asset cached: {local_path}")
+    return local_path
+
+
+def _enable_worldstereo_pipeline_offload(pipeline, offload_mode: str, *, preserve_text_encoder: bool, prefix: str):
+    text_encoder = getattr(pipeline, "text_encoder", None)
+    if preserve_text_encoder and text_encoder is not None:
+        print(f"{prefix} Keeping ComfyUI quantized text encoder out of accelerate CPU offload.")
+        pipeline.text_encoder = None
+    try:
+        if offload_mode == "model_cpu_offload":
+            print(f"{prefix} Enabling model_cpu_offload ...")
+            pipeline.enable_model_cpu_offload()
+            print(f"{prefix} model_cpu_offload enabled")
+        elif offload_mode == "sequential_cpu_offload":
+            print(f"{prefix} Enabling sequential_cpu_offload ...")
+            pipeline.enable_sequential_cpu_offload()
+            print(f"{prefix} sequential_cpu_offload enabled")
+    finally:
+        if preserve_text_encoder and text_encoder is not None:
+            pipeline.text_encoder = text_encoder
+
+
 def _download_hf_repo_missing(repo_id: str, local_dir: str, label: str, allow_patterns=None):
     from fnmatch import fnmatch
     from huggingface_hub import HfApi, hf_hub_download
@@ -1272,6 +1518,42 @@ def _download_hf_repo_missing(repo_id: str, local_dir: str, label: str, allow_pa
         )
 
     print(f"[WorldStereo] {label} cached: {local_dir}")
+
+
+def _wan_base_aux_ready(base_model_dir: str, components) -> bool:
+    checks = [os.path.join(base_model_dir, "model_index.json")]
+    if "text_encoder" in components:
+        checks.extend([
+            os.path.join(base_model_dir, "text_encoder", "config.json"),
+            os.path.join(base_model_dir, "text_encoder", "model.safetensors.index.json"),
+            os.path.join(base_model_dir, "tokenizer", "tokenizer_config.json"),
+        ])
+    if "vae" in components:
+        checks.extend([
+            os.path.join(base_model_dir, "vae", "config.json"),
+            os.path.join(base_model_dir, "vae", "diffusion_pytorch_model.safetensors"),
+        ])
+    return all(os.path.exists(path) for path in checks)
+
+
+def _resolve_wan_base_aux(components, models_base: str | None = None) -> str:
+    base_model_dir = os.path.join(models_base or _get_models_base(), "Wan2.1-I2V-14B-480P")
+    if _wan_base_aux_ready(base_model_dir, components):
+        print(f"[WorldStereo Export] Using local Wan base aux files: {base_model_dir}")
+        return base_model_dir
+
+    patterns = ["model_index.json"]
+    if "text_encoder" in components:
+        patterns.extend(["tokenizer/**", "text_encoder/**"])
+    if "vae" in components:
+        patterns.append("vae/**")
+    _download_hf_repo_missing(
+        repo_id="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+        local_dir=base_model_dir,
+        label=f"Wan2.1-I2V-14B-480P {'/'.join(components)} files",
+        allow_patterns=patterns,
+    )
+    return base_model_dir
 
 
 def _download_worldstereo_single_loader_components(
@@ -1745,6 +2027,11 @@ class VNCCS_LoadWorldStereoModel:
             "turbo_lora":  turbo_lora,
             "lora_strength": float(lora_strength),
             "turbo_lora_path": turbo_lora_path,
+            "pretrained_path": parent_dir,
+            "transformer_dir": transformer_dir,
+            "base_model_dir": base_model_dir,
+            "moge_dir": moge_dir,
+            "loader_type": "worldstereo_full",
         },)
 
 
@@ -1777,8 +2064,10 @@ class VNCCS_LoadWorldStereoLightModel:
         model,
         offload_mode="sequential_cpu_offload",
         device="cuda",
+        use_light_aux_models=True,
     ):
         import os
+        use_light_aux_models = True
 
         current_dir = os.path.dirname(os.path.dirname(__file__))
         _prepare_worldstereo_import_paths(current_dir)
@@ -1802,9 +2091,15 @@ class VNCCS_LoadWorldStereoLightModel:
             )
 
         transformer_dir, base_model_dir, moge_dir = _download_worldstereo_single_loader_components(model_type)
+        text_encoder_path = _download_worldstereo_light_asset(WORLDSTEREO_LIGHT_TEXT_ENCODER_ASSET)
+        vae_path = _download_worldstereo_light_asset(WORLDSTEREO_LIGHT_VAE_ASSET)
         transformer_dir = transformer_dir.replace("\\", "/")
         base_model_dir = base_model_dir.replace("\\", "/")
         moge_dir = moge_dir.replace("\\", "/")
+        if text_encoder_path:
+            text_encoder_path = text_encoder_path.replace("\\", "/")
+        if vae_path:
+            vae_path = vae_path.replace("\\", "/")
 
         with _temporary_worldstereo_runtime_patches(patch_diffusers=True):
             WorldStereo = _import_worldstereo_class(current_dir)
@@ -1828,6 +2123,9 @@ class VNCCS_LoadWorldStereoLightModel:
                 subfolder=model_type,
                 device=device,
                 model_device=model_device,
+                text_encoder_path=text_encoder_path,
+                vae_path=vae_path,
+                comfy_root=_get_comfy_root(),
             )
         pipeline = worldstereo.pipeline
 
@@ -1843,14 +2141,13 @@ class VNCCS_LoadWorldStereoLightModel:
         offload_mode = _normalize_worldstereo_offload_mode(offload_mode, precision, prefix="[WorldStereoLight]")
 
         if device == "cuda":
-            if offload_mode == "model_cpu_offload":
-                print("[WorldStereoLight] Enabling model_cpu_offload ...")
-                pipeline.enable_model_cpu_offload()
-                print("[WorldStereoLight] model_cpu_offload enabled")
-            elif offload_mode == "sequential_cpu_offload":
-                print("[WorldStereoLight] Enabling sequential_cpu_offload ...")
-                pipeline.enable_sequential_cpu_offload()
-                print("[WorldStereoLight] sequential_cpu_offload enabled")
+            if offload_mode in ("model_cpu_offload", "sequential_cpu_offload"):
+                _enable_worldstereo_pipeline_offload(
+                    pipeline,
+                    offload_mode,
+                    preserve_text_encoder=bool(use_light_aux_models),
+                    prefix="[WorldStereoLight]",
+                )
             elif offload_mode == "none":
                 print("[WorldStereoLight Warning] CPU offload disabled; this is likely too large for normal VRAM.")
 
@@ -1879,8 +2176,13 @@ class VNCCS_LoadWorldStereoLightModel:
             "turbo_lora_path": None,
             "single_model_path": single_model_path,
             "single_model_metadata": metadata,
+            "pretrained_path": parent_dir,
+            "transformer_dir": transformer_dir,
+            "base_model_dir": base_model_dir,
+            "moge_dir": moge_dir,
             "loader_type": "worldstereo_light",
             "selected_model": model,
+            "use_light_aux_models": bool(use_light_aux_models),
         },)
 
 
@@ -2826,7 +3128,8 @@ class VNCCS_WorldStereoGenerate:
 class VNCCS_ExportWorldStereoSingleModel:
     """Experimental exporter for single-file WorldStereo transformer checkpoints."""
 
-    MODEL_TYPES = VNCCS_LoadWorldStereoModel.MODEL_TYPES
+    AUX_MODEL_TYPES = ["official-clip-umt5-encoder", "official-wan-vae"]
+    MODEL_TYPES = VNCCS_LoadWorldStereoModel.MODEL_TYPES + AUX_MODEL_TYPES
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -2885,6 +3188,12 @@ class VNCCS_ExportWorldStereoSingleModel:
         if device == "cuda" and not torch.cuda.is_available():
             print("[WorldStereo Export] CUDA requested but unavailable; using CPU")
             device = "cpu"
+        if model_type == "official-clip-umt5-encoder" and precision == "int4":
+            print("[WorldStereo Export] int4 is transformer-only; UMT5 export will use ComfyUI fp8.")
+            precision = "fp8"
+        if model_type == "official-wan-vae" and precision != "bf16":
+            print("[WorldStereo Export] Single-file Wan VAE export uses bf16 normal weights.")
+            precision = "bf16"
 
         output_file, metadata_file = _resolve_worldstereo_export_paths(
             export_path,
@@ -2901,6 +3210,20 @@ class VNCCS_ExportWorldStereoSingleModel:
         export_models_base = _worldstereo_export_cache_dir(output_file)
         os.makedirs(export_models_base, exist_ok=True)
         print(f"[WorldStereo Export] Using export-local model cache: {export_models_base}")
+
+        if model_type in self.AUX_MODEL_TYPES:
+            if turbo_lora != "none":
+                print("[WorldStereo Export] turbo_lora ignored for auxiliary model export.")
+            info = _export_worldstereo_aux_single_model(
+                output_file=output_file,
+                metadata_file=metadata_file,
+                model_type=model_type,
+                precision=precision,
+                device=device,
+                export_models_base=export_models_base,
+                write_metadata_json=write_metadata_json,
+            )
+            return (info,)
 
         transformer_dir, base_model_dir, _ = _download_worldstereo_components(
             model_type,
@@ -3089,8 +3412,7 @@ class VNCCS_InstallHYWorld2Dependencies:
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
-        import time
-        return time.time()
+        return str(kwargs.get("install", "RUN_DEPENDENCY_INSTALL"))
 
     def install_dependencies(self, install="RUN_DEPENDENCY_INSTALL"):
         import sys

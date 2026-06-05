@@ -91,7 +91,11 @@ ipch/
 input/
 output/
 temp/
-models/
+/models/
+!hyworld2/
+!hyworld2/worldgen/
+!hyworld2/worldgen/models/
+!hyworld2/worldgen/models/**
 checkpoints/
 embeddings/
 loras/
@@ -117,8 +121,7 @@ controlnet/
 
 # Local installer/build caches
 scripts/gsplat_build/
+scripts/fused_ssim_build/
 scripts/dist/
 scripts/portable_msvc/
-gsplat/*.whl
-!gsplat/gsplat-*.whl
-!gsplat/pytorch3d-*.whl
+tests/

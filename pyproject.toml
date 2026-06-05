@@ -1,12 +1,12 @@
 [project]
 name = "comfyui-hyworld2"
-version = "1.4.0"
+version = "1.5.0"
 description = "HY-World 2.0 ComfyUI nodes — WorldMirror V1 & V2 3D reconstruction"
 license = { file = "LICENSE" }
 dependencies = [
     "torch",
     "torchvision",
-    "numpy",
+    "numpy>=2.0,<2.3",
     "Pillow",
     "opencv-python",
     "scipy",
@@ -17,23 +17,30 @@ dependencies = [
     "omegaconf",
     "plyfile",
     "trimesh",
-    "gsplat",
     "einops",
     "jaxtyping",
     "typeguard",
     "open3d>=0.18.0",
+    "ninja",
+    "pybind11",
+    "scikit-learn",
     "accelerate",
     "diffusers>=0.36.0",
-    "transformers>=4.40.0",
+    "transformers>=5.2.0",
     "bitsandbytes>=0.43.0",
     "optimum-quanto>=0.2.4",
     "torchao",
     "imageio[ffmpeg]",
     "kornia",
+    "cupy-cuda13x",
+    "zim-anything",
+    "openai",
+    "json-repair",
+    "utils3d",
 ]
 
 [project.optional-dependencies]
-gsplat = ["gsplat>=1.5.3"]
+gsplat = []
 fp8 = ["torchao"]
 colmap = ["pycolmap==3.10.0"]
 video = ["moviepy==1.0.3"]
