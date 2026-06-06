@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.5.1
+
+### Added
+
+- Added `HYWorld2 Klein World Expansion`, a memory-bank expansion node that runs a ComfyUI Flux/Klein-style reference-latent pipeline over selected HYWorld2 trajectory keyframes and writes reusable per-trajectory result videos.
+- Added Klein expansion caching/state tracking via `hyworld2_klein_expansion_state.json`, including seed/settings reuse for previously generated result videos.
+- Added memory-bank normalization for Klein outputs so generated frames, camera intrinsics, and memory-bank point grids stay aligned when the output resolution differs from the original trajectory render size.
+- Added `HYWorld2 Dataset Frame Pairs`, a utility node for collecting final/generated frames, matching source render frames, and previous-frame context images from HYWorld2 workspaces for dataset and LoRA preparation workflows.
+- Registered the new HYWorld2 utility nodes through the main node mappings.
+
+### Changed
+
+- Updated the package version to `1.5.1`.
+- Updated `HYWorld2 Trajectories` so trajectory rendering only prepares and sorts render outputs; QwenVL caption generation is deferred to the downstream world-expansion stage.
+- Updated HYWorld2 trajectory cache validation so missing trajectory caption files no longer invalidate otherwise complete rendered trajectory workspaces.
+- Added evenly spaced keyframe selection for workflows that need a smaller frame subset from WorldStereo-style trajectory renders.
+
+### Fixed
+
+- Reduced `Load WorldStereoLight Model` on-demand Wan2.1 downloads by avoiding unused full Wan text-encoder weights and full VAE weights when single-file WorldStereoLight encoder/VAE assets are used.
+
 ## 1.5.0
 
 ### Added

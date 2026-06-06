@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-hyworld2"
-version = "1.5.0"
+version = "1.5.1"
 description = "HY-World 2.0 ComfyUI nodes — WorldMirror V1 & V2 3D reconstruction"
 license = { file = "LICENSE" }
 dependencies = [

@@ -299,6 +299,10 @@ def _hyworld2_world_expansion_state_path(scene):
     return Path(scene) / "hyworld2_world_expansion_state.json"
 
 
+def _hyworld2_klein_expansion_state_path(scene):
+    return Path(scene) / "hyworld2_klein_expansion_state.json"
+
+
 def _hyworld2_read_json_file(path, default=None):
     path = Path(path)
     if not path.is_file():
@@ -382,7 +386,6 @@ def _hyworld2_trajectory_cache_status(
     require_detail=False,
     require_anchor=False,
     anchor_topk=0,
-    caption_mode="qwenvl_missing",
     workspace_cache_action=None,
 ):
     scene = Path(scene)
@@ -445,12 +448,6 @@ def _hyworld2_trajectory_cache_status(
         anchor_dirs = [path for path in trajectory_dirs if any(part.startswith("wonder_scan_") for part in path.parts)]
         if len(anchor_dirs) < int(anchor_topk):
             return False, f"anchor scan requested but only {len(anchor_dirs)}/{int(anchor_topk)} scan renders were found", state
-
-    if caption_mode != "existing_files_only":
-        missing_caption = [path for path in trajectory_dirs if not (path / "traj_caption.json").is_file()]
-        if missing_caption:
-            state["_captions_incomplete"] = len(missing_caption)
-            state["_repair_state"] = True
 
     return True, "cached trajectory workspace is complete", state
 
@@ -1171,6 +1168,17 @@ def _worldstereo_keyframe_indices(num_frames, device=None):
     keyframe_count = max(1, (int(num_frames) - 1) // 4 + 1)
     indices = torch.linspace(0, int(num_frames) - 1, keyframe_count, device=device).round().long()
     return torch.unique_consecutive(indices.clamp(0, int(num_frames) - 1))
+
+
+def _select_evenly_spaced_indices(indices, count):
+    values = [int(index) for index in indices]
+    if int(count) <= 0 or int(count) >= len(values):
+        return values
+    if int(count) == 1:
+        return [values[0]]
+    pick = np.rint(np.linspace(0, len(values) - 1, int(count))).astype(np.int64)
+    pick = np.unique(np.clip(pick, 0, len(values) - 1))
+    return [values[int(index)] for index in pick]
 
 
 def _coerce_worldstereo_ref_index(ref_index, max_ref_index):
@@ -2272,13 +2280,11 @@ class HYWorld2Trajectories:
             roof_height_threshold=float(roof_height_threshold),
             sam3_path=str(sam3_path or HYWORLD2_SAM3_REPO_ID),
             local_files_only=bool(local_files_only),
-            caption_mode=str(caption_mode),
             qwen_model_id=str(qwen_model_id),
             qwen_quantization=str(qwen_quantization),
             qwen_attention_mode=str(qwen_attention_mode),
             qwen_max_image_edge=int(qwen_max_image_edge),
             qwen_max_new_tokens=int(qwen_max_new_tokens),
-            qwen_frame_count=int(qwen_frame_count),
             apply_anchor_scan=bool(apply_anchor_scan),
             anchor_scan_topk=int(anchor_scan_topk),
             anchor_scan_min_distance=float(anchor_scan_min_distance),
@@ -2292,7 +2298,6 @@ class HYWorld2Trajectories:
             require_detail=bool(apply_detail_traj),
             require_anchor=bool(apply_anchor_scan),
             anchor_topk=int(anchor_scan_topk),
-            caption_mode=str(caption_mode),
             workspace_cache_action=workspace.get("cache_action"),
         )
         if cache_ok:
@@ -2449,23 +2454,7 @@ class HYWorld2Trajectories:
         from hyworld2.worldgen.src.data_utils import sort_trajs
 
         render_list = sort_trajs(str(render_root))
-        print(f"[HYWorld2 Trajectories] Stage 5/5: local QwenVL captions for {len(render_list)} trajectory render(s)")
-        captions_written = HYWorld2WorldExpansion()._ensure_captions(
-            workspace,
-            render_list,
-            caption_mode,
-            qwen_model_id,
-            qwen_device,
-            int(qwen_max_new_tokens),
-            qwen_quantization,
-            qwen_attention_mode,
-            bool(qwen_keep_model_loaded),
-            bool(qwen_cpu_offload),
-            int(qwen_max_image_edge),
-            int(qwen_frame_count),
-        )
-        HYWorld2QwenVL._clear_cache()
-        print(f"[HYWorld2 Trajectories] Stage 5/5 complete: wrote {len(captions_written)} caption file(s)")
+        print(f"[HYWorld2 Trajectories] Stage 5/5: sorted {len(render_list)} trajectory render(s); captions deferred to World Expansion")
         _hyworld2_write_json_file(
             _hyworld2_trajectory_state_path(scene),
             {
@@ -2473,7 +2462,7 @@ class HYWorld2Trajectories:
                 "settings_signature": settings_signature,
                 "settings": settings_state,
                 "render_count": len(render_list),
-                "captions_written": len(captions_written),
+                "captions_written": 0,
                 "anchor_scans_written": len(anchor_scans_written),
             },
         )
@@ -2483,7 +2472,7 @@ class HYWorld2Trajectories:
             "count": len(render_list),
             "generated": True,
             "planner_context_written": planner_written,
-            "captions_written": captions_written,
+            "captions_written": [],
             "anchor_scans_written": anchor_scans_written,
             "logs": logs,
         }
@@ -2932,6 +2921,393 @@ class HYWorld2WorldExpansion:
                     "seed": int(seed),
                     "seed_cache_action": "reuse_existing" if not pending_render_list else "generated_pending",
                     "state_path": str(state_path),
+                }
+            ),
+        )
+
+
+def _comfy_node_output(value, index=0):
+    if hasattr(value, "result"):
+        result = value.result
+        return result[index]
+    return value[index]
+
+
+def _comfy_node_class(name):
+    import importlib
+
+    comfy_nodes = importlib.import_module("nodes")
+    mappings = getattr(comfy_nodes, "NODE_CLASS_MAPPINGS", {}) or {}
+    node_cls = mappings.get(name)
+    if node_cls is None and hasattr(comfy_nodes, name):
+        node_cls = getattr(comfy_nodes, name)
+    if node_cls is None:
+        fallback_modules = {
+            "ReferenceLatent": "comfy_extras.nodes_edit_model",
+            "EmptyFlux2LatentImage": "comfy_extras.nodes_flux",
+            "Flux2Scheduler": "comfy_extras.nodes_flux",
+            "KSamplerSelect": "comfy_extras.nodes_custom_sampler",
+            "CFGGuider": "comfy_extras.nodes_custom_sampler",
+            "RandomNoise": "comfy_extras.nodes_custom_sampler",
+            "SamplerCustomAdvanced": "comfy_extras.nodes_custom_sampler",
+            "ImageScaleToTotalPixels": "comfy_extras.nodes_post_processing",
+        }
+        module_name = fallback_modules.get(name)
+        if module_name:
+            module = importlib.import_module(module_name)
+            node_cls = getattr(module, name, None)
+    if node_cls is None:
+        raise RuntimeError(f"Comfy node class '{name}' is not available. Update ComfyUI or enable the required official node extension.")
+    return node_cls
+
+
+def _run_comfy_node(name, method_name, *args, **kwargs):
+    node = _comfy_node_class(name)()
+    method = getattr(node, method_name, None)
+    if method is None:
+        method = getattr(node, "execute", None)
+    if method is None:
+        raise RuntimeError(f"Comfy node '{name}' has no callable '{method_name}' or 'execute' method.")
+    return _comfy_node_output(method(*args, **kwargs), 0)
+
+
+def _image_tensor_size(image):
+    if not isinstance(image, torch.Tensor) or image.ndim != 4:
+        raise ValueError(f"Expected IMAGE tensor [B,H,W,C], got {type(image).__name__}: {getattr(image, 'shape', None)}")
+    return int(image.shape[2]), int(image.shape[1])
+
+
+def _pil_to_single_image_tensor(image):
+    return _pil_list_to_image_tensor([image.convert("RGB")])
+
+
+def _image_tensor_first_to_pil(image):
+    frames = _image_tensor_to_pil_list(image)
+    if not frames:
+        raise RuntimeError("Klein pipeline returned an empty IMAGE output.")
+    return frames[0].convert("RGB")
+
+
+def _resize_pil(image, size):
+    image = image.convert("RGB")
+    if image.size == tuple(size):
+        return image
+    return image.resize(tuple(size), Image.Resampling.LANCZOS)
+
+
+def _scale_intrinsics_to_size(Ks, old_size, new_size):
+    old_w, old_h = max(1, int(old_size[0])), max(1, int(old_size[1]))
+    new_w, new_h = max(1, int(new_size[0])), max(1, int(new_size[1]))
+    scaled = Ks.clone().float()
+    scaled[..., 0, :] *= float(new_w) / float(old_w)
+    scaled[..., 1, :] *= float(new_h) / float(old_h)
+    return scaled
+
+
+def _make_memory_bank_points(width, height, device):
+    x = torch.arange(int(width), dtype=torch.float32, device=device)
+    y = torch.arange(int(height), dtype=torch.float32, device=device)
+    points = torch.stack(torch.meshgrid(x, y, indexing="ij"), dim=-1)
+    points = points.permute(1, 0, 2).reshape(-1, 2)
+    pad = torch.ones((points.shape[0], 1), dtype=points.dtype, device=points.device)
+    return torch.cat([points, pad], dim=-1)
+
+
+def _normalize_memory_bank_image_size(bank, memory_bank, target_size):
+    target_w, target_h = int(target_size[0]), int(target_size[1])
+    old_w = int(getattr(bank, "image_width", memory_bank.get("image_width", target_w)) or target_w)
+    old_h = int(getattr(bank, "image_height", memory_bank.get("image_height", target_h)) or target_h)
+    expected_points = target_w * target_h
+    current_points = getattr(bank, "points", None)
+    points_ok = isinstance(current_points, torch.Tensor) and int(current_points.shape[0]) == int(expected_points)
+    if old_w == target_w and old_h == target_h and points_ok:
+        return (old_w, old_h)
+
+    _hy_log(
+        "Klein Expansion",
+        f"Normalizing memory bank size: {old_w}x{old_h} -> {target_w}x{target_h}; "
+        f"points={int(current_points.shape[0]) if isinstance(current_points, torch.Tensor) else 0}->{expected_points}",
+    )
+    if old_w != target_w or old_h != target_h:
+        bank.ref_frames = [_resize_pil(frame, (target_w, target_h)) for frame in getattr(bank, "ref_frames", [])]
+    if (old_w != target_w or old_h != target_h) and isinstance(getattr(bank, "ref_Ks", None), torch.Tensor) and bank.ref_Ks.numel() > 0:
+        bank.ref_Ks = _scale_intrinsics_to_size(bank.ref_Ks, (old_w, old_h), (target_w, target_h)).to(bank.ref_Ks.device)
+    bank.image_width = target_w
+    bank.image_height = target_h
+    device = getattr(bank, "device", None)
+    if device is None:
+        ref_Ks = getattr(bank, "ref_Ks", None)
+        device = ref_Ks.device if isinstance(ref_Ks, torch.Tensor) else torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    bank.points = _make_memory_bank_points(target_w, target_h, device)
+    memory_bank["image_width"] = target_w
+    memory_bank["image_height"] = target_h
+    return (old_w, old_h)
+
+
+class HYWorld2KleinWorldExpansion:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "workspace": ("HYWORLD2_WORKSPACE",),
+                "memory_bank": ("HYWORLD2_MEMORY_BANK",),
+                "trajectory_set": ("HYWORLD2_TRAJECTORY_SET",),
+                "model": ("MODEL",),
+                "clip": ("CLIP",),
+                "vae": ("VAE",),
+            },
+            "optional": {
+                "positive_prompt": ("STRING", {"default": "Reconstruct image based on image2", "multiline": True}),
+                "negative_prompt": ("STRING", {"default": "", "multiline": True}),
+                "result_name": ("STRING", {"default": "klein9b-memory-lora"}),
+                "steps": ("INT", {"default": 4, "min": 1, "max": 4096}),
+                "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.1}),
+                "sampler_name": (["euler"], {"default": "euler"}),
+                "input_megapixels": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 16.0, "step": 0.01}),
+                "resolution_steps": ("INT", {"default": 1, "min": 1, "max": 256}),
+                "frames_per_trajectory": ("INT", {"default": 3, "min": 1, "max": 64}),
+                "use_context_image": ("BOOLEAN", {"default": True}),
+                "seed": ("INT", {"default": 1, "min": 0, "max": 2**31 - 1, "control_after_generate": "fixed"}),
+                "max_trajectories": ("INT", {"default": 0, "min": 0, "max": 100000}),
+            },
+        }
+
+    RETURN_TYPES = ("HYWORLD2_MEMORY_BANK", "STRING")
+    RETURN_NAMES = ("memory_bank", "info")
+    FUNCTION = "run"
+    CATEGORY = "VNCCS/HYWorld2"
+
+    def _scale_reference(self, image, input_megapixels, resolution_steps):
+        return _run_comfy_node("ImageScaleToTotalPixels", "execute", image, "lanczos", float(input_megapixels), int(resolution_steps))
+
+    def _run_klein_frame(
+        self,
+        model,
+        clip,
+        vae,
+        render_frame,
+        context_frame,
+        positive_base,
+        negative_base,
+        sampler,
+        seed,
+        steps,
+        cfg,
+        input_megapixels,
+        resolution_steps,
+    ):
+        image1 = self._scale_reference(_pil_to_single_image_tensor(render_frame), input_megapixels, resolution_steps)
+        image2 = self._scale_reference(_pil_to_single_image_tensor(context_frame), input_megapixels, resolution_steps)
+        width, height = _image_tensor_size(image1)
+
+        latent1 = _run_comfy_node("VAEEncode", "encode", vae, image1)
+        latent2 = _run_comfy_node("VAEEncode", "encode", vae, image2)
+        positive = _run_comfy_node("ReferenceLatent", "execute", positive_base, latent1)
+        positive = _run_comfy_node("ReferenceLatent", "execute", positive, latent2)
+        negative = _run_comfy_node("ReferenceLatent", "execute", negative_base, latent1)
+        negative = _run_comfy_node("ReferenceLatent", "execute", negative, latent2)
+        guider = _run_comfy_node("CFGGuider", "execute", model, positive, negative, float(cfg))
+        sigmas = _run_comfy_node("Flux2Scheduler", "execute", int(steps), width, height)
+        latent = _run_comfy_node("EmptyFlux2LatentImage", "execute", width, height, 1)
+        noise = _run_comfy_node("RandomNoise", "execute", int(seed))
+        samples = _run_comfy_node("SamplerCustomAdvanced", "execute", noise, guider, sampler, sigmas, latent)
+        image = _run_comfy_node("VAEDecode", "decode", vae, samples)
+        return _image_tensor_first_to_pil(image)
+
+    def run(
+        self,
+        workspace,
+        memory_bank,
+        trajectory_set,
+        model,
+        clip,
+        vae,
+        positive_prompt="Reconstruct image based on image2",
+        negative_prompt="",
+        result_name="klein9b-memory-lora",
+        steps=4,
+        cfg=1.0,
+        sampler_name="euler",
+        input_megapixels=1.0,
+        resolution_steps=1,
+        frames_per_trajectory=3,
+        use_context_image=True,
+        seed=1,
+        max_trajectories=0,
+    ):
+        _hy_log("Klein Expansion", "Stage 1/5: preparing Klein memory expansion")
+        bank = memory_bank["bank"]
+        device = torch.device(memory_bank.get("device", "cuda:0" if torch.cuda.is_available() else "cpu"))
+        model_type = str(result_name or "klein9b-memory-lora").strip() or "klein9b-memory-lora"
+        render_list = list(trajectory_set.get("render_list", []))
+        if int(max_trajectories) > 0:
+            render_list = render_list[: int(max_trajectories)]
+
+        state_path = _hyworld2_klein_expansion_state_path(workspace["scene_dir"])
+        expansion_state = _hyworld2_read_json_file(state_path, default={}) or {}
+        settings_signature = {
+            "seed": int(seed),
+            "model_type": model_type,
+            "positive_prompt": str(positive_prompt or ""),
+            "negative_prompt": str(negative_prompt or ""),
+            "steps": int(steps),
+            "cfg": float(cfg),
+            "sampler_name": str(sampler_name),
+            "input_megapixels": float(input_megapixels),
+            "resolution_steps": int(resolution_steps),
+            "frames_per_trajectory": int(frames_per_trajectory),
+            "use_context_image": bool(use_context_image),
+        }
+        settings_match = expansion_state.get("settings_signature") == settings_signature
+        sampler = _run_comfy_node("KSamplerSelect", "execute", str(sampler_name))
+        positive_base = _run_comfy_node("CLIPTextEncode", "encode", clip, str(positive_prompt or ""))
+        negative_base = _run_comfy_node("CLIPTextEncode", "encode", clip, str(negative_prompt or ""))
+
+        render_items = []
+        pending_count = 0
+        for render_path in render_list:
+            render_parts = Path(render_path).parts
+            view_id, traj_id = render_parts[-3], render_parts[-2]
+            traj_dir = Path(workspace["scene_dir"]) / "render_results" / view_id / traj_id
+            result_path = traj_dir / f"{model_type}_result.mp4"
+            has_result = result_path.is_file() and result_path.stat().st_size > 0
+            can_reuse_result = bool(has_result and settings_match)
+            if not can_reuse_result:
+                pending_count += 1
+            render_items.append(
+                {
+                    "render_path": Path(render_path),
+                    "view_id": view_id,
+                    "traj_id": traj_id,
+                    "traj_dir": traj_dir,
+                    "result_path": result_path,
+                    "can_reuse_result": can_reuse_result,
+                }
+            )
+
+        _hy_log("Klein Expansion", f"Stage 2/5: trajectory count={len(render_items)}, pending={pending_count}, model_type={model_type}")
+        completed = []
+        generated_frame_count = 0
+        target_size = None
+        original_bank_size = (int(getattr(bank, "image_width", memory_bank.get("image_width", 0)) or 0), int(getattr(bank, "image_height", memory_bank.get("image_height", 0)) or 0))
+
+        _hy_log("Klein Expansion", "Stage 3/5: generating/reusing trajectory videos")
+        for item_index, item in enumerate(render_items):
+            view_id = item["view_id"]
+            traj_id = item["traj_id"]
+            traj_dir = item["traj_dir"]
+            result_path = item["result_path"]
+            camera_data = json.load(open(traj_dir / "camera.json", "r", encoding="utf-8"))
+            tar_w2cs = torch.from_numpy(np.asarray(camera_data["extrinsic"], dtype=np.float32)).to(device)
+            tar_Ks = torch.from_numpy(np.asarray(camera_data["intrinsic"], dtype=np.float32)).to(device)
+
+            _hy_log("Klein Expansion", f"Trajectory {item_index + 1}/{len(render_items)}: {view_id}/{traj_id}")
+            if item["can_reuse_result"]:
+                frames = _load_video_frames(result_path)
+                if not frames:
+                    raise RuntimeError(f"Reusable Klein result has no frames: {result_path}")
+                if target_size is None:
+                    target_size = frames[0].size
+                    original_bank_size = _normalize_memory_bank_image_size(bank, memory_bank, target_size)
+                frames = [_resize_pil(frame, target_size) for frame in frames]
+                update_w2cs, update_Ks = _sample_camera_tensors_to_frame_count(tar_w2cs, tar_Ks, len(frames))
+                update_Ks = _scale_intrinsics_to_size(update_Ks, original_bank_size, target_size)
+                bank.update_memory(frames, update_w2cs, update_Ks, view_id=view_id, traj_id=traj_id)
+                completed.append(str(result_path))
+                continue
+
+            render_frames = _load_video_frames(item["render_path"])
+            canonical_keyframe_indices = _worldstereo_keyframe_indices(len(render_frames)).detach().cpu().numpy().astype(np.int64).tolist()
+            keyframe_indices = _select_evenly_spaced_indices(canonical_keyframe_indices, int(frames_per_trajectory))
+            if not keyframe_indices:
+                raise RuntimeError(f"No keyframes selected for trajectory: {item['render_path']}")
+            _hy_log(
+                "Klein Expansion",
+                f"Trajectory {view_id}/{traj_id}: selected {len(keyframe_indices)}/{len(canonical_keyframe_indices)} keyframe(s), "
+                f"render_indices={keyframe_indices}",
+            )
+
+            generated_frames = []
+            previous_frame = None
+            for local_index, render_index in enumerate(keyframe_indices):
+                render_frame = render_frames[int(render_index)].convert("RGB")
+                if bool(use_context_image) and previous_frame is not None:
+                    context_frame = previous_frame
+                else:
+                    context_frame = Image.new("RGB", render_frame.size, (0, 0, 0))
+                frame_seed = int(seed) + generated_frame_count
+                _hy_log(
+                    "Klein Expansion",
+                    f"Trajectory {view_id}/{traj_id}: Klein frame {local_index + 1}/{len(keyframe_indices)}, "
+                    f"seed={frame_seed}, context={'previous' if bool(use_context_image) and previous_frame is not None else 'black'}",
+                )
+                generated = self._run_klein_frame(
+                    model,
+                    clip,
+                    vae,
+                    render_frame,
+                    context_frame,
+                    positive_base,
+                    negative_base,
+                    sampler,
+                    frame_seed,
+                    int(steps),
+                    float(cfg),
+                    float(input_megapixels),
+                    int(resolution_steps),
+                )
+                if target_size is None:
+                    target_size = generated.size
+                    original_bank_size = _normalize_memory_bank_image_size(bank, memory_bank, target_size)
+                generated = _resize_pil(generated, target_size)
+                generated_frames.append(generated)
+                previous_frame = generated
+                generated_frame_count += 1
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            _export_video([np.asarray(frame, dtype=np.float32) / 255.0 for frame in generated_frames], result_path, fps=16)
+            selected_w2cs = tar_w2cs[torch.as_tensor(keyframe_indices, dtype=torch.long, device=tar_w2cs.device)]
+            selected_Ks = tar_Ks[torch.as_tensor(keyframe_indices, dtype=torch.long, device=tar_Ks.device)]
+            selected_Ks = _scale_intrinsics_to_size(selected_Ks, original_bank_size, target_size)
+            bank.update_memory(generated_frames, selected_w2cs, selected_Ks, view_id=view_id, traj_id=traj_id)
+            completed.append(str(result_path))
+            _hy_log("Klein Expansion", f"Trajectory {view_id}/{traj_id}: wrote {result_path} and updated memory")
+
+        memory_bank["bank"] = bank
+        _hy_log("Klein Expansion", "Stage 4/5: writing expansion state")
+        _hyworld2_write_json_file(
+            state_path,
+            {
+                "seed": int(seed),
+                "model_type": model_type,
+                "render_count": len(render_list),
+                "completed_count": len(completed),
+                "result_paths": completed,
+                "target_size": list(target_size) if target_size else None,
+                "input_megapixels": float(input_megapixels),
+                "steps": int(steps),
+                "cfg": float(cfg),
+                "sampler_name": str(sampler_name),
+                "frames_per_trajectory": int(frames_per_trajectory),
+                "use_context_image": bool(use_context_image),
+                "settings_signature": settings_signature,
+            },
+        )
+        _hy_log("Klein Expansion", f"Stage 5/5 complete: completed={len(completed)}, target_size={target_size}")
+        return (
+            memory_bank,
+            _safe_json_dumps(
+                {
+                    "completed": completed,
+                    "count": len(completed),
+                    "seed": int(seed),
+                    "seed_cache_action": "reuse_existing" if pending_count == 0 else "generated_pending",
+                    "state_path": str(state_path),
+                    "target_size": list(target_size) if target_size else None,
+                    "frames_per_trajectory": int(frames_per_trajectory),
+                    "use_context_image": bool(use_context_image),
                 }
             ),
         )
@@ -3411,6 +3787,7 @@ NODE_CLASS_MAPPINGS = {
     "HYWorld2Trajectories": HYWorld2Trajectories,
     "HYWorld2MemoryBank": HYWorld2MemoryBank,
     "HYWorld2WorldExpansion": HYWorld2WorldExpansion,
+    "HYWorld2KleinWorldExpansion": HYWorld2KleinWorldExpansion,
     "HYWorld2PrepareWorldMirrorBatch": HYWorld2PrepareWorldMirrorBatch,
     "HYWorld2MemoryAlignment": HYWorld2MemoryAlignment,
     "HYWorld2GSData": HYWorld2GSData,
@@ -3423,6 +3800,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "HYWorld2Trajectories": "HYWorld2 Trajectories",
     "HYWorld2MemoryBank": "HYWorld2 Memory Bank",
     "HYWorld2WorldExpansion": "HYWorld2 World Expansion",
+    "HYWorld2KleinWorldExpansion": "HYWorld2 Klein World Expansion (experimental)",
     "HYWorld2PrepareWorldMirrorBatch": "HYWorld2 Prepare WorldMirror Batch",
     "HYWorld2MemoryAlignment": "HYWorld2 Memory Alignment",
     "HYWorld2GSData": "HYWorld2 GS Data",
