@@ -1587,10 +1587,9 @@ def _download_worldstereo_single_loader_components(
             "model_index.json",
             "scheduler/**",
             "tokenizer/**",
-            "text_encoder/**",
             "image_encoder/**",
             "image_processor/**",
-            "vae/**",
+            "vae/config.json",
             "transformer/config.json",
         ],
     )
