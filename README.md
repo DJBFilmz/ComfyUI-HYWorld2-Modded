@@ -1,9 +1,12 @@
 # ComfyUI HY-World 2.0 - WorldMirror 3D
 
-This is a modded ver of the original fork. Basically a testing grounds for myself. Feel free to download if you wish, maybe it'll have some things that fit your needs, but... it probably won't. - David J. Buchanan
+`This is a modded ver of the original fork. Basically a testing grounds for myself. Feel free to download if you wish, maybe it'll have some things that fit your needs, but... it probably won't.` 
 
-Original Message Below:
+`- David J. Buchanan`
 
+### Original Message Below:
+
+</br>
 
 
 ComfyUI custom nodes for 3D scene reconstruction from a single image, panorama, image set, or video using HY-World 2.0 / WorldMirror.
